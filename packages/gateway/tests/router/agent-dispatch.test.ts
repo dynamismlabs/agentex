@@ -1,0 +1,340 @@
+import { describe, it, expect, vi } from "vitest";
+import { dispatchToAgent } from "../../src/router/agent-dispatch.js";
+import type {
+  AdapterModule,
+  ExecutionContext,
+  ExecutionResult,
+  StreamEvent,
+} from "@agentex/adapters";
+import type {
+  AgentConfig,
+  DispatchOptions,
+  InboundMessage,
+  SessionEntry,
+} from "../../src/types.js";
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function makeResult(overrides: Partial<ExecutionResult> = {}): ExecutionResult {
+  return {
+    exitCode: 0,
+    signal: null,
+    timedOut: false,
+    errorMessage: null,
+    errorCode: null,
+    costUsd: null,
+    model: "claude-4",
+    summary: "done",
+    sessionParams: null,
+    sessionDisplayId: null,
+    clearSession: false,
+    billingType: "api",
+    ...overrides,
+  };
+}
+
+function createMockAdapter(
+  opts?: { events?: StreamEvent[]; result?: Partial<ExecutionResult> },
+): AdapterModule & { lastCtx: ExecutionContext | null } {
+  const mock: AdapterModule & { lastCtx: ExecutionContext | null } = {
+    type: "mock",
+    lastCtx: null,
+    async execute(ctx: ExecutionContext): Promise<ExecutionResult> {
+      mock.lastCtx = ctx;
+
+      // Fire any pre-configured events
+      if (opts?.events) {
+        for (const event of opts.events) {
+          ctx.onEvent?.(event);
+        }
+      }
+
+      return makeResult(opts?.result);
+    },
+    async testEnvironment() {
+      return { adapterType: "mock", status: "pass" as const, checks: [], testedAt: new Date().toISOString() };
+    },
+  };
+  return mock;
+}
+
+function makeMsg(overrides: Partial<InboundMessage> = {}): InboundMessage {
+  return {
+    messageId: "msg-1",
+    channel: "telegram",
+    senderId: "user-42",
+    senderName: "Alice",
+    chatType: "direct",
+    target: "bot-1",
+    text: "Hello agent",
+    timestamp: Date.now(),
+    ...overrides,
+  };
+}
+
+function makeSession(overrides: Partial<SessionEntry> = {}): SessionEntry {
+  return {
+    key: "ses-1",
+    sessionParams: { conversationId: "conv-abc" },
+    lastChannel: "telegram",
+    lastRoute: { channel: "telegram", target: "bot-1" },
+    lastActivityAt: Date.now(),
+    ...overrides,
+  };
+}
+
+function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
+  return {
+    adapter: "mock",
+    cwd: "/home/project",
+    ...overrides,
+  };
+}
+
+function makeDispatchOpts(overrides: Partial<DispatchOptions> = {}): DispatchOptions {
+  return {
+    msg: makeMsg(),
+    session: makeSession(),
+    agentConfig: makeAgentConfig(),
+    adapter: createMockAdapter(),
+    onStreamEvent: vi.fn(),
+    onSystemEvent: vi.fn(),
+    ...overrides,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+describe("dispatchToAgent", () => {
+  it("builds ExecutionContext correctly from inputs", async () => {
+    const adapter = createMockAdapter();
+    const opts = makeDispatchOpts({ adapter });
+
+    await dispatchToAgent(opts);
+
+    const ctx = adapter.lastCtx!;
+    expect(ctx).not.toBeNull();
+    expect(ctx.runId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+    );
+    expect(ctx.prompt).toBe("Hello agent");
+    expect(ctx.cwd).toBe("/home/project");
+    expect(ctx.sessionParams).toEqual({ conversationId: "conv-abc" });
+  });
+
+  it("maps AgentConfig fields to AdapterConfig", async () => {
+    const adapter = createMockAdapter();
+    const opts = makeDispatchOpts({
+      adapter,
+      agentConfig: makeAgentConfig({
+        model: "claude-4",
+        maxTurns: 10,
+        timeoutSec: 120,
+        skipPermissions: true,
+        skillDirs: ["/skills"],
+        instructionsFile: "INSTRUCTIONS.md",
+        mcpServers: [{ name: "db", command: "db-server" }],
+      }),
+    });
+
+    await dispatchToAgent(opts);
+
+    const config = adapter.lastCtx!.config!;
+    expect(config.model).toBe("claude-4");
+    expect(config.maxTurns).toBe(10);
+    expect(config.timeoutSec).toBe(120);
+    expect(config.skipPermissions).toBe(true);
+    expect(config.skillDirs).toEqual(["/skills"]);
+    expect(config.instructionsFile).toBe("INSTRUCTIONS.md");
+    expect(config.mcpServers).toEqual([{ name: "db", command: "db-server" }]);
+  });
+
+  it("omits undefined AgentConfig fields from AdapterConfig", async () => {
+    const adapter = createMockAdapter();
+    const opts = makeDispatchOpts({ adapter });
+
+    await dispatchToAgent(opts);
+
+    const config = adapter.lastCtx!.config!;
+    expect(config).toEqual({});
+  });
+
+  it("extracts system-init events and calls onSystemEvent", async () => {
+    const systemEvent: StreamEvent = {
+      type: "system",
+      subtype: "init",
+      sessionId: "ses-xyz",
+      model: "claude-4",
+      timestamp: new Date().toISOString(),
+    };
+    const adapter = createMockAdapter({ events: [systemEvent] });
+    const onSystemEvent = vi.fn();
+    const opts = makeDispatchOpts({ adapter, onSystemEvent });
+
+    await dispatchToAgent(opts);
+
+    expect(onSystemEvent).toHaveBeenCalledOnce();
+    expect(onSystemEvent).toHaveBeenCalledWith("ses-xyz", "claude-4");
+  });
+
+  it("forwards ALL events to onStreamEvent", async () => {
+    const events: StreamEvent[] = [
+      { type: "system", subtype: "init", sessionId: "s1", model: "m1", timestamp: "t1" },
+      { type: "assistant", text: "hi", timestamp: "t2" },
+      { type: "result", text: "done", cost: 0.01, isError: false, timestamp: "t3" },
+    ];
+    const adapter = createMockAdapter({ events });
+    const onStreamEvent = vi.fn();
+    const opts = makeDispatchOpts({ adapter, onStreamEvent });
+
+    await dispatchToAgent(opts);
+
+    expect(onStreamEvent).toHaveBeenCalledTimes(3);
+    expect(onStreamEvent).toHaveBeenNthCalledWith(1, events[0]);
+    expect(onStreamEvent).toHaveBeenNthCalledWith(2, events[1]);
+    expect(onStreamEvent).toHaveBeenNthCalledWith(3, events[2]);
+  });
+
+  it("does not call onSystemEvent for non-init system events", async () => {
+    const event: StreamEvent = {
+      type: "system",
+      subtype: "heartbeat",
+      sessionId: null,
+      model: null,
+      timestamp: new Date().toISOString(),
+    };
+    const adapter = createMockAdapter({ events: [event] });
+    const onSystemEvent = vi.fn();
+    const onStreamEvent = vi.fn();
+    const opts = makeDispatchOpts({ adapter, onSystemEvent, onStreamEvent });
+
+    await dispatchToAgent(opts);
+
+    expect(onSystemEvent).not.toHaveBeenCalled();
+    // But it should still be forwarded to onStreamEvent
+    expect(onStreamEvent).toHaveBeenCalledOnce();
+    expect(onStreamEvent).toHaveBeenCalledWith(event);
+  });
+
+  it("renders systemPromptTemplate and prepends to prompt", async () => {
+    const adapter = createMockAdapter();
+    const opts = makeDispatchOpts({
+      adapter,
+      msg: makeMsg({
+        channel: "slack",
+        senderId: "U123",
+        senderName: "Bob",
+        chatType: "group",
+        threadId: "T456",
+        text: "deploy please",
+      }),
+      agentConfig: makeAgentConfig({
+        systemPromptTemplate:
+          "Channel: {{channel}}, Sender: {{sender.name}} ({{sender.id}}), Chat: {{chatType}}{{#if threadId}}, Thread: {{threadId}}{{/if}}",
+      }),
+    });
+
+    await dispatchToAgent(opts);
+
+    const expected =
+      "Channel: slack, Sender: Bob (U123), Chat: group, Thread: T456\ndeploy please";
+    expect(adapter.lastCtx!.prompt).toBe(expected);
+  });
+
+  it("handles systemPromptTemplate without threadId", async () => {
+    const adapter = createMockAdapter();
+    const opts = makeDispatchOpts({
+      adapter,
+      msg: makeMsg({
+        channel: "telegram",
+        senderId: "U1",
+        senderName: "Eve",
+        chatType: "direct",
+        text: "hi",
+        // no threadId
+      }),
+      agentConfig: makeAgentConfig({
+        systemPromptTemplate:
+          "From {{sender.name}}{{#if threadId}} in thread {{threadId}}{{/if}}",
+      }),
+    });
+
+    await dispatchToAgent(opts);
+
+    expect(adapter.lastCtx!.prompt).toBe("From Eve\nhi");
+  });
+
+  it("passes session params through to ExecutionContext", async () => {
+    const adapter = createMockAdapter();
+    const sessionParams = { conversationId: "c1", resumeId: "r1" };
+    const opts = makeDispatchOpts({
+      adapter,
+      session: makeSession({ sessionParams }),
+    });
+
+    await dispatchToAgent(opts);
+
+    expect(adapter.lastCtx!.sessionParams).toEqual(sessionParams);
+  });
+
+  it("handles null session params", async () => {
+    const adapter = createMockAdapter();
+    const opts = makeDispatchOpts({
+      adapter,
+      session: makeSession({ sessionParams: null }),
+    });
+
+    await dispatchToAgent(opts);
+
+    expect(adapter.lastCtx!.sessionParams).toBeNull();
+  });
+
+  it("returns the ExecutionResult from the adapter", async () => {
+    const expectedResult = makeResult({
+      exitCode: 0,
+      model: "claude-4",
+      summary: "Task completed",
+      sessionParams: { newConvId: "c2" },
+      costUsd: 0.05,
+    });
+    const adapter = createMockAdapter({ result: expectedResult });
+    const opts = makeDispatchOpts({ adapter });
+
+    const result = await dispatchToAgent(opts);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.model).toBe("claude-4");
+    expect(result.summary).toBe("Task completed");
+    expect(result.sessionParams).toEqual({ newConvId: "c2" });
+    expect(result.costUsd).toBe(0.05);
+  });
+
+  it("generates unique runId for each dispatch", async () => {
+    const adapter1 = createMockAdapter();
+    const adapter2 = createMockAdapter();
+
+    await dispatchToAgent(makeDispatchOpts({ adapter: adapter1 }));
+    await dispatchToAgent(makeDispatchOpts({ adapter: adapter2 }));
+
+    expect(adapter1.lastCtx!.runId).not.toBe(adapter2.lastCtx!.runId);
+  });
+
+  it("does not include signal on the ExecutionContext", async () => {
+    const controller = new AbortController();
+    const adapter = createMockAdapter();
+    const opts = makeDispatchOpts({
+      adapter,
+      signal: controller.signal,
+    });
+
+    await dispatchToAgent(opts);
+
+    // The ExecutionContext shape does not have a signal field;
+    // the adapter handles abort internally if needed
+    expect(adapter.lastCtx!).not.toHaveProperty("signal");
+  });
+});

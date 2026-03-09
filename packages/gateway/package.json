@@ -1,0 +1,72 @@
+{
+  "name": "@agentex/gateway",
+  "version": "0.0.1",
+  "description": "Multi-channel AI agent communication gateway",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "smoke": "tsx scripts/smoke.ts",
+    "dev": "node --env-file=.env --import=tsx/esm scripts/dev.ts"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "gateway",
+    "telegram",
+    "slack",
+    "discord",
+    "multi-channel"
+  ],
+  "author": "",
+  "license": "MIT",
+  "packageManager": "pnpm@10.32.0",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "yaml": "^2.7.0",
+    "zod": "^3.24.0",
+    "ws": "^8.18.0"
+  },
+  "peerDependencies": {
+    "@agentex/adapters": "workspace:*",
+    "node-telegram-bot-api": ">=0.60.0",
+    "discord.js": ">=14.0.0",
+    "@slack/bolt": ">=3.0.0",
+    "@whiskeysockets/baileys": ">=6.0.0",
+    "imapflow": ">=1.0.0",
+    "nodemailer": ">=6.0.0",
+    "cron": ">=3.0.0"
+  },
+  "peerDependenciesMeta": {
+    "node-telegram-bot-api": { "optional": true },
+    "discord.js": { "optional": true },
+    "@slack/bolt": { "optional": true },
+    "@whiskeysockets/baileys": { "optional": true },
+    "imapflow": { "optional": true },
+    "nodemailer": { "optional": true },
+    "cron": { "optional": true }
+  },
+  "devDependencies": {
+    "@agentex/adapters": "workspace:*",
+    "@types/node": "^25.3.5",
+    "@types/ws": "^8.5.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}

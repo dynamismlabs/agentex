@@ -1,0 +1,24 @@
+gateway:
+  port: 18789
+  bind: loopback
+  auth:
+    mode: none
+
+agent:
+  adapter: claude
+  cwd: .
+  skipPermissions: true
+  maxTurns: 5
+  timeoutSec: 120
+
+sessions:
+  dmScope: per-peer
+
+queue:
+  mode: queue
+
+channels:
+  telegram:
+    token: $TELEGRAM_BOT_TOKEN
+    dm:
+      policy: open

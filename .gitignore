@@ -1,0 +1,29 @@
+node_modules/
+dist/
+*.tsbuildinfo
+/examples
+
+# State
+.agentex/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# AI
+.claude/settings.local.json
+.spec-workflow
+/internal-docs
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
