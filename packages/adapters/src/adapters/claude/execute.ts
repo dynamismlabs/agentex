@@ -4,6 +4,7 @@ import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { runChildProcess, deriveErrorCode } from "../../utils/process.js";
 import { buildSkillsDir, cleanupSkillsDir } from "../../utils/skills.js";
+import { uuidv7 } from "../../utils/uuid.js";
 import { parseClaudeStreamJson, parseStreamLine, isClaudeUnknownSessionError, isClaudeAuthRequired } from "./parse.js";
 
 function hasNonEmptyEnvValue(env: Record<string, string>, key: string): boolean {
@@ -12,6 +13,9 @@ function hasNonEmptyEnvValue(env: Record<string, string>, key: string): boolean 
 }
 
 export async function executeClaudeAdapter(ctx: ExecutionContext): Promise<ExecutionResult> {
+  const runId = ctx.runId ?? uuidv7();
+  const cwd = ctx.cwd ?? process.cwd();
+  const model = ctx.model ?? ctx.config?.model;
   const config = ctx.config ?? {};
 
   // 1. Resolve binary
@@ -20,6 +24,7 @@ export async function executeClaudeAdapter(ctx: ExecutionContext): Promise<Execu
     resolvedBinary = await findBinary("claude", config.command);
   } catch (err) {
     return {
+      runId,
       exitCode: null,
       signal: null,
       timedOut: false,
@@ -55,7 +60,7 @@ export async function executeClaudeAdapter(ctx: ExecutionContext): Promise<Execu
     const args = [...resolvedBinary.prefixArgs, "--print", "-", "--output-format", "stream-json", "--verbose"];
     if (resumeSessionId) args.push("--resume", resumeSessionId);
     if (config.skipPermissions) args.push("--dangerously-skip-permissions");
-    if (config.model) args.push("--model", config.model);
+    if (model) args.push("--model", model);
     if (config.effort) args.push("--effort", config.effort);
     if (config.maxTurns && config.maxTurns > 0) args.push("--max-turns", String(config.maxTurns));
     if (config.instructionsFile) args.push("--append-system-prompt-file", config.instructionsFile);
@@ -76,7 +81,7 @@ export async function executeClaudeAdapter(ctx: ExecutionContext): Promise<Execu
     const id = sessionParams["sessionId"] as string | undefined ?? sessionParams["session_id"] as string | undefined;
     if (!id || typeof id !== "string") return null;
     const sessionCwd = sessionParams["cwd"] as string | undefined;
-    if (sessionCwd && path.resolve(sessionCwd) !== path.resolve(ctx.cwd)) return null;
+    if (sessionCwd && path.resolve(sessionCwd) !== path.resolve(cwd)) return null;
     return id;
   })();
 
@@ -88,10 +93,10 @@ export async function executeClaudeAdapter(ctx: ExecutionContext): Promise<Execu
     let lineBuffer = "";
 
     const proc = await runChildProcess({
-      runId: ctx.runId,
+      runId,
       command: resolvedBinary.bin,
       args,
-      cwd: ctx.cwd,
+      cwd,
       env,
       stdin: ctx.prompt,
       timeoutSec: config.timeoutSec,
@@ -173,10 +178,11 @@ export async function executeClaudeAdapter(ctx: ExecutionContext): Promise<Execu
 
     const resolvedSessionId = parsed.sessionId;
     const resultSessionParams = resolvedSessionId
-      ? { sessionId: resolvedSessionId, cwd: ctx.cwd }
+      ? { sessionId: resolvedSessionId, cwd }
       : null;
 
     return {
+      runId,
       exitCode: proc.exitCode,
       signal: proc.signal ?? null,
       timedOut: proc.timedOut,

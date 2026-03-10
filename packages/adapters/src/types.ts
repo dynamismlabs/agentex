@@ -9,9 +9,10 @@ export interface AdapterModule {
 
 // Execution input
 export interface ExecutionContext {
-  runId: string;
   prompt: string;
-  cwd: string;
+  model?: string;
+  runId?: string;
+  cwd?: string;
   env?: Record<string, string>;
   sessionParams?: Record<string, unknown> | null;
   config?: AdapterConfig;
@@ -36,6 +37,7 @@ export interface AdapterConfig {
 
 // Execution output
 export interface ExecutionResult {
+  runId: string;
   exitCode: number | null;
   signal: string | null;
   timedOut: boolean;

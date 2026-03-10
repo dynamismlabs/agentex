@@ -4,6 +4,7 @@ import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { runChildProcess, deriveErrorCode } from "../../utils/process.js";
 import { buildSkillsDir, cleanupSkillsDir } from "../../utils/skills.js";
+import { uuidv7 } from "../../utils/uuid.js";
 import {
   parseCodexJsonl,
   parseCodexStreamLine,
@@ -18,6 +19,9 @@ function hasNonEmptyEnvValue(env: Record<string, string>, key: string): boolean 
 }
 
 export async function executeCodexAdapter(ctx: ExecutionContext): Promise<ExecutionResult> {
+  const runId = ctx.runId ?? uuidv7();
+  const cwd = ctx.cwd ?? process.cwd();
+  const model = ctx.model ?? ctx.config?.model;
   const config = ctx.config ?? {};
 
   // 1. Resolve binary
@@ -26,6 +30,7 @@ export async function executeCodexAdapter(ctx: ExecutionContext): Promise<Execut
     resolvedBinary = await findBinary("codex", config.command);
   } catch (err) {
     return {
+      runId,
       exitCode: null,
       signal: null,
       timedOut: false,
@@ -66,7 +71,7 @@ export async function executeCodexAdapter(ctx: ExecutionContext): Promise<Execut
       (sessionParams["thread_id"] as string | undefined);
     if (!id || typeof id !== "string") return null;
     const sessionCwd = sessionParams["cwd"] as string | undefined;
-    if (sessionCwd && path.resolve(sessionCwd) !== path.resolve(ctx.cwd)) return null;
+    if (sessionCwd && path.resolve(sessionCwd) !== path.resolve(cwd)) return null;
     return id;
   })();
 
@@ -74,7 +79,7 @@ export async function executeCodexAdapter(ctx: ExecutionContext): Promise<Execut
   const buildArgs = (resumeSessionId: string | null): string[] => {
     const args = [...resolvedBinary.prefixArgs, "exec", "--json"];
     if (config.skipPermissions) args.push("--dangerously-bypass-approvals-and-sandbox");
-    if (config.model) args.push("--model", config.model);
+    if (model) args.push("--model", model);
     if (config.extraArgs) args.push(...config.extraArgs);
     if (resumeSessionId) {
       args.push("resume", resumeSessionId, "-");
@@ -90,10 +95,10 @@ export async function executeCodexAdapter(ctx: ExecutionContext): Promise<Execut
     let lineBuffer = "";
 
     const proc = await runChildProcess({
-      runId: ctx.runId,
+      runId,
       command: resolvedBinary.bin,
       args,
-      cwd: ctx.cwd,
+      cwd,
       env,
       stdin: ctx.prompt,
       timeoutSec: config.timeoutSec,
@@ -173,10 +178,11 @@ export async function executeCodexAdapter(ctx: ExecutionContext): Promise<Execut
 
     const resolvedSessionId = parsed.sessionId;
     const resultSessionParams = resolvedSessionId
-      ? { sessionId: resolvedSessionId, cwd: ctx.cwd }
+      ? { sessionId: resolvedSessionId, cwd }
       : null;
 
     return {
+      runId,
       exitCode: proc.exitCode,
       signal: proc.signal ?? null,
       timedOut: proc.timedOut,
@@ -186,7 +192,7 @@ export async function executeCodexAdapter(ctx: ExecutionContext): Promise<Execut
         ? { inputTokens: parsed.usage.inputTokens, outputTokens: parsed.usage.outputTokens }
         : undefined,
       costUsd: null,
-      model: parsed.model ?? config.model ?? null,
+      model: parsed.model ?? model ?? null,
       summary: parsed.summary,
       sessionParams: resultSessionParams,
       sessionDisplayId: resolvedSessionId,

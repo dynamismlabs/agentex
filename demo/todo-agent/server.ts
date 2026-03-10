@@ -131,15 +131,14 @@ app.post("/api/todos/:id/execute", (req, res) => {
     return;
   }
 
-  const runId = `todo-${id}-${Date.now()}`;
-  updateTodo(id, { status: "running", agentType, runId });
+  updateTodo(id, { status: "running", agentType });
   runningTodoId = id;
 
   // Return immediately, execute async
-  res.status(202).json({ runId });
+  res.status(202).json({ ok: true });
 
   // Start execution in background
-  executeAgent(id, agentType, runId, todo.title, todo.description);
+  executeAgent(id, agentType, todo.title, todo.description);
 });
 
 // ---------------------------------------------------------------------------
@@ -148,7 +147,6 @@ app.post("/api/todos/:id/execute", (req, res) => {
 async function executeAgent(
   todoId: string,
   agentType: "claude" | "codex",
-  runId: string,
   title: string,
   description: string
 ) {
@@ -164,9 +162,7 @@ async function executeAgent(
 
   try {
     const result = await adapter.execute({
-      runId,
       prompt,
-      cwd: process.cwd(),
       config: {
         skipPermissions: true,
         maxTurns: 5,
@@ -182,6 +178,7 @@ async function executeAgent(
 
     updateTodo(todoId, {
       status: success ? "done" : "failed",
+      runId: result.runId,
       completedAt: new Date().toISOString(),
       agentResult: {
         exitCode: result.exitCode,

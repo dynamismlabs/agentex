@@ -1,6 +1,9 @@
 import type { ExecutionContext, ExecutionResult } from "../../types.js";
+import { uuidv7 } from "../../utils/uuid.js";
 
 export async function executeOpenclawAdapter(ctx: ExecutionContext): Promise<ExecutionResult> {
+  const runId = ctx.runId ?? uuidv7();
+  const model = ctx.model ?? ctx.config?.model;
   const config = ctx.config ?? {};
   const gatewayUrl = config.command?.trim() || "http://localhost:3001";
   const endpoint = gatewayUrl.replace(/\/$/, "") + "/api/agent/run";
@@ -15,7 +18,7 @@ export async function executeOpenclawAdapter(ctx: ExecutionContext): Promise<Exe
   const body = JSON.stringify({
     prompt: ctx.prompt,
     ...(sessionKey ? { sessionKey } : {}),
-    ...(config.model ? { model: config.model } : {}),
+    ...(model ? { model: model } : {}),
   });
 
   try {
@@ -40,13 +43,14 @@ export async function executeOpenclawAdapter(ctx: ExecutionContext): Promise<Exe
     if (!response.ok) {
       const errorText = await response.text().catch(() => "");
       return {
+        runId,
         exitCode: 1,
         signal: null,
         timedOut: false,
         errorMessage: `OpenClaw gateway returned ${response.status}: ${errorText}`,
         errorCode: response.status === 401 ? "auth_required" : null,
         costUsd: null,
-        model: config.model ?? null,
+        model: model ?? null,
         summary: null,
         sessionParams: sessionKey ? { sessionKey, gatewayUrl } : null,
         sessionDisplayId: sessionKey,
@@ -77,13 +81,14 @@ export async function executeOpenclawAdapter(ctx: ExecutionContext): Promise<Exe
     }
 
     return {
+      runId,
       exitCode: 0,
       signal: null,
       timedOut: false,
       errorMessage: null,
       errorCode: null,
       costUsd: typeof result["costUsd"] === "number" ? result["costUsd"] : null,
-      model: typeof result["model"] === "string" ? result["model"] : config.model ?? null,
+      model: typeof result["model"] === "string" ? result["model"] : model ?? null,
       summary,
       sessionParams: newSessionKey ? { sessionKey: newSessionKey, gatewayUrl } : null,
       sessionDisplayId: newSessionKey,
@@ -94,13 +99,14 @@ export async function executeOpenclawAdapter(ctx: ExecutionContext): Promise<Exe
   } catch (err) {
     if (err instanceof Error && err.name === "AbortError") {
       return {
+        runId,
         exitCode: null,
         signal: null,
         timedOut: true,
         errorMessage: `Timed out after ${config.timeoutSec ?? 0}s`,
         errorCode: "timeout",
         costUsd: null,
-        model: config.model ?? null,
+        model: model ?? null,
         summary: null,
         sessionParams: sessionKey ? { sessionKey, gatewayUrl } : null,
         sessionDisplayId: sessionKey,
@@ -110,13 +116,14 @@ export async function executeOpenclawAdapter(ctx: ExecutionContext): Promise<Exe
     }
 
     return {
+      runId,
       exitCode: null,
       signal: null,
       timedOut: false,
       errorMessage: err instanceof Error ? err.message : "OpenClaw execution failed",
       errorCode: null,
       costUsd: null,
-      model: config.model ?? null,
+      model: model ?? null,
       summary: null,
       sessionParams: null,
       sessionDisplayId: null,

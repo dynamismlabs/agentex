@@ -25,22 +25,18 @@ console.log(`  Agent: ${agentType}`);
 console.log(`  ID: ${todo.id}\n`);
 
 const adapter = getAdapter(agentType);
-const runId = `todo-${todoId}-${Date.now()}`;
 const startTime = Date.now();
 
 updateTodo(todoId, {
   status: "running",
   agentType: agentType as "claude" | "codex",
-  runId,
 });
 
 const prompt = `Task: ${todo.title}\n\nDetails: ${todo.description}`;
 
 try {
   const result = await adapter.execute({
-    runId,
     prompt,
-    cwd: process.cwd(),
     config: {
       skipPermissions: true,
       maxTurns: 5,
@@ -62,6 +58,7 @@ try {
 
   updateTodo(todoId, {
     status: success ? "done" : "failed",
+    runId: result.runId,
     completedAt: new Date().toISOString(),
     agentResult: {
       exitCode: result.exitCode,

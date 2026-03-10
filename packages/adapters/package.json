@@ -40,5 +40,8 @@
     "tsx": "^4.21.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
+  },
+  "dependencies": {
+    "uuid": "^13.0.0"
   }
 }

@@ -2,13 +2,17 @@ import type { ExecutionContext, ExecutionResult } from "../../types.js";
 import { ensureCommandResolvable } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { runChildProcess, deriveErrorCode } from "../../utils/process.js";
+import { uuidv7 } from "../../utils/uuid.js";
 
 export async function executeProcessAdapter(ctx: ExecutionContext): Promise<ExecutionResult> {
+  const runId = ctx.runId ?? uuidv7();
+  const cwd = ctx.cwd ?? process.cwd();
   const config = ctx.config ?? {};
   const command = config.command;
 
   if (!command) {
     return {
+      runId,
       exitCode: null,
       signal: null,
       timedOut: false,
@@ -29,6 +33,7 @@ export async function executeProcessAdapter(ctx: ExecutionContext): Promise<Exec
     resolvedBinary = await ensureCommandResolvable(command);
   } catch (err) {
     return {
+      runId,
       exitCode: null,
       signal: null,
       timedOut: false,
@@ -48,10 +53,10 @@ export async function executeProcessAdapter(ctx: ExecutionContext): Promise<Exec
   ensurePathInEnv(env);
 
   const proc = await runChildProcess({
-    runId: ctx.runId,
+    runId,
     command: resolvedBinary.bin,
     args: [...resolvedBinary.prefixArgs, ...(config.extraArgs ?? [])],
-    cwd: ctx.cwd,
+    cwd,
     env,
     stdin: ctx.prompt,
     timeoutSec: config.timeoutSec,
@@ -72,6 +77,7 @@ export async function executeProcessAdapter(ctx: ExecutionContext): Promise<Exec
   })();
 
   return {
+    runId,
     exitCode: proc.exitCode,
     signal: proc.signal ?? null,
     timedOut: proc.timedOut,

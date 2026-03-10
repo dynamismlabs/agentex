@@ -47,6 +47,7 @@ function createMockAdapter(
     async execute(ctx) {
       const partial = handler ? await handler(ctx) : {};
       return {
+        runId: ctx.runId ?? "mock-run-id",
         exitCode: 0,
         signal: null,
         timedOut: false,

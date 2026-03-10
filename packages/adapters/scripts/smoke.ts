@@ -43,9 +43,7 @@ async function testAdapter(type: string) {
   // 3. Execute a simple prompt
   console.log('\n--- Execute ---');
   const result = await adapter.execute({
-    runId: `smoke-${type}-${Date.now()}`,
     prompt: 'Respond with exactly: hello from agentex',
-    cwd: process.cwd(),
     config: {
       maxTurns: 1,
       skipPermissions: true,

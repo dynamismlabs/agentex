@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import type {
   AdapterConfig,
   ExecutionContext,
@@ -35,7 +34,6 @@ function buildAdapterConfig(opts: DispatchOptions): AdapterConfig {
   const { agentConfig } = opts;
   const config: AdapterConfig = {};
 
-  if (agentConfig.model != null) config.model = agentConfig.model;
   if (agentConfig.maxTurns != null) config.maxTurns = agentConfig.maxTurns;
   if (agentConfig.timeoutSec != null) config.timeoutSec = agentConfig.timeoutSec;
   if (agentConfig.skipPermissions != null) config.skipPermissions = agentConfig.skipPermissions;
@@ -59,8 +57,8 @@ export async function dispatchToAgent(
   const prompt = buildPrompt(opts);
 
   const ctx: ExecutionContext = {
-    runId: randomUUID(),
     prompt,
+    model: opts.agentConfig.model,
     cwd: opts.agentConfig.cwd,
     sessionParams: opts.session.sessionParams,
     config: buildAdapterConfig(opts),
