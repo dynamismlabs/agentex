@@ -8,7 +8,7 @@ importers:
 
   .: {}
 
-  packages/adapters:
+  packages/agent:
     dependencies:
       uuid:
         specifier: ^13.0.0
@@ -60,9 +60,9 @@ importers:
         specifier: ^3.24.0
         version: 3.25.76
     devDependencies:
-      '@agentex/adapters':
+      '@agentex/agent':
         specifier: workspace:*
-        version: link:../adapters
+        version: link:../agent
       '@types/node':
         specifier: ^25.3.5
         version: 25.4.0

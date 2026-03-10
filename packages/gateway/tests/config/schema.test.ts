@@ -5,7 +5,7 @@ import { validateConfig, gatewayConfigSchema } from "../../src/config/schema.js"
 /** Minimal valid raw config (only the required fields). */
 function minimalRaw() {
   return {
-    agent: { adapter: "claude", cwd: "/tmp/project" },
+    agent: { provider: "claude", cwd: "/tmp/project" },
   };
 }
 
@@ -58,7 +58,7 @@ describe("gatewayConfigSchema", () => {
   describe("valid configurations", () => {
     it("accepts a minimal config with only agent", () => {
       const cfg = validateConfig(minimalRaw());
-      expect(cfg.agent.adapter).toBe("claude");
+      expect(cfg.agent.provider).toBe("claude");
       expect(cfg.agent.cwd).toBe("/tmp/project");
     });
 
@@ -70,7 +70,7 @@ describe("gatewayConfigSchema", () => {
           auth: { mode: "none" as const },
         },
         agent: {
-          adapter: "codex",
+          provider: "codex",
           cwd: "/home/user/project",
           model: "gpt-4",
           maxTurns: 5,
@@ -96,7 +96,7 @@ describe("gatewayConfigSchema", () => {
           telegram: { token: "abc", chatId: 123 },
         },
         agents: {
-          coder: { adapter: "claude", cwd: "/code" },
+          coder: { provider: "claude", cwd: "/code" },
         },
         routing: {
           rules: [
@@ -176,12 +176,12 @@ describe("gatewayConfigSchema", () => {
       expect(() => validateConfig({})).toThrow(ZodError);
     });
 
-    it("rejects missing agent.adapter", () => {
+    it("rejects missing agent.provider", () => {
       expect(() => validateConfig({ agent: { cwd: "/tmp" } })).toThrow(ZodError);
     });
 
     it("rejects missing agent.cwd", () => {
-      expect(() => validateConfig({ agent: { adapter: "claude" } })).toThrow(ZodError);
+      expect(() => validateConfig({ agent: { provider: "claude" } })).toThrow(ZodError);
     });
 
     it("rejects invalid auth mode", () => {
@@ -253,7 +253,7 @@ describe("gatewayConfigSchema", () => {
 
     it("rejects non-integer maxTurns", () => {
       const raw = {
-        agent: { adapter: "claude", cwd: "/tmp", maxTurns: 2.5 },
+        agent: { provider: "claude", cwd: "/tmp", maxTurns: 2.5 },
       };
       expect(() => validateConfig(raw)).toThrow(ZodError);
     });
@@ -261,7 +261,7 @@ describe("gatewayConfigSchema", () => {
     it("rejects mcpServer missing name", () => {
       const raw = {
         agent: {
-          adapter: "claude",
+          provider: "claude",
           cwd: "/tmp",
           mcpServers: [{ command: "mcp-fs" }],
         },
@@ -272,7 +272,7 @@ describe("gatewayConfigSchema", () => {
     it("rejects mcpServer missing command", () => {
       const raw = {
         agent: {
-          adapter: "claude",
+          provider: "claude",
           cwd: "/tmp",
           mcpServers: [{ name: "fs" }],
         },

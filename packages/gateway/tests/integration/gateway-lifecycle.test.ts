@@ -3,8 +3,8 @@ import http from "node:http";
 import { tmpdir } from "node:os";
 import { mkdtemp, rm } from "node:fs/promises";
 import { resolve } from "node:path";
-import { registerAdapter } from "@agentex/adapters";
-import type { AdapterModule } from "@agentex/adapters";
+import { registerProvider } from "@agentex/agent";
+import type { ProviderModule } from "@agentex/agent";
 import { createGateway } from "../../src/gateway.js";
 import { defineChannel } from "../../src/channels/define.js";
 import type { Gateway, ChannelPlugin, ChannelContext } from "../../src/types.js";
@@ -19,10 +19,10 @@ function nextPort(): number {
 }
 
 // ---------------------------------------------------------------------------
-// Mock adapter
+// Mock provider
 // ---------------------------------------------------------------------------
 
-const mockAdapter: AdapterModule = {
+const mockProvider: ProviderModule = {
   type: "mock-lifecycle",
   async execute() {
     return {
@@ -46,7 +46,7 @@ const mockAdapter: AdapterModule = {
   },
   async testEnvironment() {
     return {
-      adapterType: "mock-lifecycle",
+      providerType: "mock-lifecycle",
       status: "pass" as const,
       checks: [],
       testedAt: new Date().toISOString(),
@@ -116,14 +116,14 @@ describe("Gateway lifecycle", () => {
   });
 
   it("starts and channel start() is called", async () => {
-    registerAdapter(mockAdapter);
+    registerProvider(mockProvider);
     stateDir = await mkdtemp(resolve(tmpdir(), "gw-lc-"));
     const mockChannel = createMockChannel();
 
     gateway = createGateway({
       config: {
         gateway: { bind: "loopback", port: nextPort(), auth: { mode: "none" } },
-        agent: { adapter: "mock-lifecycle", cwd: "/tmp" },
+        agent: { provider: "mock-lifecycle", cwd: "/tmp" },
         sessions: { dmScope: "per-peer" },
         queue: { mode: "queue", maxQueueDepth: 10 },
         channels: { test: {} },
@@ -139,14 +139,14 @@ describe("Gateway lifecycle", () => {
   });
 
   it("GET /healthz returns 200", async () => {
-    registerAdapter(mockAdapter);
+    registerProvider(mockProvider);
     stateDir = await mkdtemp(resolve(tmpdir(), "gw-hz-"));
     const port = nextPort();
 
     gateway = createGateway({
       config: {
         gateway: { bind: "loopback", port, auth: { mode: "none" } },
-        agent: { adapter: "mock-lifecycle", cwd: "/tmp" },
+        agent: { provider: "mock-lifecycle", cwd: "/tmp" },
         sessions: { dmScope: "per-peer" },
         queue: { mode: "queue", maxQueueDepth: 10 },
         channels: {},
@@ -163,14 +163,14 @@ describe("Gateway lifecycle", () => {
   });
 
   it("stops cleanly — channels stopped, server closed", async () => {
-    registerAdapter(mockAdapter);
+    registerProvider(mockProvider);
     stateDir = await mkdtemp(resolve(tmpdir(), "gw-stop-"));
     const mockChannel = createMockChannel();
 
     gateway = createGateway({
       config: {
         gateway: { bind: "loopback", port: nextPort(), auth: { mode: "none" } },
-        agent: { adapter: "mock-lifecycle", cwd: "/tmp" },
+        agent: { provider: "mock-lifecycle", cwd: "/tmp" },
         sessions: { dmScope: "per-peer" },
         queue: { mode: "queue", maxQueueDepth: 10 },
         channels: { test: {} },
@@ -187,13 +187,13 @@ describe("Gateway lifecycle", () => {
   });
 
   it("throws on double start", async () => {
-    registerAdapter(mockAdapter);
+    registerProvider(mockProvider);
     stateDir = await mkdtemp(resolve(tmpdir(), "gw-dbl-"));
 
     gateway = createGateway({
       config: {
         gateway: { bind: "loopback", port: nextPort(), auth: { mode: "none" } },
-        agent: { adapter: "mock-lifecycle", cwd: "/tmp" },
+        agent: { provider: "mock-lifecycle", cwd: "/tmp" },
         sessions: { dmScope: "per-peer" },
         queue: { mode: "queue", maxQueueDepth: 10 },
         channels: {},
@@ -206,13 +206,13 @@ describe("Gateway lifecycle", () => {
   });
 
   it("throws on password auth mode", async () => {
-    registerAdapter(mockAdapter);
+    registerProvider(mockProvider);
     stateDir = await mkdtemp(resolve(tmpdir(), "gw-pw-"));
 
     gateway = createGateway({
       config: {
         gateway: { bind: "loopback", port: nextPort(), auth: { mode: "password" } },
-        agent: { adapter: "mock-lifecycle", cwd: "/tmp" },
+        agent: { provider: "mock-lifecycle", cwd: "/tmp" },
         sessions: { dmScope: "per-peer" },
         queue: { mode: "queue", maxQueueDepth: 10 },
         channels: {},
@@ -224,13 +224,13 @@ describe("Gateway lifecycle", () => {
   });
 
   it("stop is idempotent", async () => {
-    registerAdapter(mockAdapter);
+    registerProvider(mockProvider);
     stateDir = await mkdtemp(resolve(tmpdir(), "gw-idem-"));
 
     gateway = createGateway({
       config: {
         gateway: { bind: "loopback", port: nextPort(), auth: { mode: "none" } },
-        agent: { adapter: "mock-lifecycle", cwd: "/tmp" },
+        agent: { provider: "mock-lifecycle", cwd: "/tmp" },
         sessions: { dmScope: "per-peer" },
         queue: { mode: "queue", maxQueueDepth: 10 },
         channels: {},
@@ -244,14 +244,14 @@ describe("Gateway lifecycle", () => {
   });
 
   it("config is accessible before start", async () => {
-    registerAdapter(mockAdapter);
+    registerProvider(mockProvider);
     stateDir = await mkdtemp(resolve(tmpdir(), "gw-cfg-"));
     const port = nextPort();
 
     gateway = createGateway({
       config: {
         gateway: { bind: "loopback", port, auth: { mode: "none" } },
-        agent: { adapter: "mock-lifecycle", cwd: "/tmp" },
+        agent: { provider: "mock-lifecycle", cwd: "/tmp" },
         sessions: { dmScope: "per-peer" },
         queue: { mode: "queue", maxQueueDepth: 10 },
         channels: {},
@@ -260,17 +260,17 @@ describe("Gateway lifecycle", () => {
     });
 
     expect(gateway.config.gateway.port).toBe(port);
-    expect(gateway.config.agent.adapter).toBe("mock-lifecycle");
+    expect(gateway.config.agent.provider).toBe("mock-lifecycle");
   });
 
   it("events emitter is accessible before start", async () => {
-    registerAdapter(mockAdapter);
+    registerProvider(mockProvider);
     stateDir = await mkdtemp(resolve(tmpdir(), "gw-evt-"));
 
     gateway = createGateway({
       config: {
         gateway: { bind: "loopback", port: nextPort(), auth: { mode: "none" } },
-        agent: { adapter: "mock-lifecycle", cwd: "/tmp" },
+        agent: { provider: "mock-lifecycle", cwd: "/tmp" },
         sessions: { dmScope: "per-peer" },
         queue: { mode: "queue", maxQueueDepth: 10 },
         channels: {},

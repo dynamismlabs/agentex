@@ -18,7 +18,7 @@ const mcpServerConfigSchema = z.object({
 });
 
 const agentConfigSchema = z.object({
-  adapter: z.string(),
+  provider: z.string(),
   cwd: z.string(),
   model: z.string().optional(),
   maxTurns: z.number().int().positive().optional(),

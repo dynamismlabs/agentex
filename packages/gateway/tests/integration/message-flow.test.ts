@@ -2,8 +2,8 @@ import { describe, it, expect, afterEach, beforeEach } from "vitest";
 import { tmpdir } from "node:os";
 import { mkdtemp, rm } from "node:fs/promises";
 import { resolve } from "node:path";
-import { registerAdapter } from "@agentex/adapters";
-import type { AdapterModule, ExecutionContext, ExecutionResult } from "@agentex/adapters";
+import { registerProvider } from "@agentex/agent";
+import type { ProviderModule, ExecutionContext, ExecutionResult } from "@agentex/agent";
 import { createGateway } from "../../src/gateway.js";
 import { defineChannel } from "../../src/channels/define.js";
 import type {
@@ -35,13 +35,13 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5000, pollMs = 20):
 }
 
 // ---------------------------------------------------------------------------
-// Mock adapter factory
+// Mock provider factory
 // ---------------------------------------------------------------------------
 
-function createMockAdapter(
+function createMockProvider(
   type: string,
   handler?: (ctx: ExecutionContext) => Promise<Partial<ExecutionResult>>,
-): AdapterModule {
+): ProviderModule {
   return {
     type,
     async execute(ctx) {
@@ -68,7 +68,7 @@ function createMockAdapter(
     },
     async testEnvironment() {
       return {
-        adapterType: type,
+        providerType: type,
         status: "pass" as const,
         checks: [],
         testedAt: new Date().toISOString(),
@@ -151,11 +151,11 @@ describe("Message flow — end to end", () => {
     if (stateDir) await rm(stateDir, { recursive: true, force: true });
   });
 
-  it("full DM pipeline: inbound → adapter → reply", async () => {
-    const adapter = createMockAdapter("mock-flow", async (ctx) => ({
+  it("full DM pipeline: inbound → provider → reply", async () => {
+    const provider = createMockProvider("mock-flow", async (ctx) => ({
       summary: `Agent says: got "${ctx.prompt}"`,
     }));
-    registerAdapter(adapter);
+    registerProvider(provider);
 
     stateDir = await mkdtemp(resolve(tmpdir(), "gw-flow-"));
     const mockChannel = createMockChannel("test");
@@ -163,7 +163,7 @@ describe("Message flow — end to end", () => {
     gateway = createGateway({
       config: {
         gateway: { bind: "loopback", port: nextPort(), auth: { mode: "none" } },
-        agent: { adapter: "mock-flow", cwd: "/tmp" },
+        agent: { provider: "mock-flow", cwd: "/tmp" },
         sessions: { dmScope: "per-peer" },
         queue: { mode: "queue", maxQueueDepth: 10 },
         channels: { test: { dm: { policy: "open" } } },
@@ -184,8 +184,8 @@ describe("Message flow — end to end", () => {
   });
 
   it("emits gateway events during pipeline", async () => {
-    const adapter = createMockAdapter("mock-events", async () => ({ summary: "Done" }));
-    registerAdapter(adapter);
+    const provider = createMockProvider("mock-events", async () => ({ summary: "Done" }));
+    registerProvider(provider);
 
     stateDir = await mkdtemp(resolve(tmpdir(), "gw-evt-"));
     const mockChannel = createMockChannel("test");
@@ -193,7 +193,7 @@ describe("Message flow — end to end", () => {
     gateway = createGateway({
       config: {
         gateway: { bind: "loopback", port: nextPort(), auth: { mode: "none" } },
-        agent: { adapter: "mock-events", cwd: "/tmp" },
+        agent: { provider: "mock-events", cwd: "/tmp" },
         sessions: { dmScope: "per-peer" },
         queue: { mode: "queue", maxQueueDepth: 10 },
         channels: { test: { dm: { policy: "open" } } },
@@ -218,7 +218,7 @@ describe("Message flow — end to end", () => {
   });
 
   it("access control blocks non-allowlisted sender", async () => {
-    registerAdapter(createMockAdapter("mock-acl"));
+    registerProvider(createMockProvider("mock-acl"));
 
     stateDir = await mkdtemp(resolve(tmpdir(), "gw-acl-"));
     const mockChannel = createMockChannel("test");
@@ -226,7 +226,7 @@ describe("Message flow — end to end", () => {
     gateway = createGateway({
       config: {
         gateway: { bind: "loopback", port: nextPort(), auth: { mode: "none" } },
-        agent: { adapter: "mock-acl", cwd: "/tmp" },
+        agent: { provider: "mock-acl", cwd: "/tmp" },
         sessions: { dmScope: "per-peer" },
         queue: { mode: "queue", maxQueueDepth: 10 },
         channels: { test: { dm: { policy: "allowlist", allowFrom: ["allowed-user"] } } },
@@ -245,8 +245,8 @@ describe("Message flow — end to end", () => {
   });
 
   it("access control allows allowlisted sender", async () => {
-    registerAdapter(
-      createMockAdapter("mock-acl-ok", async () => ({ summary: "Allowed response" })),
+    registerProvider(
+      createMockProvider("mock-acl-ok", async () => ({ summary: "Allowed response" })),
     );
 
     stateDir = await mkdtemp(resolve(tmpdir(), "gw-acl-ok-"));
@@ -255,7 +255,7 @@ describe("Message flow — end to end", () => {
     gateway = createGateway({
       config: {
         gateway: { bind: "loopback", port: nextPort(), auth: { mode: "none" } },
-        agent: { adapter: "mock-acl-ok", cwd: "/tmp" },
+        agent: { provider: "mock-acl-ok", cwd: "/tmp" },
         sessions: { dmScope: "per-peer" },
         queue: { mode: "queue", maxQueueDepth: 10 },
         channels: { test: { dm: { policy: "allowlist", allowFrom: ["allowed-user"] } } },
@@ -274,14 +274,14 @@ describe("Message flow — end to end", () => {
 
   it("session is preserved across messages", async () => {
     let callCount = 0;
-    const adapter = createMockAdapter("mock-sess", async (ctx) => {
+    const provider = createMockProvider("mock-sess", async (ctx) => {
       callCount++;
       if (callCount === 1) {
         return { summary: "First response", sessionParams: { sessionId: "sid-123" } };
       }
       return { summary: `Session has: ${JSON.stringify(ctx.sessionParams)}` };
     });
-    registerAdapter(adapter);
+    registerProvider(provider);
 
     stateDir = await mkdtemp(resolve(tmpdir(), "gw-sess-"));
     const mockChannel = createMockChannel("test");
@@ -289,7 +289,7 @@ describe("Message flow — end to end", () => {
     gateway = createGateway({
       config: {
         gateway: { bind: "loopback", port: nextPort(), auth: { mode: "none" } },
-        agent: { adapter: "mock-sess", cwd: "/tmp" },
+        agent: { provider: "mock-sess", cwd: "/tmp" },
         sessions: { dmScope: "per-peer" },
         queue: { mode: "queue", maxQueueDepth: 10 },
         channels: { test: { dm: { policy: "open" } } },
@@ -300,29 +300,29 @@ describe("Message flow — end to end", () => {
 
     await gateway.start();
 
-    // First message — adapter sets sessionParams
+    // First message — provider sets sessionParams
     mockChannel.onMessage!(directMessage({ text: "First" }));
     await waitFor(() => mockChannel.sendCalls.length >= 1);
 
-    // Second message — adapter should receive the session params
+    // Second message — provider should receive the session params
     mockChannel.onMessage!(directMessage({ text: "Second" }));
     await waitFor(() => mockChannel.sendCalls.length >= 2);
 
     expect(mockChannel.sendCalls[1]!.text).toContain("sid-123");
   });
 
-  it("multi-agent routing dispatches to correct adapter", async () => {
+  it("multi-agent routing dispatches to correct provider", async () => {
     const coderCalls: string[] = [];
     const reviewerCalls: string[] = [];
 
-    registerAdapter(
-      createMockAdapter("mock-coder", async (ctx) => {
+    registerProvider(
+      createMockProvider("mock-coder", async (ctx) => {
         coderCalls.push(ctx.prompt);
         return { summary: "Coder response" };
       }),
     );
-    registerAdapter(
-      createMockAdapter("mock-reviewer", async (ctx) => {
+    registerProvider(
+      createMockProvider("mock-reviewer", async (ctx) => {
         reviewerCalls.push(ctx.prompt);
         return { summary: "Reviewer response" };
       }),
@@ -334,10 +334,10 @@ describe("Message flow — end to end", () => {
     gateway = createGateway({
       config: {
         gateway: { bind: "loopback", port: nextPort(), auth: { mode: "none" } },
-        agent: { adapter: "mock-coder", cwd: "/tmp" },
+        agent: { provider: "mock-coder", cwd: "/tmp" },
         agents: {
-          coder: { adapter: "mock-coder", cwd: "/tmp/coder" },
-          reviewer: { adapter: "mock-reviewer", cwd: "/tmp/reviewer" },
+          coder: { provider: "mock-coder", cwd: "/tmp/coder" },
+          reviewer: { provider: "mock-reviewer", cwd: "/tmp/reviewer" },
         },
         routing: {
           rules: [{ match: { channel: "test", chatType: "thread" }, agent: "reviewer" }],
@@ -366,8 +366,8 @@ describe("Message flow — end to end", () => {
   });
 
   it("streaming channel receives placeholder + edits + finalize", async () => {
-    registerAdapter(
-      createMockAdapter("mock-stream", async (ctx) => {
+    registerProvider(
+      createMockProvider("mock-stream", async (ctx) => {
         if (ctx.onEvent) {
           await ctx.onEvent({ type: "assistant", text: "Streaming ", timestamp: new Date().toISOString() });
           await ctx.onEvent({ type: "assistant", text: "response", timestamp: new Date().toISOString() });
@@ -382,7 +382,7 @@ describe("Message flow — end to end", () => {
     gateway = createGateway({
       config: {
         gateway: { bind: "loopback", port: nextPort(), auth: { mode: "none" } },
-        agent: { adapter: "mock-stream", cwd: "/tmp" },
+        agent: { provider: "mock-stream", cwd: "/tmp" },
         sessions: { dmScope: "per-peer" },
         queue: { mode: "queue", maxQueueDepth: 10 },
         channels: { test: { dm: { policy: "open" } } },
@@ -406,7 +406,7 @@ describe("Message flow — end to end", () => {
   });
 
   it("pairing flow: unapproved sender triggers pairing event", async () => {
-    registerAdapter(createMockAdapter("mock-pair"));
+    registerProvider(createMockProvider("mock-pair"));
 
     stateDir = await mkdtemp(resolve(tmpdir(), "gw-pair-"));
     const mockChannel = createMockChannel("test");
@@ -414,7 +414,7 @@ describe("Message flow — end to end", () => {
     gateway = createGateway({
       config: {
         gateway: { bind: "loopback", port: nextPort(), auth: { mode: "none" } },
-        agent: { adapter: "mock-pair", cwd: "/tmp" },
+        agent: { provider: "mock-pair", cwd: "/tmp" },
         sessions: { dmScope: "per-peer" },
         queue: { mode: "queue", maxQueueDepth: 10 },
         channels: { test: { dm: { policy: "pairing" } } },
@@ -437,10 +437,10 @@ describe("Message flow — end to end", () => {
     expect(mockChannel.sendCalls.length).toBe(0);
   });
 
-  it("adapter error sends error message to channel", async () => {
-    registerAdapter(
-      createMockAdapter("mock-err", async () => {
-        throw new Error("Adapter exploded");
+  it("provider error sends error message to channel", async () => {
+    registerProvider(
+      createMockProvider("mock-err", async () => {
+        throw new Error("Provider exploded");
       }),
     );
 
@@ -450,7 +450,7 @@ describe("Message flow — end to end", () => {
     gateway = createGateway({
       config: {
         gateway: { bind: "loopback", port: nextPort(), auth: { mode: "none" } },
-        agent: { adapter: "mock-err", cwd: "/tmp" },
+        agent: { provider: "mock-err", cwd: "/tmp" },
         sessions: { dmScope: "per-peer" },
         queue: { mode: "queue", maxQueueDepth: 10 },
         channels: { test: { dm: { policy: "open" } } },
@@ -464,6 +464,6 @@ describe("Message flow — end to end", () => {
 
     await waitFor(() => mockChannel.sendCalls.length > 0, 3000);
 
-    expect(mockChannel.sendCalls[0]!.text).toContain("Adapter exploded");
+    expect(mockChannel.sendCalls[0]!.text).toContain("Provider exploded");
   });
 });

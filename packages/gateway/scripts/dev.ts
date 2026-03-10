@@ -14,7 +14,7 @@
  *       mode: none
  *
  *   agent:
- *     adapter: claude
+ *     provider: claude
  *     cwd: /path/to/workspace
  *     skipPermissions: true
  *     maxTurns: 5
@@ -44,7 +44,7 @@ console.log(`Loading config from: ${configPath}`);
 
 const gw = createGateway({ configPath });
 
-console.log(`Config: port=${gw.config.gateway.port}, adapter=${gw.config.agent.adapter}`);
+console.log(`Config: port=${gw.config.gateway.port}, provider=${gw.config.agent.provider}`);
 console.log(`Channels: ${Object.keys(gw.config.channels).join(", ") || "(none)"}`);
 
 gw.events.on("*", (payload) => {

@@ -11,7 +11,7 @@ export function minimalConfig(overrides?: Partial<GatewayConfig>): GatewayConfig
       auth: { mode: "none" },
     },
     agent: {
-      adapter: "mock",
+      provider: "mock",
       cwd: "/tmp",
     },
     sessions: {
@@ -49,11 +49,11 @@ export function multiAgentConfig(): GatewayConfig {
   return minimalConfig({
     agents: {
       coder: {
-        adapter: "mock-coder",
+        provider: "mock-coder",
         cwd: "/tmp/coder",
       },
       reviewer: {
-        adapter: "mock-reviewer",
+        provider: "mock-reviewer",
         cwd: "/tmp/reviewer",
       },
     },

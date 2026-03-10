@@ -3,8 +3,8 @@ import type { Server } from "node:http";
 import { mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
-import { getAdapter } from "@agentex/adapters";
-import type { AdapterModule, StreamEvent } from "@agentex/adapters";
+import { getProvider } from "@agentex/agent";
+import type { ProviderModule, StreamEvent } from "@agentex/agent";
 
 import { loadConfig } from "./config/loader.js";
 import { GatewayEventEmitterImpl } from "./events/emitter.js";
@@ -195,12 +195,12 @@ export function createGateway(opts: CreateGatewayOptions = {}): Gateway {
 
     messageQueue.setRunning(sessionKey, true);
 
-    // Get adapter
-    let adapter: AdapterModule;
+    // Get provider
+    let provider: ProviderModule;
     try {
-      adapter = getAdapter(agentConfig.adapter);
+      provider = getProvider(agentConfig.provider);
     } catch (err) {
-      log.error(`No adapter for "${agentConfig.adapter}": ${String(err)}`);
+      log.error(`No provider for "${agentConfig.provider}": ${String(err)}`);
       messageQueue.setRunning(sessionKey, false);
       return;
     }
@@ -226,7 +226,7 @@ export function createGateway(opts: CreateGatewayOptions = {}): Gateway {
 
     events.emit("agent.start", {
       agentId: resolveAgent(primaryMsg, config.routing),
-      adapter: agentConfig.adapter,
+      provider: agentConfig.provider,
       sessionKey,
     }, sessionKey);
 
@@ -237,7 +237,7 @@ export function createGateway(opts: CreateGatewayOptions = {}): Gateway {
         msg: { ...primaryMsg, text: combinedText },
         session,
         agentConfig,
-        adapter,
+        provider,
         onStreamEvent: (event: StreamEvent) => {
           events.emit("agent.event", event as unknown as Record<string, unknown>, sessionKey);
           if (streamer && event.type === "assistant") {

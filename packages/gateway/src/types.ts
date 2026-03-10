@@ -1,14 +1,14 @@
 import type { Server } from "node:http";
 import type {
-  AdapterConfig,
-  AdapterModule,
+  ProviderConfig,
+  ProviderModule,
   ExecutionResult,
   McpServerConfig,
   StreamEvent,
-} from "@agentex/adapters";
+} from "@agentex/agent";
 
-// Re-export adapter types consumers need
-export type { AdapterModule, AdapterConfig, ExecutionResult, StreamEvent, McpServerConfig };
+// Re-export provider types consumers need
+export type { ProviderModule, ProviderConfig, ExecutionResult, StreamEvent, McpServerConfig };
 
 // ---------------------------------------------------------------------------
 // Gateway
@@ -54,7 +54,7 @@ export interface AuthConfig {
 }
 
 export interface AgentConfig {
-  adapter: string;
+  provider: string;
   cwd: string;
   model?: string;
   maxTurns?: number;
@@ -284,7 +284,7 @@ export interface DispatchOptions {
   msg: InboundMessage;
   session: SessionEntry;
   agentConfig: AgentConfig;
-  adapter: AdapterModule;
+  provider: ProviderModule;
   onStreamEvent: (event: StreamEvent) => void;
   onSystemEvent: (sessionId: string | null, model: string | null) => void;
   signal?: AbortSignal;

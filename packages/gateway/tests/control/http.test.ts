@@ -41,7 +41,7 @@ function createMockContext(overrides?: Partial<ControlApiContext>): ControlApiCo
     },
     config: {
       gateway: { bind: "loopback", port: 9090, auth: { mode: "token", token: "super-secret" } },
-      agent: { adapter: "claude", cwd: "/tmp", secretKey: "abc123" },
+      agent: { provider: "claude", cwd: "/tmp", secretKey: "abc123" },
       sessions: { dmScope: "main" },
       apiKey: "sk-12345",
       normalValue: "visible",
@@ -275,7 +275,7 @@ describe("mountControlRoutes", () => {
     // Nested object secret redacted
     const agent = body["agent"] as Record<string, unknown>;
     expect(agent["secretKey"]).toBe("[REDACTED]");
-    expect(agent["adapter"]).toBe("claude");
+    expect(agent["provider"]).toBe("claude");
     // Auth nested
     const gw = body["gateway"] as Record<string, unknown>;
     const auth = gw["auth"] as Record<string, unknown>;

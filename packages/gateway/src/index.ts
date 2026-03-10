@@ -2,8 +2,8 @@
 export { createGateway } from "./gateway.js";
 export { defineChannel } from "./channels/define.js";
 
-// Re-export adapter types consumers need
-export type { AdapterModule, AdapterConfig, ExecutionResult, StreamEvent } from "./types.js";
+// Re-export provider types consumers need
+export type { ProviderModule, ProviderConfig, ExecutionResult, StreamEvent } from "./types.js";
 
 // Gateway types
 export type {

@@ -5,7 +5,7 @@ gateway:
     mode: none
 
 agent:
-  adapter: claude
+  provider: claude
   cwd: .
   skipPermissions: true
   maxTurns: 5

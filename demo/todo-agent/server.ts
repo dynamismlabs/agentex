@@ -2,8 +2,8 @@ import express from "express";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { mkdirSync } from "node:fs";
-import { getAdapter, listAdapters } from "../../packages/adapters/src/index.js";
-import type { StreamEvent } from "../../packages/adapters/src/index.js";
+import { getProvider, listProviders } from "../../packages/agent/src/index.js";
+import type { StreamEvent } from "../../packages/agent/src/index.js";
 import { readTodos, getTodo, addTodo, updateTodo, deleteTodo, clearTodos, seedTodos } from "./store.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -113,13 +113,13 @@ app.get("/api/todos/:id/events", (req, res) => {
   });
 });
 
-// Check adapter availability
-app.get("/api/adapters", async (_req, res) => {
+// Check provider availability
+app.get("/api/providers", async (_req, res) => {
   const available: Record<string, boolean> = {};
-  for (const name of listAdapters()) {
+  for (const name of listProviders()) {
     try {
-      const adapter = getAdapter(name);
-      const result = await adapter.testEnvironment({ adapterType: name });
+      const provider = getProvider(name);
+      const result = await provider.testEnvironment({ providerType: name });
       available[name] = result.status !== "fail";
     } catch {
       available[name] = false;
@@ -168,7 +168,7 @@ async function executeAgent(
   title: string,
   description: string
 ) {
-  const adapter = getAdapter(agentType);
+  const provider = getProvider(agentType);
 
   const workspaceDir = join(DATA_DIR, "workspace", todoId);
   mkdirSync(workspaceDir, { recursive: true });
@@ -181,7 +181,7 @@ async function executeAgent(
   });
 
   try {
-    const result = await adapter.execute({
+    const result = await provider.execute({
       prompt,
       cwd: workspaceDir,
       config: {

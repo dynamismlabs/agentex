@@ -24,14 +24,14 @@ async function main() {
   const gw = createGateway({
     config: {
       gateway: { bind: "loopback", port: PORT, auth: { mode: "none" } },
-      agent: { adapter: "claude", cwd: process.cwd() },
+      agent: { provider: "claude", cwd: process.cwd() },
       sessions: { dmScope: "per-peer" },
       queue: { mode: "queue", maxQueueDepth: 10 },
       channels: {},
     },
   });
 
-  console.log(`Config loaded: port=${gw.config.gateway.port}, adapter=${gw.config.agent.adapter}`);
+  console.log(`Config loaded: port=${gw.config.gateway.port}, provider=${gw.config.agent.provider}`);
 
   // Track events
   let eventCount = 0;

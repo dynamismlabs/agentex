@@ -71,14 +71,14 @@
         font-size: 1rem;
       }
 
-      /* Adapters */
-      .adapters {
+      /* Providers */
+      .providers {
         display: flex;
         gap: 10px;
         margin-bottom: 32px;
         justify-content: center;
       }
-      .adapter-badge {
+      .provider-badge {
         padding: 6px 12px;
         border-radius: var(--radius-full);
         font-size: 0.75rem;
@@ -90,38 +90,38 @@
         align-items: center;
         gap: 6px;
       }
-      .adapter-badge::before {
+      .provider-badge::before {
         content: '';
         display: inline-block;
         width: 6px;
         height: 6px;
         border-radius: 50%;
       }
-      .adapter-badge.available {
+      .provider-badge.available {
         background: rgba(16, 185, 129, 0.1);
         color: #34d399;
         border-color: rgba(16, 185, 129, 0.2);
       }
-      .adapter-badge.available::before {
+      .provider-badge.available::before {
         background: #34d399;
         box-shadow: 0 0 8px #34d399;
       }
 
-      .adapter-badge.unavailable {
+      .provider-badge.unavailable {
         background: rgba(239, 68, 68, 0.1);
         color: #f87171;
         border-color: rgba(239, 68, 68, 0.2);
       }
-      .adapter-badge.unavailable::before {
+      .provider-badge.unavailable::before {
         background: #f87171;
       }
 
-      .adapter-badge.loading {
+      .provider-badge.loading {
         background: rgba(161, 161, 170, 0.1);
         color: var(--text-muted);
         border-color: rgba(161, 161, 170, 0.2);
       }
-      .adapter-badge.loading::before {
+      .provider-badge.loading::before {
         background: var(--text-muted);
         animation: pulse 1.5s infinite;
       }
@@ -463,9 +463,9 @@
       <p class="subtitle">Create tasks and dispatch them to AI agents for autonomous execution</p>
     </div>
 
-    <div class="adapters" id="adapters">
-      <span class="adapter-badge loading">claude: checking...</span>
-      <span class="adapter-badge loading">codex: checking...</span>
+    <div class="providers" id="providers">
+      <span class="provider-badge loading">claude: checking...</span>
+      <span class="provider-badge loading">codex: checking...</span>
     </div>
 
     <div class="create-form">
@@ -508,7 +508,7 @@
     <div class="todo-list" id="todoList"></div>
 
     <script>
-      const adapterAvailability = {};
+      const providerAvailability = {};
       const eventSources = {};
       let eventLogs = {}; // todoId -> array of event strings
 
@@ -528,23 +528,23 @@
       }
 
       // -----------------------------------------------------------------------
-      // Load adapter availability
+      // Load provider availability
       // -----------------------------------------------------------------------
-      async function loadAdapters() {
+      async function loadProviders() {
         try {
-          const data = await api('GET', '/api/adapters');
-          Object.assign(adapterAvailability, data);
-          const el = document.getElementById('adapters');
+          const data = await api('GET', '/api/providers');
+          Object.assign(providerAvailability, data);
+          const el = document.getElementById('providers');
           el.innerHTML = Object.entries(data)
             .filter(([name]) => ['claude', 'codex'].includes(name))
             .map(
               ([name, ok]) =>
-                `<span class="adapter-badge ${ok ? 'available' : 'unavailable'}">${name}: ${ok ? 'available' : 'not found'}</span>`,
+                `<span class="provider-badge ${ok ? 'available' : 'unavailable'}">${name}: ${ok ? 'available' : 'not found'}</span>`,
             )
             .join('');
         } catch {
-          document.getElementById('adapters').innerHTML =
-            '<span class="adapter-badge unavailable">Failed to check adapters</span>';
+          document.getElementById('providers').innerHTML =
+            '<span class="provider-badge unavailable">Failed to check providers</span>';
         }
       }
 
@@ -623,10 +623,10 @@
             ${
               canRun
                 ? `
-              <button class="btn-sm btn-claude" onclick="executeTodo('${todo.id}','claude')" ${!adapterAvailability.claude ? "disabled title='Claude not available'" : ''}>
+              <button class="btn-sm btn-claude" onclick="executeTodo('${todo.id}','claude')" ${!providerAvailability.claude ? "disabled title='Claude not available'" : ''}>
                 Run with Claude
               </button>
-              <button class="btn-sm btn-codex" onclick="executeTodo('${todo.id}','codex')" ${!adapterAvailability.codex ? "disabled title='Codex not available'" : ''}>
+              <button class="btn-sm btn-codex" onclick="executeTodo('${todo.id}','codex')" ${!providerAvailability.codex ? "disabled title='Codex not available'" : ''}>
                 Run with Codex
               </button>
             `
@@ -787,7 +787,7 @@
       // -----------------------------------------------------------------------
       // Init
       // -----------------------------------------------------------------------
-      loadAdapters().then(() => loadTodos());
+      loadProviders().then(() => loadTodos());
       loadTodos();
     </script>
   </body>

@@ -1,9 +1,9 @@
 import type {
-  AdapterConfig,
+  ProviderConfig,
   ExecutionContext,
   ExecutionResult,
   StreamEvent,
-} from "@agentex/adapters";
+} from "@agentex/agent";
 import type { DispatchOptions } from "../types.js";
 import { renderGatewayTemplate } from "../utils/template.js";
 
@@ -28,11 +28,11 @@ function buildPrompt(opts: DispatchOptions): string {
 }
 
 /**
- * Map AgentConfig fields to the AdapterConfig shape expected by adapters.
+ * Map AgentConfig fields to the ProviderConfig shape expected by providers.
  */
-function buildAdapterConfig(opts: DispatchOptions): AdapterConfig {
+function buildProviderConfig(opts: DispatchOptions): ProviderConfig {
   const { agentConfig } = opts;
-  const config: AdapterConfig = {};
+  const config: ProviderConfig = {};
 
   if (agentConfig.maxTurns != null) config.maxTurns = agentConfig.maxTurns;
   if (agentConfig.timeoutSec != null) config.timeoutSec = agentConfig.timeoutSec;
@@ -45,11 +45,11 @@ function buildAdapterConfig(opts: DispatchOptions): AdapterConfig {
 }
 
 /**
- * Dispatch an inbound message to the configured agent adapter for execution.
+ * Dispatch an inbound message to the configured agent provider for execution.
  *
  * Builds an {@link ExecutionContext} from the dispatch options, forwards all
  * stream events, extracts system-init events for session tracking, and
- * returns the adapter's {@link ExecutionResult}.
+ * returns the provider's {@link ExecutionResult}.
  */
 export async function dispatchToAgent(
   opts: DispatchOptions,
@@ -61,7 +61,7 @@ export async function dispatchToAgent(
     model: opts.agentConfig.model,
     cwd: opts.agentConfig.cwd,
     sessionParams: opts.session.sessionParams,
-    config: buildAdapterConfig(opts),
+    config: buildProviderConfig(opts),
     onEvent(event: StreamEvent) {
       // Extract system-init events to update session metadata
       if (event.type === "system" && event.subtype === "init") {
@@ -75,5 +75,5 @@ export async function dispatchToAgent(
     },
   };
 
-  return opts.adapter.execute(ctx);
+  return opts.provider.execute(ctx);
 }

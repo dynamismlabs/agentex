@@ -1,8 +1,8 @@
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { mkdirSync } from "node:fs";
-import { getAdapter } from "../../packages/adapters/src/index.js";
-import type { StreamEvent } from "../../packages/adapters/src/index.js";
+import { getProvider } from "../../packages/agent/src/index.js";
+import type { StreamEvent } from "../../packages/agent/src/index.js";
 import { getTodo, updateTodo } from "./store.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -29,7 +29,7 @@ console.log(`\n▶ Running todo: ${todo.title}`);
 console.log(`  Agent: ${agentType}`);
 console.log(`  ID: ${todo.id}\n`);
 
-const adapter = getAdapter(agentType);
+const provider = getProvider(agentType);
 
 const workspaceDir = join(__dirname, "data", "workspace", todoId);
 mkdirSync(workspaceDir, { recursive: true });
@@ -44,7 +44,7 @@ const prompt = `Task: ${todo.title}\n\nDetails: ${todo.description}`;
 console.log(`  Workspace: ${workspaceDir}\n`);
 
 try {
-  const result = await adapter.execute({
+  const result = await provider.execute({
     prompt,
     cwd: workspaceDir,
     config: {

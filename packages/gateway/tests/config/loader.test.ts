@@ -31,13 +31,13 @@ describe("loadConfig", () => {
         "config.yaml",
         `
 agent:
-  adapter: claude
+  provider: claude
   cwd: /tmp/project
 `,
       );
 
       const cfg = loadConfig({ configPath });
-      expect(cfg.agent.adapter).toBe("claude");
+      expect(cfg.agent.provider).toBe("claude");
       expect(cfg.agent.cwd).toBe("/tmp/project");
     });
 
@@ -46,7 +46,7 @@ agent:
         "config.yaml",
         `
 agent:
-  adapter: claude
+  provider: claude
   cwd: /tmp/project
 `,
       );
@@ -71,7 +71,7 @@ gateway:
   auth:
     mode: none
 agent:
-  adapter: codex
+  provider: codex
   cwd: /home/user/project
   model: gpt-4
   maxTurns: 5
@@ -104,7 +104,7 @@ stateDir: /var/agentex
       expect(cfg.gateway.bind).toBe("lan");
       expect(cfg.gateway.port).toBe(9999);
       expect(cfg.gateway.auth.mode).toBe("none");
-      expect(cfg.agent.adapter).toBe("codex");
+      expect(cfg.agent.provider).toBe("codex");
       expect(cfg.agent.model).toBe("gpt-4");
       expect(cfg.sessions.dmScope).toBe("per-peer");
       expect(cfg.sessions.resetOnIdle).toBe("24h");
@@ -126,13 +126,13 @@ stateDir: /var/agentex
     beforeEach(() => {
       savedEnv = { ...process.env };
       process.env["AGEX_GATEWAY_TOKEN"] = "test-token-123";
-      process.env["AGEX_ADAPTER"] = "claude";
+      process.env["AGEX_PROVIDER"] = "claude";
       process.env["AGEX_CWD"] = "/env/project";
     });
 
     afterEach(() => {
       // Restore original env
-      for (const key of ["AGEX_GATEWAY_TOKEN", "AGEX_ADAPTER", "AGEX_CWD"]) {
+      for (const key of ["AGEX_GATEWAY_TOKEN", "AGEX_PROVIDER", "AGEX_CWD"]) {
         if (savedEnv[key] === undefined) {
           delete process.env[key];
         } else {
@@ -149,14 +149,14 @@ gateway:
   auth:
     token: $AGEX_GATEWAY_TOKEN
 agent:
-  adapter: $AGEX_ADAPTER
+  provider: $AGEX_PROVIDER
   cwd: $AGEX_CWD
 `,
       );
 
       const cfg = loadConfig({ configPath });
       expect(cfg.gateway.auth.token).toBe("test-token-123");
-      expect(cfg.agent.adapter).toBe("claude");
+      expect(cfg.agent.provider).toBe("claude");
       expect(cfg.agent.cwd).toBe("/env/project");
     });
 
@@ -168,7 +168,7 @@ gateway:
   auth:
     token: "\${AGEX_GATEWAY_TOKEN}"
 agent:
-  adapter: claude
+  provider: claude
   cwd: /tmp
 `,
       );
@@ -182,7 +182,7 @@ agent:
         "config.yaml",
         `
 agent:
-  adapter: claude
+  provider: claude
   cwd: /tmp
 gateway:
   auth:
@@ -204,7 +204,7 @@ gateway:
         "config.yaml",
         `
 agent:
-  adapter: claude
+  provider: claude
   cwd: /tmp/project
 gateway:
   port: 18789
@@ -227,7 +227,7 @@ gateway:
         "config.yaml",
         `
 agent:
-  adapter: claude
+  provider: claude
   cwd: /tmp/project
 gateway:
   auth:
@@ -251,7 +251,7 @@ gateway:
         "config.yaml",
         `
 agent:
-  adapter: claude
+  provider: claude
   cwd: /tmp/project
   skillDirs:
     - /skills/a
@@ -271,10 +271,10 @@ agent:
     it("works without a config file (overrides only)", () => {
       const cfg = loadConfig({
         overrides: {
-          agent: { adapter: "claude", cwd: "/tmp" },
+          agent: { provider: "claude", cwd: "/tmp" },
         },
       });
-      expect(cfg.agent.adapter).toBe("claude");
+      expect(cfg.agent.provider).toBe("claude");
       expect(cfg.gateway.bind).toBe("loopback");
     });
   });
@@ -297,10 +297,10 @@ agent:
       const cfg = loadConfig({
         configPath,
         overrides: {
-          agent: { adapter: "claude", cwd: "/tmp" },
+          agent: { provider: "claude", cwd: "/tmp" },
         },
       });
-      expect(cfg.agent.adapter).toBe("claude");
+      expect(cfg.agent.provider).toBe("claude");
     });
 
     it("throws on non-mapping YAML", () => {
@@ -322,24 +322,24 @@ agent:
         "config.yaml",
         `
 agent:
-  adapter: claude
+  provider: claude
   cwd: /tmp/project
 `,
       );
 
       const cfg = loadConfig({ configPath, overrides: {} });
-      expect(cfg.agent.adapter).toBe("claude");
+      expect(cfg.agent.provider).toBe("claude");
     });
 
     it("loads with no arguments and overrides providing required fields", () => {
       // loadConfig with just overrides, no configPath
       const cfg = loadConfig({
         overrides: {
-          agent: { adapter: "codex", cwd: "/home" },
+          agent: { provider: "codex", cwd: "/home" },
           gateway: { port: 5555 },
         },
       });
-      expect(cfg.agent.adapter).toBe("codex");
+      expect(cfg.agent.provider).toBe("codex");
       expect(cfg.gateway.port).toBe(5555);
     });
   });
@@ -366,7 +366,7 @@ gateway:
         "config.yaml",
         `
 agent:
-  adapter: claude
+  provider: claude
   cwd: /tmp
 gateway:
   auth:

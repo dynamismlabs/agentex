@@ -5,7 +5,7 @@ Multi-channel AI agent communication gateway. Connect AI agents to Telegram, Dis
 ## Install
 
 ```bash
-npm install @agentex/gateway @agentex/adapters
+npm install @agentex/gateway @agentex/agent
 ```
 
 Install channel peer dependencies as needed:
@@ -28,7 +28,7 @@ gateway:
     mode: none
 
 agent:
-  adapter: claude
+  provider: claude
   cwd: .
   skipPermissions: true
   maxTurns: 5
@@ -77,7 +77,7 @@ node --env-file=.env --import=tsx/esm scripts/dev.ts
 ## How It Works
 
 ```
-User Message → Channel Plugin → Access Control → Session → Queue → Agent Adapter → Reply
+User Message → Channel Plugin → Access Control → Session → Queue → Agent Provider → Reply
      ↑                                                                                  |
      └──────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -86,7 +86,7 @@ User Message → Channel Plugin → Access Control → Session → Queue → Age
 2. **Access control** checks if the sender is allowed (open, allowlist, or pairing flow)
 3. The **session resolver** maps the sender to a persistent session (with agent memory)
 4. The **message queue** batches or queues messages per session
-5. The **agent dispatcher** sends the prompt to the configured adapter (Claude, Codex, etc.)
+5. The **agent dispatcher** sends the prompt to the configured provider (Claude, Codex, etc.)
 6. The **reply router** sends the response back through the originating channel
 
 ## Built-in Channels
@@ -122,7 +122,7 @@ gateway:
 
 ```yaml
 agent:
-  adapter: claude              # claude | codex | openclaw | process
+  provider: claude              # claude | codex | openclaw | process
   cwd: /path/to/project       # working directory for the agent
   model: claude-sonnet-4-5-20250514           # optional model override
   maxTurns: 10                 # max tool-use turns
@@ -161,10 +161,10 @@ queue:
 ```yaml
 agents:
   coder:
-    adapter: claude
+    provider: claude
     cwd: /code
   reviewer:
-    adapter: claude
+    provider: claude
     cwd: /code
     instructionsFile: REVIEW.md
 
@@ -251,9 +251,9 @@ Event types: `message.inbound`, `message.outbound`, `agent.start`, `agent.event`
 ## Requirements
 
 - Node.js >= 18
-- `@agentex/adapters` (peer dependency)
+- `@agentex/agent` (peer dependency)
 - Channel-specific peer dependencies (installed only for channels you use)
-- The agent CLI must be installed (e.g., `claude` for the Claude adapter)
+- The agent CLI must be installed (e.g., `claude` for the Claude provider)
 
 ## License
 

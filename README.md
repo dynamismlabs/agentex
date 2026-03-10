@@ -2,7 +2,7 @@
 
 Open-source infrastructure for running AI coding agents. Two packages:
 
-- **[@agentex/adapters](./packages/adapters)** — Execute Claude Code, Codex, OpenClaw, or any CLI agent programmatically with streaming, sessions, and a unified interface.
+- **[@agentex/agent](./packages/agent)** — Execute Claude Code, Codex, OpenClaw, or any CLI agent programmatically with streaming, sessions, and a unified interface.
 - **[@agentex/gateway](./packages/gateway)** — Multi-channel communication gateway that connects agents to Telegram, Discord, Slack, WhatsApp, email, webhooks, and cron with a single YAML config.
 
 ## Getting Started
@@ -22,16 +22,15 @@ pnpm -r test
 
 ## Packages
 
-### @agentex/adapters
+### @agentex/agent
 
 Spawn AI agents as child processes with streaming output and session resume.
 
 ```typescript
-import { getAdapter } from "@agentex/adapters";
+import { getProvider } from "@agentex/agent";
 
-const claude = getAdapter("claude");
+const claude = getProvider("claude");
 const result = await claude.execute({
-  runId: "task-1",
   prompt: "Fix the bug in auth.ts",
   cwd: "/my/project",
   config: { skipPermissions: true, maxTurns: 5 },
@@ -41,7 +40,7 @@ const result = await claude.execute({
 });
 ```
 
-Built-in adapters: `claude`, `codex`, `openclaw`, `process`
+Built-in providers: `claude`, `codex`, `openclaw`, `process`
 
 ### @agentex/gateway
 
@@ -50,7 +49,7 @@ Deploy an agent as a bot across any messaging platform.
 ```yaml
 # agentex.yaml
 agent:
-  adapter: claude
+  provider: claude
   cwd: .
   skipPermissions: true
 
@@ -83,10 +82,10 @@ Features:
 ```
 agentex/
 ├── packages/
-│   ├── adapters/          # @agentex/adapters
+│   ├── agent/             # @agentex/agent
 │   │   ├── src/
-│   │   │   ├── adapters/  # claude, codex, openclaw, process
-│   │   │   ├── utils/     # template, env, skills
+│   │   │   ├── providers/  # claude, codex, openclaw, process
+│   │   │   ├── utils/      # template, env, skills
 │   │   │   ├── registry.ts
 │   │   │   └── types.ts
 │   │   └── tests/
@@ -123,7 +122,7 @@ cd packages/gateway && pnpm dev
 
 - Node.js >= 18
 - pnpm >= 10
-- Agent CLIs on `$PATH` (e.g., `claude` for the Claude adapter)
+- Agent CLIs on `$PATH` (e.g., `claude` for the Claude provider)
 
 ## License
 
