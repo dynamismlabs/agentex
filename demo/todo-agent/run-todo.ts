@@ -30,7 +30,6 @@ console.log(`  Agent: ${agentType}`);
 console.log(`  ID: ${todo.id}\n`);
 
 const adapter = getAdapter(agentType);
-const startTime = Date.now();
 
 const workspaceDir = join(__dirname, "data", "workspace", todoId);
 mkdirSync(workspaceDir, { recursive: true });
@@ -64,27 +63,26 @@ try {
     },
   });
 
-  const durationMs = Date.now() - startTime;
   const success = result.exitCode === 0;
 
   updateTodo(todoId, {
     status: success ? "done" : "failed",
     runId: result.runId,
-    completedAt: new Date().toISOString(),
+    completedAt: result.completedAt,
     agentResult: {
       exitCode: result.exitCode,
       summary: result.summary,
       costUsd: result.costUsd,
       model: result.model,
       errorMessage: result.errorMessage,
-      durationMs,
+      durationMs: result.durationMs,
       usage: result.usage ?? null,
     },
   });
 
   console.log(`\n${"─".repeat(50)}`);
   console.log(`Status: ${success ? "done" : "failed"}`);
-  console.log(`Duration: ${(durationMs / 1000).toFixed(1)}s`);
+  console.log(`Duration: ${(result.durationMs / 1000).toFixed(1)}s`);
   if (result.usage) {
     console.log(`Tokens: ${result.usage.inputTokens} in / ${result.usage.outputTokens} out${result.usage.cachedInputTokens ? ` (${result.usage.cachedInputTokens} cached)` : ''}`);
   }
@@ -92,7 +90,6 @@ try {
   if (result.costUsd != null) console.log(`Cost: $${result.costUsd.toFixed(4)}`);
   if (result.errorMessage) console.log(`Error: ${result.errorMessage}`);
 } catch (err: unknown) {
-  const durationMs = Date.now() - startTime;
   const errorMessage = err instanceof Error ? err.message : String(err);
 
   updateTodo(todoId, {
@@ -104,7 +101,7 @@ try {
       costUsd: null,
       model: null,
       errorMessage,
-      durationMs,
+      durationMs: 0,
       usage: null,
     },
   });

@@ -169,7 +169,6 @@ async function executeAgent(
   description: string
 ) {
   const adapter = getAdapter(agentType);
-  const startTime = Date.now();
 
   const workspaceDir = join(DATA_DIR, "workspace", todoId);
   mkdirSync(workspaceDir, { recursive: true });
@@ -195,20 +194,19 @@ async function executeAgent(
       },
     });
 
-    const durationMs = Date.now() - startTime;
     const success = result.exitCode === 0;
 
     updateTodo(todoId, {
       status: success ? "done" : "failed",
       runId: result.runId,
-      completedAt: new Date().toISOString(),
+      completedAt: result.completedAt,
       agentResult: {
         exitCode: result.exitCode,
         summary: result.summary,
         costUsd: result.costUsd,
         model: result.model,
         errorMessage: result.errorMessage,
-        durationMs,
+        durationMs: result.durationMs,
         usage: result.usage ?? null,
       },
     });
@@ -222,12 +220,11 @@ async function executeAgent(
         costUsd: result.costUsd,
         model: result.model,
         errorMessage: result.errorMessage,
-        durationMs,
+        durationMs: result.durationMs,
         usage: result.usage ?? null,
       },
     });
   } catch (err: unknown) {
-    const durationMs = Date.now() - startTime;
     const errorMessage = err instanceof Error ? err.message : String(err);
 
     updateTodo(todoId, {
@@ -239,14 +236,14 @@ async function executeAgent(
         costUsd: null,
         model: null,
         errorMessage,
-        durationMs,
+        durationMs: 0,
         usage: null,
       },
     });
 
     broadcastEvent(todoId, {
       type: "done",
-      data: { status: "failed", errorMessage, durationMs },
+      data: { status: "failed", errorMessage, durationMs: 0 },
     });
   } finally {
     runningTodoId = null;
