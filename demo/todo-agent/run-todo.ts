@@ -1,6 +1,11 @@
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { mkdirSync } from "node:fs";
 import { getAdapter } from "../../packages/adapters/src/index.js";
 import type { StreamEvent } from "../../packages/adapters/src/index.js";
 import { getTodo, updateTodo } from "./store.js";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const [todoId, agentType = "claude"] = process.argv.slice(2);
 
@@ -27,6 +32,9 @@ console.log(`  ID: ${todo.id}\n`);
 const adapter = getAdapter(agentType);
 const startTime = Date.now();
 
+const workspaceDir = join(__dirname, "data", "workspace", todoId);
+mkdirSync(workspaceDir, { recursive: true });
+
 updateTodo(todoId, {
   status: "running",
   agentType: agentType as "claude" | "codex",
@@ -34,9 +42,12 @@ updateTodo(todoId, {
 
 const prompt = `Task: ${todo.title}\n\nDetails: ${todo.description}`;
 
+console.log(`  Workspace: ${workspaceDir}\n`);
+
 try {
   const result = await adapter.execute({
     prompt,
+    cwd: workspaceDir,
     config: {
       skipPermissions: true,
       maxTurns: 5,
@@ -67,12 +78,16 @@ try {
       model: result.model,
       errorMessage: result.errorMessage,
       durationMs,
+      usage: result.usage ?? null,
     },
   });
 
   console.log(`\n${"─".repeat(50)}`);
   console.log(`Status: ${success ? "done" : "failed"}`);
   console.log(`Duration: ${(durationMs / 1000).toFixed(1)}s`);
+  if (result.usage) {
+    console.log(`Tokens: ${result.usage.inputTokens} in / ${result.usage.outputTokens} out${result.usage.cachedInputTokens ? ` (${result.usage.cachedInputTokens} cached)` : ''}`);
+  }
   if (result.summary) console.log(`Summary: ${result.summary}`);
   if (result.costUsd != null) console.log(`Cost: $${result.costUsd.toFixed(4)}`);
   if (result.errorMessage) console.log(`Error: ${result.errorMessage}`);
@@ -90,6 +105,7 @@ try {
       model: null,
       errorMessage,
       durationMs,
+      usage: null,
     },
   });
 

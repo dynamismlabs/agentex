@@ -1,11 +1,13 @@
 import express from "express";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { mkdirSync } from "node:fs";
 import { getAdapter, listAdapters } from "../../packages/adapters/src/index.js";
 import type { StreamEvent } from "../../packages/adapters/src/index.js";
-import { readTodos, getTodo, addTodo, updateTodo, deleteTodo } from "./store.js";
+import { readTodos, getTodo, addTodo, updateTodo, deleteTodo, clearTodos, seedTodos } from "./store.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const DATA_DIR = join(__dirname, "data");
 const app = express();
 const PORT = 3456;
 
@@ -73,6 +75,22 @@ app.delete("/api/todos/:id", (req, res) => {
     return;
   }
   res.json({ ok: true });
+});
+
+// Clear all todos
+app.delete("/api/todos", (_req, res) => {
+  if (runningTodoId) {
+    res.status(409).json({ error: "Cannot clear while a task is running" });
+    return;
+  }
+  clearTodos();
+  res.json({ ok: true });
+});
+
+// Seed demo todos
+app.post("/api/todos/seed", (_req, res) => {
+  const created = seedTodos();
+  res.status(201).json(created);
 });
 
 // SSE stream for execution events
@@ -153,6 +171,9 @@ async function executeAgent(
   const adapter = getAdapter(agentType);
   const startTime = Date.now();
 
+  const workspaceDir = join(DATA_DIR, "workspace", todoId);
+  mkdirSync(workspaceDir, { recursive: true });
+
   const prompt = `Task: ${title}\n\nDetails: ${description}`;
 
   broadcastEvent(todoId, {
@@ -163,6 +184,7 @@ async function executeAgent(
   try {
     const result = await adapter.execute({
       prompt,
+      cwd: workspaceDir,
       config: {
         skipPermissions: true,
         maxTurns: 5,
@@ -187,6 +209,7 @@ async function executeAgent(
         model: result.model,
         errorMessage: result.errorMessage,
         durationMs,
+        usage: result.usage ?? null,
       },
     });
 
@@ -200,6 +223,7 @@ async function executeAgent(
         model: result.model,
         errorMessage: result.errorMessage,
         durationMs,
+        usage: result.usage ?? null,
       },
     });
   } catch (err: unknown) {
@@ -216,6 +240,7 @@ async function executeAgent(
         model: null,
         errorMessage,
         durationMs,
+        usage: null,
       },
     });
 

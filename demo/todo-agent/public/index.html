@@ -21,6 +21,10 @@
     .create-form textarea { resize: vertical; min-height: 60px; }
     .create-form button { background: #2563eb; color: white; border: none; padding: 8px 20px; border-radius: 6px; cursor: pointer; font-size: 0.85rem; font-weight: 600; }
     .create-form button:hover { background: #1d4ed8; }
+    .btn-seed { background: #333; color: #ccc; }
+    .btn-seed:hover { background: #444; color: #fff; }
+    .btn-clear { background: transparent; color: #666; border: 1px solid #333; }
+    .btn-clear:hover { color: #f87171; border-color: #f87171; }
 
     /* Todo cards */
     .todo-list { display: flex; flex-direction: column; gap: 12px; }
@@ -77,7 +81,11 @@
   <div class="create-form">
     <input type="text" id="title" placeholder="Todo title (e.g. Write a hello world script)" />
     <textarea id="description" placeholder="Description (e.g. Create a file hello.ts that prints hello world)"></textarea>
-    <button onclick="createTodo()">Add Todo</button>
+    <div style="display:flex;gap:8px">
+      <button onclick="createTodo()">Add Todo</button>
+      <button class="btn-seed" onclick="seedDemos()">Seed Demo Todos</button>
+      <button class="btn-clear" onclick="clearAll()">Clear All</button>
+    </div>
   </div>
 
   <div class="todo-list" id="todoList"></div>
@@ -85,7 +93,7 @@
   <script>
     const adapterAvailability = {};
     const eventSources = {};
-    const eventLogs = {}; // todoId -> array of event strings
+    let eventLogs = {}; // todoId -> array of event strings
 
     // -----------------------------------------------------------------------
     // API helpers
@@ -163,9 +171,15 @@
             ${r.summary ? `<div class="label">Summary</div><div class="value">${esc(r.summary)}</div>` : ""}
             <div class="result-grid">
               ${r.model ? `<div><div class="label">Model</div><div class="value">${esc(r.model)}</div></div>` : ""}
-              ${r.costUsd != null ? `<div><div class="label">Cost</div><div class="value">$${r.costUsd.toFixed(4)}</div></div>` : ""}
+              ${r.costUsd != null ? `<div><div class="label">Est. Cost</div><div class="value">$${r.costUsd.toFixed(4)}</div></div>` : ""}
               <div><div class="label">Duration</div><div class="value">${(r.durationMs / 1000).toFixed(1)}s</div></div>
               <div><div class="label">Exit Code</div><div class="value">${r.exitCode ?? "N/A"}</div></div>
+              ${r.usage ? `
+                <div><div class="label">Input Tokens</div><div class="value">${r.usage.inputTokens.toLocaleString()}</div></div>
+                <div><div class="label">Output Tokens</div><div class="value">${r.usage.outputTokens.toLocaleString()}</div></div>
+                <div><div class="label">Total Tokens</div><div class="value">${(r.usage.inputTokens + r.usage.outputTokens).toLocaleString()}</div></div>
+                ${r.usage.cachedInputTokens ? `<div><div class="label">Cached Tokens</div><div class="value">${r.usage.cachedInputTokens.toLocaleString()}</div></div>` : ""}
+              ` : ""}
             </div>
             ${r.errorMessage ? `<div class="label" style="margin-top:8px">Error</div><div class="value" style="color:#f87171">${esc(r.errorMessage)}</div>` : ""}
           </div>`;
@@ -208,6 +222,17 @@
       loadTodos();
     }
 
+    async function seedDemos() {
+      await api("POST", "/api/todos/seed");
+      loadTodos();
+    }
+
+    async function clearAll() {
+      await api("DELETE", "/api/todos");
+      eventLogs = {};
+      loadTodos();
+    }
+
     async function removeTodo(id) {
       await api("DELETE", `/api/todos/${id}`);
       delete eventLogs[id];
@@ -242,7 +267,7 @@
           return;
         }
         if (event.type === "done") {
-          // Final reload will pick up result
+          appendEvent(todoId, event);
           return;
         }
         appendEvent(todoId, event);
@@ -287,9 +312,32 @@
         case "result":
           const cost = d.cost != null ? ` | $${d.cost.toFixed(4)}` : "";
           return `<div class="event event-result">[done] ${esc(d.text || "")}${cost}</div>`;
+        case "done":
+          return formatDoneEvent(d);
         default:
           return "";
       }
+    }
+
+    function formatDoneEvent(d) {
+      const parts = [];
+      const status = d.status === "done" ? "completed" : "failed";
+      parts.push(`Status: ${status}`);
+      if (d.durationMs != null) parts.push(`Duration: ${(d.durationMs / 1000).toFixed(1)}s`);
+      if (d.costUsd != null) parts.push(`Cost: $${d.costUsd.toFixed(4)}`);
+      if (d.usage) {
+        const u = d.usage;
+        const total = (u.inputTokens || 0) + (u.outputTokens || 0);
+        let tokens = `Tokens: ${total.toLocaleString()} total`;
+        tokens += ` (${(u.inputTokens || 0).toLocaleString()} input`;
+        tokens += `, ${(u.outputTokens || 0).toLocaleString()} output`;
+        if (u.cachedInputTokens) tokens += `, ${u.cachedInputTokens.toLocaleString()} cached`;
+        tokens += `)`;
+        parts.push(tokens);
+      }
+      if (d.summary) parts.push(`Summary: ${d.summary}`);
+      if (d.errorMessage) parts.push(`Error: ${d.errorMessage}`);
+      return `<div class="event event-result">[finished] ${esc(parts.join(" | "))}</div>`;
     }
 
     function truncJson(obj) {
@@ -304,7 +352,7 @@
     // -----------------------------------------------------------------------
     // Init
     // -----------------------------------------------------------------------
-    loadAdapters();
+    loadAdapters().then(() => loadTodos());
     loadTodos();
   </script>
 </body>
