@@ -26,9 +26,13 @@ const mockAdapter: AdapterModule = {
   type: "mock-lifecycle",
   async execute() {
     return {
+      runId: "mock-run-id",
       exitCode: 0,
       signal: null,
       timedOut: false,
+      startedAt: new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+      durationMs: 0,
       errorMessage: null,
       errorCode: null,
       costUsd: null,

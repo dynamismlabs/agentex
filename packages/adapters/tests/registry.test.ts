@@ -43,9 +43,13 @@ describe("registry", () => {
     const custom: AdapterModule = {
       type: "custom",
       execute: async () => ({
+        runId: "test",
         exitCode: 0,
         signal: null,
         timedOut: false,
+        startedAt: new Date().toISOString(),
+        completedAt: new Date().toISOString(),
+        durationMs: 0,
         errorMessage: null,
         errorCode: null,
         costUsd: null,

@@ -5,6 +5,8 @@ export async function executeOpenclawAdapter(ctx: ExecutionContext): Promise<Exe
   const runId = ctx.runId ?? uuidv7();
   const model = ctx.model ?? ctx.config?.model;
   const config = ctx.config ?? {};
+  const startedAt = new Date().toISOString();
+  const startMs = Date.now();
   const gatewayUrl = config.command?.trim() || "http://localhost:3001";
   const endpoint = gatewayUrl.replace(/\/$/, "") + "/api/agent/run";
 
@@ -47,6 +49,9 @@ export async function executeOpenclawAdapter(ctx: ExecutionContext): Promise<Exe
         exitCode: 1,
         signal: null,
         timedOut: false,
+        startedAt,
+        completedAt: new Date().toISOString(),
+        durationMs: Date.now() - startMs,
         errorMessage: `OpenClaw gateway returned ${response.status}: ${errorText}`,
         errorCode: response.status === 401 ? "auth_required" : null,
         costUsd: null,
@@ -85,6 +90,9 @@ export async function executeOpenclawAdapter(ctx: ExecutionContext): Promise<Exe
       exitCode: 0,
       signal: null,
       timedOut: false,
+      startedAt,
+      completedAt: new Date().toISOString(),
+      durationMs: Date.now() - startMs,
       errorMessage: null,
       errorCode: null,
       costUsd: typeof result["costUsd"] === "number" ? result["costUsd"] : null,
@@ -103,6 +111,9 @@ export async function executeOpenclawAdapter(ctx: ExecutionContext): Promise<Exe
         exitCode: null,
         signal: null,
         timedOut: true,
+        startedAt,
+        completedAt: new Date().toISOString(),
+        durationMs: Date.now() - startMs,
         errorMessage: `Timed out after ${config.timeoutSec ?? 0}s`,
         errorCode: "timeout",
         costUsd: null,
@@ -120,6 +131,9 @@ export async function executeOpenclawAdapter(ctx: ExecutionContext): Promise<Exe
       exitCode: null,
       signal: null,
       timedOut: false,
+      startedAt,
+      completedAt: new Date().toISOString(),
+      durationMs: Date.now() - startMs,
       errorMessage: err instanceof Error ? err.message : "OpenClaw execution failed",
       errorCode: null,
       costUsd: null,

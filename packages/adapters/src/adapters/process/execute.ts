@@ -8,6 +8,8 @@ export async function executeProcessAdapter(ctx: ExecutionContext): Promise<Exec
   const runId = ctx.runId ?? uuidv7();
   const cwd = ctx.cwd ?? process.cwd();
   const config = ctx.config ?? {};
+  const startedAt = new Date().toISOString();
+  const startMs = Date.now();
   const command = config.command;
 
   if (!command) {
@@ -16,6 +18,9 @@ export async function executeProcessAdapter(ctx: ExecutionContext): Promise<Exec
       exitCode: null,
       signal: null,
       timedOut: false,
+      startedAt,
+      completedAt: new Date().toISOString(),
+      durationMs: Date.now() - startMs,
       errorMessage: 'Process adapter requires config.command to be set.',
       errorCode: "binary_not_found",
       costUsd: null,
@@ -37,6 +42,9 @@ export async function executeProcessAdapter(ctx: ExecutionContext): Promise<Exec
       exitCode: null,
       signal: null,
       timedOut: false,
+      startedAt,
+      completedAt: new Date().toISOString(),
+      durationMs: Date.now() - startMs,
       errorMessage: err instanceof Error ? err.message : "Command not found",
       errorCode: "binary_not_found",
       costUsd: null,
@@ -76,11 +84,15 @@ export async function executeProcessAdapter(ctx: ExecutionContext): Promise<Exec
     return null;
   })();
 
+  const completedAt = new Date().toISOString();
   return {
     runId,
     exitCode: proc.exitCode,
     signal: proc.signal ?? null,
     timedOut: proc.timedOut,
+    startedAt,
+    completedAt,
+    durationMs: new Date(completedAt).getTime() - startMs,
     errorMessage,
     errorCode,
     costUsd: null,

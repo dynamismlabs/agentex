@@ -63,9 +63,13 @@ async function testAdapter(type: string) {
 
   console.log(`\n  Exit code: ${result.exitCode}`);
   console.log(`  Timed out: ${result.timedOut}`);
+  console.log(`  Duration: ${(result.durationMs / 1000).toFixed(1)}s`);
   console.log(`  Model: ${result.model}`);
   console.log(`  Billing: ${result.billingType}`);
   console.log(`  Cost: ${result.costUsd != null ? `$${result.costUsd.toFixed(4)}` : 'n/a'}`);
+  if (result.usage) {
+    console.log(`  Tokens: ${result.usage.inputTokens} in / ${result.usage.outputTokens} out${result.usage.cachedInputTokens ? ` (${result.usage.cachedInputTokens} cached)` : ''}`);
+  }
   console.log(`  Summary: ${result.summary?.slice(0, 120)}`);
   console.log(`  Session ID: ${result.sessionDisplayId}`);
   console.log(`  Error: ${result.errorMessage ?? 'none'}`);

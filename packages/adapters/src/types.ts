@@ -41,6 +41,9 @@ export interface ExecutionResult {
   exitCode: number | null;
   signal: string | null;
   timedOut: boolean;
+  startedAt: string;
+  completedAt: string;
+  durationMs: number;
   errorMessage: string | null;
   errorCode: string | null;
   usage?: { inputTokens: number; outputTokens: number; cachedInputTokens?: number };

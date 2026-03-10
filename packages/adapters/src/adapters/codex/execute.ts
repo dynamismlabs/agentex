@@ -23,6 +23,7 @@ export async function executeCodexAdapter(ctx: ExecutionContext): Promise<Execut
   const cwd = ctx.cwd ?? process.cwd();
   const model = ctx.model ?? ctx.config?.model;
   const config = ctx.config ?? {};
+  const startedAt = new Date().toISOString();
 
   // 1. Resolve binary
   let resolvedBinary;
@@ -34,6 +35,9 @@ export async function executeCodexAdapter(ctx: ExecutionContext): Promise<Execut
       exitCode: null,
       signal: null,
       timedOut: false,
+      startedAt,
+      completedAt: new Date().toISOString(),
+      durationMs: Date.now() - new Date(startedAt).getTime(),
       errorMessage: err instanceof Error ? err.message : "Binary not found",
       errorCode: "binary_not_found",
       costUsd: null,
@@ -181,11 +185,15 @@ export async function executeCodexAdapter(ctx: ExecutionContext): Promise<Execut
       ? { sessionId: resolvedSessionId, cwd }
       : null;
 
+    const completedAt = new Date().toISOString();
     return {
       runId,
       exitCode: proc.exitCode,
       signal: proc.signal ?? null,
       timedOut: proc.timedOut,
+      startedAt,
+      completedAt,
+      durationMs: new Date(completedAt).getTime() - new Date(startedAt).getTime(),
       errorMessage,
       errorCode,
       usage: parsed.usage
