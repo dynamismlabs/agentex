@@ -69,23 +69,43 @@ describe("parseStreamLine", () => {
       session_id: "sess-abc-123",
       model: "claude-sonnet-4-20250514",
     });
-    const event = parseStreamLine(line);
-    expect(event).not.toBeNull();
-    expect(event!.type).toBe("system");
-    if (event?.type === "system") {
+    const events = parseStreamLine(line);
+    expect(events).toHaveLength(1);
+    const event = events[0]!;
+    expect(event.type).toBe("system");
+    if (event.type === "system") {
       expect(event.subtype).toBe("init");
       expect(event.sessionId).toBe("sess-abc-123");
       expect(event.model).toBe("claude-sonnet-4-20250514");
     }
   });
 
-  it("returns null for non-init system events", () => {
+  it("returns empty array for non-init system events", () => {
     const line = JSON.stringify({ type: "system", subtype: "other" });
-    expect(parseStreamLine(line)).toBeNull();
+    expect(parseStreamLine(line)).toHaveLength(0);
   });
 
-  it("returns null for malformed JSON", () => {
-    expect(parseStreamLine("not json")).toBeNull();
+  it("returns empty array for malformed JSON", () => {
+    expect(parseStreamLine("not json")).toHaveLength(0);
+  });
+
+  it("returns multiple events from assistant message with mixed content blocks", () => {
+    const line = JSON.stringify({
+      type: "assistant",
+      message: {
+        content: [
+          { type: "text", text: "I'll create that file." },
+          { type: "tool_use", name: "write_file", input: { path: "test.ts" } },
+        ],
+      },
+    });
+    const events = parseStreamLine(line);
+    expect(events).toHaveLength(2);
+    expect(events[0]!.type).toBe("assistant");
+    expect(events[1]!.type).toBe("tool_call");
+    if (events[1]!.type === "tool_call") {
+      expect(events[1]!.name).toBe("write_file");
+    }
   });
 });
 

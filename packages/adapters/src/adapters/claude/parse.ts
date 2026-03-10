@@ -178,24 +178,25 @@ export function toStreamEvents(stdout: string): StreamEvent[] {
   return events;
 }
 
-export function parseStreamLine(line: string): StreamEvent | null {
+export function parseStreamLine(line: string): StreamEvent[] {
   const event = parseJson(line);
-  if (!event) return null;
+  if (!event) return [];
 
   const type = asString(event["type"], "");
   const timestamp = new Date().toISOString();
 
   if (type === "system" && asString(event["subtype"], "") === "init") {
-    return {
+    return [{
       type: "system",
       subtype: "init",
       sessionId: asString(event["session_id"], "") || null,
       model: asString(event["model"], "") || null,
       timestamp,
-    };
+    }];
   }
 
   if (type === "assistant") {
+    const events: StreamEvent[] = [];
     const message = parseObject(event["message"]);
     const content = Array.isArray(message["content"]) ? message["content"] : [];
     for (const entry of content) {
@@ -203,35 +204,35 @@ export function parseStreamLine(line: string): StreamEvent | null {
       const block = entry as Record<string, unknown>;
       const blockType = asString(block["type"], "");
       if (blockType === "text") {
-        return { type: "assistant", text: asString(block["text"], ""), timestamp };
-      }
-      if (blockType === "thinking") {
-        return { type: "thinking", text: asString(block["thinking"], ""), timestamp };
-      }
-      if (blockType === "tool_use") {
-        return { type: "tool_call", name: asString(block["name"], ""), input: block["input"], timestamp };
-      }
-      if (blockType === "tool_result") {
-        return {
+        events.push({ type: "assistant", text: asString(block["text"], ""), timestamp });
+      } else if (blockType === "thinking") {
+        events.push({ type: "thinking", text: asString(block["thinking"], ""), timestamp });
+      } else if (blockType === "tool_use") {
+        events.push({ type: "tool_call", name: asString(block["name"], ""), input: block["input"], timestamp });
+      } else if (blockType === "tool_result") {
+        events.push({
           type: "tool_result",
           toolCallId: asString(block["tool_use_id"], ""),
           content: asString(block["content"], ""),
           isError: block["is_error"] === true,
           timestamp,
-        };
+        });
       }
     }
-  } else if (type === "result") {
-    return {
+    return events;
+  }
+
+  if (type === "result") {
+    return [{
       type: "result",
       text: asString(event["result"], ""),
       cost: typeof event["total_cost_usd"] === "number" ? event["total_cost_usd"] : null,
       isError: event["is_error"] === true,
       timestamp,
-    };
+    }];
   }
 
-  return null;
+  return [];
 }
 
 const CLAUDE_AUTH_REQUIRED_RE = /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+`?claude\s+login`?|login\s+required|requires\s+login|unauthorized|authentication\s+required)/i;

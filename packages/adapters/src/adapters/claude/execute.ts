@@ -116,8 +116,7 @@ export async function executeClaudeAdapter(ctx: ExecutionContext): Promise<Execu
           for (const line of lines) {
             const trimmed = line.trim();
             if (!trimmed) continue;
-            const event = parseStreamLine(trimmed);
-            if (event) {
+            for (const event of parseStreamLine(trimmed)) {
               try { await ctx.onEvent(event); } catch { /* swallow */ }
             }
           }
@@ -127,8 +126,7 @@ export async function executeClaudeAdapter(ctx: ExecutionContext): Promise<Execu
 
     // Parse remaining buffer
     if (lineBuffer.trim() && ctx.onEvent) {
-      const event = parseStreamLine(lineBuffer.trim());
-      if (event) {
+      for (const event of parseStreamLine(lineBuffer.trim())) {
         try { await ctx.onEvent(event); } catch { /* swallow */ }
       }
     }
