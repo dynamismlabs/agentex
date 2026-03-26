@@ -12,6 +12,7 @@ export interface RunProcessOptions {
   graceSec?: number;
   maxCaptureBytes?: number;
   onOutput?: (stream: "stdout" | "stderr", chunk: string) => void | Promise<void>;
+  onStart?: (pid: number) => void;
 }
 
 export interface RunProcessResult {
@@ -77,6 +78,11 @@ export function runChildProcess(opts: RunProcessOptions): Promise<RunProcessResu
       shell: false,
       detached: process.platform !== "win32", // Enable process group on Unix
     });
+
+    // Notify caller of the child PID
+    if (opts.onStart && child.pid != null) {
+      opts.onStart(child.pid);
+    }
 
     // Write stdin and close
     if (opts.stdin != null) {

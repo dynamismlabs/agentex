@@ -107,6 +107,7 @@ export async function executeCodexProvider(ctx: ExecutionContext): Promise<Execu
       stdin: ctx.prompt,
       timeoutSec: config.timeoutSec,
       graceSec: config.graceSec,
+      onStart: ctx.onStart,
       onOutput: async (stream, chunk) => {
         if (stream === "stderr") {
           // Filter rollout noise before forwarding

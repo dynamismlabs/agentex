@@ -69,6 +69,7 @@ export async function executeProcessProvider(ctx: ExecutionContext): Promise<Exe
     stdin: ctx.prompt,
     timeoutSec: config.timeoutSec,
     graceSec: config.graceSec,
+    onStart: ctx.onStart,
     onOutput: ctx.onOutput ? async (stream, chunk) => {
       try { await ctx.onOutput!(stream, chunk); } catch { /* swallow */ }
     } : undefined,

@@ -105,6 +105,7 @@ export async function executeClaudeProvider(ctx: ExecutionContext): Promise<Exec
       stdin: ctx.prompt,
       timeoutSec: config.timeoutSec,
       graceSec: config.graceSec,
+      onStart: ctx.onStart,
       onOutput: async (stream, chunk) => {
         // Forward raw output
         if (ctx.onOutput) {

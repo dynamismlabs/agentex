@@ -18,6 +18,7 @@ export interface ExecutionContext {
   config?: ProviderConfig;
   onOutput?: (stream: "stdout" | "stderr", chunk: string) => void | Promise<void>;
   onEvent?: (event: StreamEvent) => void | Promise<void>;
+  onStart?: (pid: number) => void;
 }
 
 // Provider-specific configuration
