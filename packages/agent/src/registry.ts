@@ -3,6 +3,10 @@ import { claudeProvider } from "./providers/claude/index.js";
 import { codexProvider } from "./providers/codex/index.js";
 import { openclawProvider } from "./providers/openclaw/index.js";
 import { processProvider } from "./providers/process/index.js";
+import { geminiProvider } from "./providers/gemini/index.js";
+import { cursorProvider } from "./providers/cursor/index.js";
+import { opencodeProvider } from "./providers/opencode/index.js";
+import { piProvider } from "./providers/pi/index.js";
 
 const providers = new Map<string, ProviderModule>();
 
@@ -11,6 +15,10 @@ providers.set("claude", claudeProvider);
 providers.set("codex", codexProvider);
 providers.set("openclaw", openclawProvider);
 providers.set("process", processProvider);
+providers.set("gemini", geminiProvider);
+providers.set("cursor", cursorProvider);
+providers.set("opencode", opencodeProvider);
+providers.set("pi", piProvider);
 
 export function getProvider(type: string): ProviderModule {
   const provider = providers.get(type);

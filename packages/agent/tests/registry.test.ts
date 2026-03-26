@@ -25,13 +25,37 @@ describe("registry", () => {
     expect(provider.type).toBe("process");
   });
 
-  it("listProviders returns all four types", () => {
+  it("getProvider returns gemini provider", () => {
+    const provider = getProvider("gemini");
+    expect(provider.type).toBe("gemini");
+  });
+
+  it("getProvider returns cursor provider", () => {
+    const provider = getProvider("cursor");
+    expect(provider.type).toBe("cursor");
+  });
+
+  it("getProvider returns opencode provider", () => {
+    const provider = getProvider("opencode");
+    expect(provider.type).toBe("opencode");
+  });
+
+  it("getProvider returns pi provider", () => {
+    const provider = getProvider("pi");
+    expect(provider.type).toBe("pi");
+  });
+
+  it("listProviders returns all registered types", () => {
     const types = listProviders();
     expect(types).toContain("claude");
     expect(types).toContain("codex");
     expect(types).toContain("openclaw");
     expect(types).toContain("process");
-    expect(types.length).toBeGreaterThanOrEqual(4);
+    expect(types).toContain("gemini");
+    expect(types).toContain("cursor");
+    expect(types).toContain("opencode");
+    expect(types).toContain("pi");
+    expect(types.length).toBeGreaterThanOrEqual(8);
   });
 
   it("getProvider throws for unknown type", () => {

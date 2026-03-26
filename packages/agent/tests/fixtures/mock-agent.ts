@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Mock agent script that mimics Claude/Codex CLI behavior for integration tests.
 // Behavior controlled by MOCK_BEHAVIOR env var: "success", "max_turns", "auth_required", "unknown_session", "timeout", "error"
-// Format controlled by MOCK_FORMAT env var: "claude" (default), "codex"
+// Format controlled by MOCK_FORMAT env var: "claude" (default), "codex", "gemini", "cursor", "opencode", "pi"
 
 import process from "node:process";
 
@@ -15,6 +15,14 @@ process.stdin.on("data", (chunk: string) => { stdin += chunk; });
 process.stdin.on("end", () => {
   if (format === "codex") {
     emitCodex();
+  } else if (format === "gemini") {
+    emitGemini();
+  } else if (format === "cursor") {
+    emitCursor();
+  } else if (format === "opencode") {
+    emitOpenCode();
+  } else if (format === "pi") {
+    emitPi();
   } else {
     emitClaude();
   }
@@ -108,6 +116,164 @@ function emitCodex() {
     case "error":
       console.log(JSON.stringify({
         type: "error", message: "Codex error occurred",
+      }));
+      process.exit(1);
+      break;
+
+    default:
+      process.exit(1);
+  }
+}
+
+function emitGemini() {
+  switch (behavior) {
+    case "success":
+      console.log(JSON.stringify({
+        type: "system", subtype: "init", session_id: "mock-gemini-sess-1", model: "gemini-2.5-pro",
+      }));
+      console.log(JSON.stringify({
+        type: "assistant", session_id: "mock-gemini-sess-1",
+        message: { content: [{ type: "text", text: `Processed: ${stdin.trim().slice(0, 50)}` }] },
+      }));
+      console.log(JSON.stringify({
+        type: "result", session_id: "mock-gemini-sess-1",
+        result: `Done: ${stdin.trim().slice(0, 50)}`,
+        is_error: false, total_cost_usd: 0.003,
+        usage: { input_tokens: 100, output_tokens: 30, cached_input_tokens: 5 },
+      }));
+      process.exit(0);
+      break;
+
+    case "auth_required":
+      process.stderr.write("Error: API key required\n");
+      process.exit(1);
+      break;
+
+    case "timeout":
+      // Do nothing — hang forever (will be killed by timeout)
+      break;
+
+    case "error":
+      console.log(JSON.stringify({
+        type: "error", message: "Gemini error occurred",
+      }));
+      process.exit(1);
+      break;
+
+    default:
+      process.exit(1);
+  }
+}
+
+function emitCursor() {
+  switch (behavior) {
+    case "success":
+      console.log(JSON.stringify({
+        type: "system", subtype: "init", session_id: "mock-cursor-sess-1", model: "gpt-4o",
+      }));
+      console.log(JSON.stringify({
+        type: "assistant", session_id: "mock-cursor-sess-1",
+        message: { content: [{ type: "text", text: `Processed: ${stdin.trim().slice(0, 50)}` }] },
+      }));
+      console.log(JSON.stringify({
+        type: "result", session_id: "mock-cursor-sess-1",
+        result: `Done: ${stdin.trim().slice(0, 50)}`,
+        is_error: false, total_cost_usd: 0.0025,
+        usage: { input_tokens: 90, output_tokens: 25, cached_input_tokens: 3 },
+        model: "gpt-4o",
+      }));
+      process.exit(0);
+      break;
+
+    case "auth_required":
+      process.stderr.write("Error: CURSOR_API_KEY is not set\n");
+      process.exit(1);
+      break;
+
+    case "timeout":
+      // Do nothing — hang forever (will be killed by timeout)
+      break;
+
+    case "error":
+      console.log(JSON.stringify({
+        type: "error", message: "Cursor error occurred",
+      }));
+      process.exit(1);
+      break;
+
+    default:
+      process.exit(1);
+  }
+}
+
+function emitOpenCode() {
+  switch (behavior) {
+    case "success":
+      console.log(JSON.stringify({
+        type: "text", sessionID: "mock-oc-sess-1",
+        part: { text: `Processed: ${stdin.trim().slice(0, 50)}` },
+      }));
+      console.log(JSON.stringify({
+        type: "step_finish", sessionID: "mock-oc-sess-1",
+        part: {
+          tokens: { input: 100, output: 30, reasoning: 5, cache: { read: 5 } },
+          cost: 0.003,
+        },
+      }));
+      process.exit(0);
+      break;
+
+    case "auth_required":
+      process.stderr.write("Error: API key required\n");
+      process.exit(1);
+      break;
+
+    case "timeout":
+      // Do nothing — hang forever (will be killed by timeout)
+      break;
+
+    case "error":
+      console.log(JSON.stringify({
+        type: "error", message: "OpenCode error occurred",
+      }));
+      process.exit(1);
+      break;
+
+    default:
+      process.exit(1);
+  }
+}
+
+function emitPi() {
+  switch (behavior) {
+    case "success":
+      console.log(JSON.stringify({
+        type: "turn_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: `Processed: ${stdin.trim().slice(0, 50)}` }],
+          usage: { input: 80, output: 20, cacheRead: 5, cost: { total: 0.002 } },
+        },
+      }));
+      console.log(JSON.stringify({
+        type: "agent_end",
+        messages: [{ role: "assistant", content: [{ type: "text", text: `Done: ${stdin.trim().slice(0, 50)}` }] }],
+      }));
+      process.exit(0);
+      break;
+
+    case "auth_required":
+      process.stderr.write("Error: authentication required\n");
+      process.exit(1);
+      break;
+
+    case "timeout":
+      // Do nothing — hang forever (will be killed by timeout)
+      break;
+
+    case "error":
+      console.log(JSON.stringify({
+        type: "error", message: "Pi error occurred",
       }));
       process.exit(1);
       break;

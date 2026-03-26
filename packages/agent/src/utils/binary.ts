@@ -21,6 +21,26 @@ const COMMON_PATHS_UNIX: Record<string, string[]> = {
     "/usr/local/bin/codex",
     path.join(os.homedir(), ".npm-global", "bin", "codex"),
   ],
+  gemini: [
+    path.join(os.homedir(), ".local", "bin", "gemini"),
+    "/usr/local/bin/gemini",
+    path.join(os.homedir(), ".npm-global", "bin", "gemini"),
+  ],
+  agent: [
+    path.join(os.homedir(), ".local", "bin", "agent"),
+    "/usr/local/bin/agent",
+    path.join(os.homedir(), ".npm-global", "bin", "agent"),
+  ],
+  opencode: [
+    path.join(os.homedir(), ".local", "bin", "opencode"),
+    "/usr/local/bin/opencode",
+    path.join(os.homedir(), ".npm-global", "bin", "opencode"),
+  ],
+  pi: [
+    path.join(os.homedir(), ".local", "bin", "pi"),
+    "/usr/local/bin/pi",
+    path.join(os.homedir(), ".npm-global", "bin", "pi"),
+  ],
 };
 
 function getCommonPathsWindows(name: string): string[] {
@@ -128,14 +148,17 @@ export async function findBinary(name: string, configOverride?: string): Promise
     return result;
   }
 
+  const installHints: Record<string, string> = {
+    claude: "Install: npm install -g @anthropic-ai/claude-code",
+    codex: "Install: npm install -g @openai/codex",
+    gemini: "Install: npm install -g @anthropic-ai/claude-code (Gemini CLI)",
+    agent: "Install the Cursor CLI agent",
+    opencode: "Install: npm install -g opencode-ai",
+    pi: "Install: npm install -g @mariozechner/pi-coding-agent",
+  };
   throw new Error(
     `Could not find "${name}" binary. Searched common install paths and PATH. ` +
-    `Install ${name} and ensure it's available in your PATH. ` +
-    (name === "claude"
-      ? `Install: npm install -g @anthropic-ai/claude-code`
-      : name === "codex"
-        ? `Install: npm install -g @openai/codex`
-        : `Ensure "${name}" is installed and on your PATH.`)
+    (installHints[name] ?? `Ensure "${name}" is installed and on your PATH.`)
   );
 }
 

@@ -34,6 +34,10 @@ export interface ProviderConfig {
   instructionsFile?: string;
   mcpServers?: McpServerConfig[];
   extraArgs?: string[];
+  search?: boolean;
+  sandbox?: boolean;
+  thinking?: string;
+  mode?: string;
 }
 
 // Execution output

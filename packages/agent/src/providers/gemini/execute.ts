@@ -3,14 +3,14 @@ import type { ExecutionContext, ExecutionResult } from "../../types.js";
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { runChildProcess, deriveErrorCode } from "../../utils/process.js";
-import { injectWorkspaceSkills } from "../../utils/skills.js";
+import { injectHomeSkills } from "../../utils/skills.js";
 import { uuidv7 } from "../../utils/uuid.js";
 import {
-  parseCodexJsonl,
-  parseCodexStreamLine,
-  stripCodexRolloutNoise,
-  isCodexAuthRequired,
-  isCodexUnknownSessionError,
+  parseGeminiJsonl,
+  parseGeminiStreamLine,
+  isGeminiUnknownSessionError,
+  isGeminiAuthRequired,
+  isGeminiTurnLimit,
 } from "./parse.js";
 
 function hasNonEmptyEnvValue(env: Record<string, string>, key: string): boolean {
@@ -18,7 +18,7 @@ function hasNonEmptyEnvValue(env: Record<string, string>, key: string): boolean 
   return typeof raw === "string" && raw.trim().length > 0;
 }
 
-export async function executeCodexProvider(ctx: ExecutionContext): Promise<ExecutionResult> {
+export async function executeGeminiProvider(ctx: ExecutionContext): Promise<ExecutionResult> {
   const runId = ctx.runId ?? uuidv7();
   const cwd = ctx.cwd ?? process.cwd();
   const model = ctx.model ?? ctx.config?.model;
@@ -28,7 +28,7 @@ export async function executeCodexProvider(ctx: ExecutionContext): Promise<Execu
   // 1. Resolve binary
   let resolvedBinary;
   try {
-    resolvedBinary = await findBinary("codex", config.command);
+    resolvedBinary = await findBinary("gemini", config.command);
   } catch (err) {
     return {
       runId,
@@ -53,12 +53,15 @@ export async function executeCodexProvider(ctx: ExecutionContext): Promise<Execu
   // 2. Build env & detect billing
   const env = buildEnv(ctx.env);
   ensurePathInEnv(env);
-  const billingType = hasNonEmptyEnvValue(env, "OPENAI_API_KEY") ? "api" as const : "subscription" as const;
+  const billingType =
+    hasNonEmptyEnvValue(env, "GEMINI_API_KEY") || hasNonEmptyEnvValue(env, "GOOGLE_API_KEY")
+      ? ("api" as const)
+      : ("subscription" as const);
 
-  // 3. Inject skills into workspace
+  // 3. Inject skills into ~/.gemini/skills/
   if (config.skillDirs && config.skillDirs.length > 0) {
     try {
-      await injectWorkspaceSkills(config.skillDirs, cwd);
+      await injectHomeSkills(config.skillDirs, "gemini");
     } catch {
       // Non-fatal
     }
@@ -71,7 +74,7 @@ export async function executeCodexProvider(ctx: ExecutionContext): Promise<Execu
     const id =
       (sessionParams["sessionId"] as string | undefined) ??
       (sessionParams["session_id"] as string | undefined) ??
-      (sessionParams["thread_id"] as string | undefined);
+      (sessionParams["checkpoint_id"] as string | undefined);
     if (!id || typeof id !== "string") return null;
     const sessionCwd = sessionParams["cwd"] as string | undefined;
     if (sessionCwd && path.resolve(sessionCwd) !== path.resolve(cwd)) return null;
@@ -80,18 +83,19 @@ export async function executeCodexProvider(ctx: ExecutionContext): Promise<Execu
 
   // 5. Build args
   const buildArgs = (resumeSessionId: string | null): string[] => {
-    const args = [...resolvedBinary.prefixArgs];
-    if (config.search) args.push("--search");
-    args.push("exec", "--json");
-    if (config.skipPermissions) args.push("--dangerously-bypass-approvals-and-sandbox");
+    const args = [...resolvedBinary.prefixArgs, "--output-format", "stream-json"];
+    if (resumeSessionId) args.push("--resume", resumeSessionId);
     if (model) args.push("--model", model);
-    if (config.effort) args.push("-c", `model_reasoning_effort=${JSON.stringify(config.effort)}`);
-    if (config.extraArgs) args.push(...config.extraArgs);
-    if (resumeSessionId) {
-      args.push("resume", resumeSessionId, "-");
-    } else {
-      args.push("-");
+    if (config.skipPermissions !== false) {
+      args.push("--approval-mode", "yolo");
     }
+    if (config.sandbox) {
+      args.push("--sandbox");
+    } else {
+      args.push("--sandbox=none");
+    }
+    if (config.extraArgs) args.push(...config.extraArgs);
+    args.push("--prompt", ctx.prompt);
     return args;
   };
 
@@ -106,34 +110,23 @@ export async function executeCodexProvider(ctx: ExecutionContext): Promise<Execu
       args,
       cwd,
       env,
-      stdin: ctx.prompt,
       timeoutSec: config.timeoutSec,
       graceSec: config.graceSec,
       onStart: ctx.onStart,
       onOutput: async (stream, chunk) => {
-        if (stream === "stderr") {
-          // Filter rollout noise before forwarding
-          const cleaned = stripCodexRolloutNoise(chunk);
-          if (cleaned.trim() && ctx.onOutput) {
-            try { await ctx.onOutput(stream, cleaned); } catch { /* swallow */ }
-          }
-        } else {
-          if (ctx.onOutput) {
-            try { await ctx.onOutput(stream, chunk); } catch { /* swallow */ }
-          }
+        if (ctx.onOutput) {
+          try { await ctx.onOutput(stream, chunk); } catch { /* swallow */ }
+        }
 
-          // Parse stdout lines for stream events
-          if (ctx.onEvent) {
-            lineBuffer += chunk;
-            const lines = lineBuffer.split("\n");
-            lineBuffer = lines.pop() ?? "";
-            for (const line of lines) {
-              const trimmed = line.trim();
-              if (!trimmed) continue;
-              const event = parseCodexStreamLine(trimmed);
-              if (event) {
-                try { await ctx.onEvent(event); } catch { /* swallow */ }
-              }
+        if (stream === "stdout" && ctx.onEvent) {
+          lineBuffer += chunk;
+          const lines = lineBuffer.split("\n");
+          lineBuffer = lines.pop() ?? "";
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            for (const event of parseGeminiStreamLine(trimmed)) {
+              try { await ctx.onEvent(event); } catch { /* swallow */ }
             }
           }
         }
@@ -141,8 +134,7 @@ export async function executeCodexProvider(ctx: ExecutionContext): Promise<Execu
     });
 
     if (lineBuffer.trim() && ctx.onEvent) {
-      const event = parseCodexStreamLine(lineBuffer.trim());
-      if (event) {
+      for (const event of parseGeminiStreamLine(lineBuffer.trim())) {
         try { await ctx.onEvent(event); } catch { /* swallow */ }
       }
     }
@@ -154,39 +146,43 @@ export async function executeCodexProvider(ctx: ExecutionContext): Promise<Execu
   let proc = await runAttempt(sessionId);
   let clearSession = false;
 
-  // Check for unknown session — retry once
+  // 8. Check for unknown session — retry once
   if (
     sessionId &&
     !proc.timedOut &&
     (proc.exitCode ?? 0) !== 0 &&
-    isCodexUnknownSessionError(proc.stdout, proc.stderr)
+    isGeminiUnknownSessionError(proc.stdout, proc.stderr)
   ) {
     proc = await runAttempt(null);
     clearSession = true;
   }
 
-  const parsed = parseCodexJsonl(proc.stdout);
+  // 9. Parse result
+  const parsed = parseGeminiJsonl(proc.stdout);
   const processErrorCode = deriveErrorCode(proc);
 
   let errorCode = processErrorCode;
-  if (!errorCode && isCodexAuthRequired(proc.stdout, proc.stderr)) {
+  if (!errorCode && isGeminiAuthRequired(proc.stdout, proc.stderr)) {
     errorCode = "auth_required";
+  }
+  if (!errorCode && isGeminiTurnLimit(proc.exitCode)) {
+    errorCode = "max_turns";
+    clearSession = true;
   }
 
   const errorMessage = (() => {
     if (proc.timedOut) return `Timed out after ${config.timeoutSec ?? 0}s`;
-    if (errorCode === "auth_required") return "Codex requires OPENAI_API_KEY.";
-    if ((proc.exitCode ?? 0) !== 0) {
-      return parsed.errorMessage ?? stripCodexRolloutNoise(proc.stderr).split(/\r?\n/).map((l) => l.trim()).find(Boolean) ?? `Codex exited with code ${proc.exitCode ?? -1}`;
+    if (errorCode === "auth_required") return "Gemini requires authentication. Run `gemini auth login`.";
+    if (parsed.errorMessage) return parsed.errorMessage;
+    if ((proc.exitCode ?? 0) !== 0 && !parsed.summary) {
+      const stderrLine = proc.stderr.split(/\r?\n/).map((l) => l.trim()).find(Boolean);
+      return stderrLine ?? `Gemini exited with code ${proc.exitCode ?? -1}`;
     }
-    if (parsed.isError) return parsed.errorMessage;
     return null;
   })();
 
   const resolvedSessionId = parsed.sessionId;
-  const resultSessionParams = resolvedSessionId
-    ? { sessionId: resolvedSessionId, cwd }
-    : null;
+  const resultSessionParams = resolvedSessionId ? { sessionId: resolvedSessionId, cwd } : null;
 
   const completedAt = new Date().toISOString();
   return {
@@ -200,9 +196,9 @@ export async function executeCodexProvider(ctx: ExecutionContext): Promise<Execu
     errorMessage,
     errorCode,
     usage: parsed.usage
-      ? { inputTokens: parsed.usage.inputTokens, outputTokens: parsed.usage.outputTokens }
+      ? { inputTokens: parsed.usage.inputTokens, outputTokens: parsed.usage.outputTokens, cachedInputTokens: parsed.usage.cachedInputTokens }
       : undefined,
-    costUsd: null,
+    costUsd: parsed.costUsd,
     model: parsed.model ?? model ?? null,
     summary: parsed.summary,
     sessionParams: resultSessionParams,
