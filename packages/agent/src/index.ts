@@ -10,6 +10,8 @@ export {
   listInstalledSkills,
   resolveSkillsHome,
   resolveSkillsWorkspace,
+  resolveNativeSkillsHome,
+  resolveNativeSkillsWorkspace,
   ensureSkillSymlink,
 } from "./utils/skills.js";
 
@@ -31,6 +33,7 @@ export type {
 export type {
   SkillRuntime,
   SkillLocation,
+  SkillChannel,
   InstallSkillsOptions,
   SkillInstallEntry,
   SkillInstallResult,

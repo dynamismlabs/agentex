@@ -31,32 +31,16 @@ interface RemoveResult {
 
 type Location = "workspace" | "global";
 
-const WORKSPACE_RUNTIMES = ["claude", "codex", "gemini", "cursor", "opencode", "pi"] as const;
-const GLOBAL_RUNTIMES = ["gemini", "cursor", "opencode", "pi"] as const;
+const CHANNELS = ["agents", "claude"] as const;
 
-const RUNTIME_LABELS: Record<string, string> = {
-  claude: "Claude",
-  codex: "Codex",
-  gemini: "Gemini",
-  cursor: "Cursor",
-  opencode: "OpenCode",
-  pi: "Pi",
-};
-
-const WORKSPACE_PATHS: Record<string, string> = {
+const CHANNEL_LABELS: Record<string, string> = {
+  agents: ".agents/skills/",
   claude: ".claude/skills/",
-  codex: ".agents/skills/",
-  gemini: ".gemini/skills/",
-  cursor: ".cursor/skills/",
-  opencode: ".claude/skills/",
-  pi: ".pi/agent/skills/",
 };
 
-const GLOBAL_PATHS: Record<string, string> = {
-  gemini: "~/.gemini/skills/",
-  cursor: "~/.cursor/skills/",
-  opencode: "~/.claude/skills/",
-  pi: "~/.pi/agent/skills/",
+const CHANNEL_DESCRIPTIONS: Record<string, string> = {
+  agents: "Codex, Gemini, Cursor, OpenCode, Pi",
+  claude: "Claude Code",
 };
 
 export default function SkillsPanel() {
@@ -111,9 +95,6 @@ export default function SkillsPanel() {
     }
     setActionLoading(null);
   }
-
-  const runtimes = location === "workspace" ? WORKSPACE_RUNTIMES : GLOBAL_RUNTIMES;
-  const pathMap = location === "workspace" ? WORKSPACE_PATHS : GLOBAL_PATHS;
 
   const totalInstalled = Object.values(installed).reduce(
     (sum, skills) => sum + skills.length,
@@ -267,21 +248,20 @@ export default function SkillsPanel() {
           </div>
         ) : (
           <div className="grid gap-4">
-            {runtimes.map((runtime) => {
-              const skills = installed[runtime] ?? [];
-              const runtimePath = pathMap[runtime] ?? "";
+            {CHANNELS.map((channel) => {
+              const skills = installed[channel] ?? [];
               return (
                 <div
-                  key={runtime}
+                  key={channel}
                   className="bg-surface border border-border rounded-xl overflow-hidden"
                 >
                   <div className="flex items-center justify-between px-4 py-3 border-b border-border bg-surface-hover/30">
-                    <div className="flex items-center gap-2">
-                      <span className="text-sm font-semibold text-text-primary">
-                        {RUNTIME_LABELS[runtime]}
+                    <div className="flex flex-col gap-0.5">
+                      <span className="text-sm font-semibold text-text-primary font-mono">
+                        {CHANNEL_LABELS[channel]}
                       </span>
-                      <span className="text-xs text-text-tertiary font-mono">
-                        {runtimePath}
+                      <span className="text-xs text-text-tertiary">
+                        {CHANNEL_DESCRIPTIONS[channel]}
                       </span>
                     </div>
                     <span

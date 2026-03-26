@@ -16,7 +16,7 @@ import {
   removeSkills,
   listInstalledSkills,
 } from "../../packages/agent/src/index.js";
-import type { SkillRuntime, SkillLocation } from "../../packages/agent/src/index.js";
+import type { SkillLocation } from "../../packages/agent/src/index.js";
 import {
   readState,
   writeState,
@@ -603,20 +603,7 @@ const DEMO_SKILL_DIRS = [
   join(__dirname, "skills", "security"),
 ];
 
-const GLOBAL_SKILL_RUNTIMES: SkillRuntime[] = ["gemini", "cursor", "opencode", "pi"];
-const WORKSPACE_SKILL_RUNTIMES: SkillRuntime[] = ["claude", "codex", "gemini", "cursor", "opencode", "pi"];
 const SKILLS_CWD = __dirname;
-
-function resolveSkillOpts(location: SkillLocation): {
-  runtimes: SkillRuntime[];
-  location: SkillLocation;
-  cwd?: string;
-} {
-  if (location === "workspace") {
-    return { runtimes: WORKSPACE_SKILL_RUNTIMES, location: "workspace", cwd: SKILLS_CWD };
-  }
-  return { runtimes: GLOBAL_SKILL_RUNTIMES, location: "global" };
-}
 
 // List available demo skills (source dirs on disk)
 app.get("/api/skills/available", (_req, res) => {
@@ -627,29 +614,15 @@ app.get("/api/skills/available", (_req, res) => {
   res.json({ skills, cwd: SKILLS_CWD });
 });
 
-// List installed skills for all runtimes at a given location
+// List installed skills for all channels at a given location
 app.get("/api/skills", async (req, res) => {
   const location = (req.query.location as SkillLocation) || "workspace";
-  const opts = resolveSkillOpts(location);
-  const result: Record<string, Awaited<ReturnType<typeof listInstalledSkills>>> = {};
-  for (const runtime of opts.runtimes) {
-    try {
-      result[runtime] = await listInstalledSkills(runtime, { location: opts.location, cwd: opts.cwd });
-    } catch {
-      result[runtime] = [];
-    }
-  }
-  res.json(result);
-});
-
-// List installed skills for a runtime
-app.get("/api/skills/:runtime", async (req, res) => {
-  const runtime = req.params.runtime as SkillRuntime;
-  const location = (req.query.location as SkillLocation) || "workspace";
-  const opts = resolveSkillOpts(location);
   try {
-    const installed = await listInstalledSkills(runtime, { location: opts.location, cwd: opts.cwd });
-    res.json(installed);
+    const result = await listInstalledSkills({
+      location,
+      cwd: location === "workspace" ? SKILLS_CWD : undefined,
+    });
+    res.json(result);
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }
@@ -657,13 +630,12 @@ app.get("/api/skills/:runtime", async (req, res) => {
 
 // Install demo skills
 app.post("/api/skills/install", async (req, res) => {
-  const { runtimes, location } = req.body as { runtimes?: SkillRuntime[]; location?: SkillLocation };
-  const opts = resolveSkillOpts(location ?? "workspace");
+  const { location } = req.body as { location?: SkillLocation };
+  const loc = location ?? "workspace";
   try {
     const result = await installSkills(DEMO_SKILL_DIRS, {
-      runtimes: runtimes ?? opts.runtimes,
-      location: opts.location,
-      cwd: opts.cwd,
+      location: loc,
+      cwd: loc === "workspace" ? SKILLS_CWD : undefined,
     });
     res.json(result);
   } catch (err) {
@@ -673,13 +645,12 @@ app.post("/api/skills/install", async (req, res) => {
 
 // Remove demo skills
 app.post("/api/skills/remove", async (req, res) => {
-  const { runtimes, location } = req.body as { runtimes?: SkillRuntime[]; location?: SkillLocation };
-  const opts = resolveSkillOpts(location ?? "workspace");
+  const { location } = req.body as { location?: SkillLocation };
+  const loc = location ?? "workspace";
   try {
     const result = await removeSkills(DEMO_SKILL_DIRS, {
-      runtimes: runtimes ?? opts.runtimes,
-      location: opts.location,
-      cwd: opts.cwd,
+      location: loc,
+      cwd: loc === "workspace" ? SKILLS_CWD : undefined,
     });
     res.json(result);
   } catch (err) {

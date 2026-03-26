@@ -6,32 +6,55 @@ export type SkillRuntime = "claude" | "codex" | "gemini" | "cursor" | "opencode"
 
 export type SkillLocation = "global" | "workspace";
 
-/** Runtimes that support home-directory-based skill discovery. */
-const GLOBAL_RUNTIMES: SkillRuntime[] = ["gemini", "cursor", "opencode", "pi"];
+/**
+ * The two standard skill discovery channels:
+ * - "agents": ~/.agents/skills/ or {cwd}/.agents/skills/ — scanned by Codex, Gemini, Cursor, OpenCode, Pi
+ * - "claude": ~/.claude/skills/ or {cwd}/.claude/skills/ — scanned by Claude Code (the only agent that doesn't scan .agents/)
+ */
+export type SkillChannel = "agents" | "claude";
 
-/** All runtimes support workspace-relative skill discovery. */
-const WORKSPACE_RUNTIMES: SkillRuntime[] = ["claude", "codex", "gemini", "cursor", "opencode", "pi"];
+/**
+ * Native per-runtime directories. Only used when includeNativeDirs is enabled.
+ * These are in addition to the two standard channels.
+ * Claude and Codex are excluded since they ARE the standard channels.
+ */
+const NATIVE_DIRS: Record<string, { global: string; workspace: (cwd: string) => string }> = {
+  gemini: {
+    global: path.join(os.homedir(), ".gemini", "skills"),
+    workspace: (cwd) => path.join(cwd, ".gemini", "skills"),
+  },
+  cursor: {
+    global: path.join(os.homedir(), ".cursor", "skills"),
+    workspace: (cwd) => path.join(cwd, ".cursor", "skills"),
+  },
+  opencode: {
+    global: path.join(os.homedir(), ".config", "opencode", "skills"),
+    workspace: (cwd) => path.join(cwd, ".opencode", "skills"),
+  },
+  pi: {
+    global: path.join(os.homedir(), ".pi", "agent", "skills"),
+    workspace: (cwd) => path.join(cwd, ".pi", "skills"),
+  },
+};
 
 // ---------------------------------------------------------------------------
 // Public API types
 // ---------------------------------------------------------------------------
 
 export interface InstallSkillsOptions {
-  /** Runtimes to install for. Defaults depend on location:
-   *  - "global": gemini, cursor, opencode, pi
-   *  - "workspace": all runtimes (claude, codex, gemini, cursor, opencode, pi) */
-  runtimes?: SkillRuntime[];
   /** Where to install skills. Defaults to "global" (home directory).
-   *  - "global": ~/.gemini/skills/, ~/.cursor/skills/, etc.
-   *  - "workspace": {cwd}/.gemini/skills/, {cwd}/.claude/skills/, etc. */
+   *  - "global": ~/.agents/skills/ + ~/.claude/skills/
+   *  - "workspace": {cwd}/.agents/skills/ + {cwd}/.claude/skills/ */
   location?: SkillLocation;
-  /** Working directory. Required for "workspace" location.
-   *  In "global" mode, also installs for codex at {cwd}/.agents/skills/. */
+  /** Working directory. Required for "workspace" location. */
   cwd?: string;
+  /** Also install into each runtime's native directory (e.g. ~/.gemini/skills/, ~/.cursor/skills/).
+   *  Usually unnecessary since most runtimes scan .agents/skills/. Default: false. */
+  includeNativeDirs?: boolean;
 }
 
 export interface SkillInstallEntry {
-  runtime: string;
+  target: string;
   skillName: string;
   status: "created" | "skipped" | "conflict" | "error";
   targetPath: string;
@@ -47,17 +70,16 @@ export interface SkillInstallResult {
 }
 
 export interface RemoveSkillsOptions {
-  /** Runtimes to remove from. Defaults depend on location. */
-  runtimes?: SkillRuntime[];
   /** Where to remove skills from. Defaults to "global". */
   location?: SkillLocation;
-  /** Working directory. Required for "workspace" location.
-   *  In "global" mode, also removes codex skills from {cwd}/.agents/skills/. */
+  /** Working directory. Required for "workspace" location. */
   cwd?: string;
+  /** Also remove from native runtime directories. Default: false. */
+  includeNativeDirs?: boolean;
 }
 
 export interface SkillRemoveEntry {
-  runtime: string;
+  target: string;
   skillName: string;
   status: "removed" | "not_found" | "conflict" | "error";
   targetPath: string;
@@ -76,28 +98,74 @@ export interface InstalledSkill {
 }
 
 // ---------------------------------------------------------------------------
+// Path resolution
+// ---------------------------------------------------------------------------
+
+/** Resolve the standard skill discovery paths (both channels). */
+function resolveStandardPaths(location: SkillLocation, cwd?: string): Array<{ target: string; skillsHome: string }> {
+  if (location === "workspace") {
+    if (!cwd) throw new Error("cwd is required when location is 'workspace'");
+    return [
+      { target: "agents", skillsHome: path.join(cwd, ".agents", "skills") },
+      { target: "claude", skillsHome: path.join(cwd, ".claude", "skills") },
+    ];
+  }
+  return [
+    { target: "agents", skillsHome: path.join(os.homedir(), ".agents", "skills") },
+    { target: "claude", skillsHome: path.join(os.homedir(), ".claude", "skills") },
+  ];
+}
+
+/** Resolve native per-runtime paths (for includeNativeDirs). */
+function resolveNativePaths(location: SkillLocation, cwd?: string): Array<{ target: string; skillsHome: string }> {
+  const results: Array<{ target: string; skillsHome: string }> = [];
+  for (const [runtime, dirs] of Object.entries(NATIVE_DIRS)) {
+    if (location === "workspace") {
+      if (!cwd) continue;
+      results.push({ target: runtime, skillsHome: dirs.workspace(cwd) });
+    } else {
+      results.push({ target: runtime, skillsHome: dirs.global });
+    }
+  }
+  return results;
+}
+
+/** Build the full list of install/remove targets. */
+function resolveTargets(
+  location: SkillLocation,
+  cwd?: string,
+  includeNativeDirs?: boolean,
+): Array<{ target: string; skillsHome: string }> {
+  const targets = resolveStandardPaths(location, cwd);
+  if (includeNativeDirs) {
+    targets.push(...resolveNativePaths(location, cwd));
+  }
+  return targets;
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
 /**
  * Install skill directories into agent discovery paths via idempotent symlinks.
  *
- * @param location "global" (default) — installs into home-dir paths (~/.gemini/skills/, etc.)
- *                 "workspace" — installs into project-local paths ({cwd}/.gemini/skills/, etc.)
+ * By default, installs into the two standard channels:
+ * - `.agents/skills/` — discovered by Codex, Gemini, Cursor, OpenCode, Pi
+ * - `.claude/skills/` — discovered by Claude Code
+ *
+ * Set `includeNativeDirs: true` to also install into each runtime's
+ * native directory (e.g. `.gemini/skills/`, `.cursor/skills/`).
  *
  * @example
  * ```typescript
  * // Global install (home directory)
- * const result = await installSkills([
- *   "~/.myapp/skills/code-review",
- *   "~/.myapp/skills/deploy-helper",
- * ]);
+ * await installSkills(["~/.myapp/skills/code-review"]);
+ * // Creates ~/.agents/skills/code-review + ~/.claude/skills/code-review
  *
  * // Workspace install (project-local)
- * const result = await installSkills(skillDirs, {
- *   location: "workspace",
- *   cwd: "/path/to/project",
- * });
+ * await installSkills(skillDirs, { location: "workspace", cwd: "/path/to/project" });
+ * // Creates {cwd}/.agents/skills/... + {cwd}/.claude/skills/...
  * ```
  */
 export async function installSkills(
@@ -106,47 +174,24 @@ export async function installSkills(
 ): Promise<SkillInstallResult> {
   const entries: SkillInstallEntry[] = [];
   const location = options?.location ?? "global";
+  const targets = resolveTargets(location, options?.cwd, options?.includeNativeDirs);
 
-  // Build the list of runtime → skillsHome pairs to process
-  const targets: Array<{ runtime: string; skillsHome: string }> = [];
-
-  if (location === "workspace") {
-    if (!options?.cwd) {
-      throw new Error("cwd is required when location is 'workspace'");
-    }
-    const runtimes = options?.runtimes ?? WORKSPACE_RUNTIMES;
-    for (const runtime of runtimes) {
-      targets.push({ runtime, skillsHome: resolveSkillsWorkspace(runtime, options.cwd) });
-    }
-  } else {
-    // Global mode
-    const runtimes = options?.runtimes ?? GLOBAL_RUNTIMES;
-    for (const runtime of runtimes) {
-      const skillsHome = resolveSkillsHome(runtime);
-      if (skillsHome) targets.push({ runtime, skillsHome });
-    }
-    // Backward compat: codex workspace install when cwd provided in global mode
-    if (options?.cwd) {
-      targets.push({ runtime: "codex", skillsHome: path.join(options.cwd, ".agents", "skills") });
-    }
-  }
-
-  for (const { runtime, skillsHome } of targets) {
+  for (const { target, skillsHome } of targets) {
     await fs.mkdir(skillsHome, { recursive: true });
 
     for (const dir of skillDirs) {
       const resolved = path.resolve(dir);
       const name = path.basename(resolved);
-      const target = path.join(skillsHome, name);
+      const symlink = path.join(skillsHome, name);
       try {
-        const status = await ensureSkillSymlink(resolved, target);
-        entries.push({ runtime, skillName: name, status, targetPath: target });
+        const status = await ensureSkillSymlink(resolved, symlink);
+        entries.push({ target, skillName: name, status, targetPath: symlink });
       } catch (err) {
         entries.push({
-          runtime,
+          target,
           skillName: name,
           status: "error",
-          targetPath: target,
+          targetPath: symlink,
           error: err instanceof Error ? err.message : String(err),
         });
       }
@@ -174,58 +219,37 @@ export async function removeSkills(
 ): Promise<SkillRemoveResult> {
   const entries: SkillRemoveEntry[] = [];
   const location = options?.location ?? "global";
+  const targets = resolveTargets(location, options?.cwd, options?.includeNativeDirs);
 
-  const targets: Array<{ runtime: string; skillsHome: string }> = [];
-
-  if (location === "workspace") {
-    if (!options?.cwd) {
-      throw new Error("cwd is required when location is 'workspace'");
-    }
-    const runtimes = options?.runtimes ?? WORKSPACE_RUNTIMES;
-    for (const runtime of runtimes) {
-      targets.push({ runtime, skillsHome: resolveSkillsWorkspace(runtime, options.cwd) });
-    }
-  } else {
-    const runtimes = options?.runtimes ?? GLOBAL_RUNTIMES;
-    for (const runtime of runtimes) {
-      const skillsHome = resolveSkillsHome(runtime);
-      if (skillsHome) targets.push({ runtime, skillsHome });
-    }
-    if (options?.cwd) {
-      targets.push({ runtime: "codex", skillsHome: path.join(options.cwd, ".agents", "skills") });
-    }
-  }
-
-  for (const { runtime, skillsHome } of targets) {
+  for (const { target, skillsHome } of targets) {
     for (const dir of skillDirs) {
       const resolved = path.resolve(dir);
       const name = path.basename(resolved);
-      const target = path.join(skillsHome, name);
+      const symlink = path.join(skillsHome, name);
 
       try {
-        const stat = await fs.lstat(target);
+        const stat = await fs.lstat(symlink);
         if (!stat.isSymbolicLink()) {
-          entries.push({ runtime, skillName: name, status: "conflict", targetPath: target });
+          entries.push({ target, skillName: name, status: "conflict", targetPath: symlink });
           continue;
         }
-        const existing = await fs.readlink(target);
-        const resolvedExisting = path.resolve(path.dirname(target), existing);
+        const existing = await fs.readlink(symlink);
+        const resolvedExisting = path.resolve(path.dirname(symlink), existing);
         if (resolvedExisting !== resolved) {
-          // Symlink points somewhere else — not ours, don't touch it
-          entries.push({ runtime, skillName: name, status: "conflict", targetPath: target });
+          entries.push({ target, skillName: name, status: "conflict", targetPath: symlink });
           continue;
         }
-        await fs.unlink(target);
-        entries.push({ runtime, skillName: name, status: "removed", targetPath: target });
+        await fs.unlink(symlink);
+        entries.push({ target, skillName: name, status: "removed", targetPath: symlink });
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-          entries.push({ runtime, skillName: name, status: "not_found", targetPath: target });
+          entries.push({ target, skillName: name, status: "not_found", targetPath: symlink });
         } else {
           entries.push({
-            runtime,
+            target,
             skillName: name,
             status: "error",
-            targetPath: target,
+            targetPath: symlink,
             error: err instanceof Error ? err.message : String(err),
           });
         }
@@ -240,120 +264,112 @@ export async function removeSkills(
 }
 
 /**
- * List skills currently installed in a runtime's discovery directory.
+ * List skills installed in the standard discovery channels.
  *
- * @param cwdOrOptions - A cwd string (backward compat for codex), or options object.
+ * Returns a record keyed by channel ("agents", "claude") with the skills
+ * found in each. If `includeNativeDirs` is true, also includes native
+ * runtime directories (keyed by runtime name).
  *
  * @example
  * ```typescript
- * // Global (home directory)
- * const skills = await listInstalledSkills("gemini");
+ * const skills = await listInstalledSkills();
+ * // { agents: [...], claude: [...] }
  *
- * // Workspace (project-local)
- * const skills = await listInstalledSkills("gemini", { location: "workspace", cwd: "/path/to/project" });
- *
- * // Backward compat: codex with cwd string
- * const skills = await listInstalledSkills("codex", "/path/to/project");
+ * const skills = await listInstalledSkills({ location: "workspace", cwd: "/my/project" });
+ * // { agents: [...], claude: [...] }
  * ```
  */
 export async function listInstalledSkills(
-  runtime: SkillRuntime,
-  cwdOrOptions?: string | { location?: SkillLocation; cwd?: string },
-): Promise<InstalledSkill[]> {
-  let skillsHome: string | null;
+  options?: { location?: SkillLocation; cwd?: string; includeNativeDirs?: boolean },
+): Promise<Record<string, InstalledSkill[]>> {
+  const location = options?.location ?? "global";
+  const targets = resolveTargets(location, options?.cwd, options?.includeNativeDirs);
 
-  if (typeof cwdOrOptions === "string") {
-    // Backward compat: listInstalledSkills("codex", "/path")
-    if (runtime === "codex") {
-      skillsHome = path.join(cwdOrOptions, ".agents", "skills");
-    } else {
-      skillsHome = resolveSkillsHome(runtime);
-    }
-  } else if (cwdOrOptions?.location === "workspace") {
-    if (!cwdOrOptions.cwd) return [];
-    skillsHome = resolveSkillsWorkspace(runtime, cwdOrOptions.cwd);
-  } else {
-    // Global mode
-    if (runtime === "codex") {
-      const cwd = cwdOrOptions?.cwd;
-      if (!cwd) return [];
-      skillsHome = path.join(cwd, ".agents", "skills");
-    } else {
-      skillsHome = resolveSkillsHome(runtime);
-    }
-  }
+  const result: Record<string, InstalledSkill[]> = {};
 
-  if (!skillsHome) return [];
-
-  let dirEntries: string[];
-  try {
-    dirEntries = await fs.readdir(skillsHome);
-  } catch {
-    return [];
-  }
-
-  const results: InstalledSkill[] = [];
-  for (const name of dirEntries) {
-    const fullPath = path.join(skillsHome, name);
+  for (const { target, skillsHome } of targets) {
+    let dirEntries: string[];
     try {
-      const stat = await fs.lstat(fullPath);
-      if (stat.isSymbolicLink()) {
-        const linkTarget = await fs.readlink(fullPath);
-        results.push({
-          name,
-          sourcePath: path.resolve(path.dirname(fullPath), linkTarget),
-          isSymlink: true,
-        });
-      } else if (stat.isDirectory()) {
-        results.push({ name, sourcePath: fullPath, isSymlink: false });
-      }
+      dirEntries = await fs.readdir(skillsHome);
     } catch {
-      // Skip unreadable entries
+      result[target] = [];
+      continue;
     }
+
+    const skills: InstalledSkill[] = [];
+    for (const name of dirEntries) {
+      const fullPath = path.join(skillsHome, name);
+      try {
+        const stat = await fs.lstat(fullPath);
+        if (stat.isSymbolicLink()) {
+          const linkTarget = await fs.readlink(fullPath);
+          skills.push({
+            name,
+            sourcePath: path.resolve(path.dirname(fullPath), linkTarget),
+            isSymlink: true,
+          });
+        } else if (stat.isDirectory()) {
+          skills.push({ name, sourcePath: fullPath, isSymlink: false });
+        }
+      } catch {
+        // Skip unreadable entries
+      }
+    }
+    result[target] = skills;
   }
 
-  return results;
+  return result;
 }
 
-/**
- * Resolve the home-directory-based skills path for a given runtime.
- * Returns null for runtimes that don't use home-dir skill discovery.
- */
-export function resolveSkillsHome(runtime: SkillRuntime): string | null {
-  switch (runtime) {
-    case "gemini":
-      return path.join(os.homedir(), ".gemini", "skills");
-    case "cursor":
-      return path.join(os.homedir(), ".cursor", "skills");
-    case "opencode":
-      // OpenCode reads skills from the same path as Claude
-      return path.join(os.homedir(), ".claude", "skills");
-    case "pi":
-      return path.join(os.homedir(), ".pi", "agent", "skills");
-    default:
-      return null;
-  }
-}
+// ---------------------------------------------------------------------------
+// Convenience resolvers (exported for low-level use / escape hatch)
+// ---------------------------------------------------------------------------
 
 /**
- * Resolve the workspace-relative skills path for a given runtime.
- * All runtimes support workspace-relative skill discovery.
+ * Resolve the global (home-directory) skills path for a standard channel.
  */
-export function resolveSkillsWorkspace(runtime: SkillRuntime, cwd: string): string {
-  switch (runtime) {
+export function resolveSkillsHome(channel: SkillChannel): string {
+  switch (channel) {
+    case "agents":
+      return path.join(os.homedir(), ".agents", "skills");
     case "claude":
-    case "opencode":
-      return path.join(cwd, ".claude", "skills");
-    case "codex":
-      return path.join(cwd, ".agents", "skills");
-    case "gemini":
-      return path.join(cwd, ".gemini", "skills");
-    case "cursor":
-      return path.join(cwd, ".cursor", "skills");
-    case "pi":
-      return path.join(cwd, ".pi", "agent", "skills");
+      return path.join(os.homedir(), ".claude", "skills");
   }
 }
+
+/**
+ * Resolve the workspace-relative skills path for a standard channel.
+ */
+export function resolveSkillsWorkspace(channel: SkillChannel, cwd: string): string {
+  switch (channel) {
+    case "agents":
+      return path.join(cwd, ".agents", "skills");
+    case "claude":
+      return path.join(cwd, ".claude", "skills");
+  }
+}
+
+/**
+ * Resolve the native per-runtime skills path (home directory).
+ * Returns null for runtimes that use standard channels (claude → .claude/, codex → .agents/).
+ */
+export function resolveNativeSkillsHome(runtime: SkillRuntime): string | null {
+  const entry = NATIVE_DIRS[runtime];
+  return entry?.global ?? null;
+}
+
+/**
+ * Resolve the native per-runtime skills path (workspace).
+ * Returns null for runtimes that use standard channels.
+ */
+export function resolveNativeSkillsWorkspace(runtime: SkillRuntime, cwd: string): string | null {
+  const entry = NATIVE_DIRS[runtime];
+  return entry ? entry.workspace(cwd) : null;
+}
+
+// ---------------------------------------------------------------------------
+// Low-level helpers
+// ---------------------------------------------------------------------------
 
 /**
  * Idempotent symlink creation. Returns the outcome:
@@ -373,22 +389,22 @@ export async function ensureSkillSymlink(
       if (resolvedExisting === path.resolve(source)) {
         return "skipped";
       }
-      // Points elsewhere — don't overwrite (could be user-installed)
       return "conflict";
     }
-    // Target exists as a real directory/file — don't overwrite
     return "conflict";
   } catch {
-    // Target doesn't exist — create the symlink
     await fs.symlink(source, target, "dir");
     return "created";
   }
 }
 
+// ---------------------------------------------------------------------------
+// Internal helpers (used by provider execute functions)
+// ---------------------------------------------------------------------------
+
 /**
  * Place skills into a home-directory-based skills folder via idempotent symlinks.
- * Used by gemini (~/.gemini/skills), cursor (~/.cursor/skills),
- * opencode (~/.claude/skills), and pi (~/.pi/agent/skills).
+ * Used internally by provider execute functions for native runtime injection.
  *
  * Returns the skills home path, or null if no skills were provided.
  */
@@ -398,7 +414,8 @@ export async function injectHomeSkills(
 ): Promise<string | null> {
   if (skillDirs.length === 0) return null;
 
-  const skillsHome = resolveSkillsHome(runtime);
+  const entry = NATIVE_DIRS[runtime];
+  const skillsHome = entry?.global ?? null;
   if (!skillsHome) return null;
 
   await fs.mkdir(skillsHome, { recursive: true });
@@ -418,7 +435,7 @@ export async function injectHomeSkills(
 
 /**
  * Place skills into {cwd}/.agents/skills/ via idempotent symlinks.
- * Used by codex which discovers skills from the workspace directory.
+ * Used internally by codex provider.
  *
  * Returns the skills directory path, or null if no skills were provided.
  */
