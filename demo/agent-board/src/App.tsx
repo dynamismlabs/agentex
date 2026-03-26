@@ -11,6 +11,7 @@ import SettingsModal from "./components/SettingsModal";
 import AddTaskModal from "./components/AddTaskModal";
 import TaskDetailModal from "./components/TaskDetailModal";
 import TerminalPanel from "./components/TerminalPanel";
+import SkillsPanel from "./components/SkillsPanel";
 
 function TasksView() {
   const { activeView } = useApp();
@@ -27,6 +28,8 @@ function LeftPanel() {
         <NotesPanel />
       ) : activeTab === "terminal" ? (
         <TerminalPanel />
+      ) : activeTab === "skills" ? (
+        <SkillsPanel />
       ) : (
         <DecisionsPanel />
       )}

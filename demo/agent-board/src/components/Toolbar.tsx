@@ -1,13 +1,14 @@
 import { useApp } from "../AppContext";
 import { api } from "../api";
 import type { AppState } from "../../types";
-import { LayoutList, Kanban, Plus, Database, ListTodo, StickyNote, GitBranch, TerminalSquare } from "lucide-react";
+import { LayoutList, Kanban, Plus, Database, ListTodo, StickyNote, GitBranch, TerminalSquare, Puzzle } from "lucide-react";
 
 const TABS = [
   { id: "tasks", label: "Tasks", icon: ListTodo },
   { id: "notes", label: "Notes", icon: StickyNote },
   { id: "decisions", label: "Decisions", icon: GitBranch },
   { id: "terminal", label: "Terminal", icon: TerminalSquare },
+  { id: "skills", label: "Skills", icon: Puzzle },
 ] as const;
 
 export default function Toolbar() {

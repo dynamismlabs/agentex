@@ -4,12 +4,19 @@
 
 import express from "express";
 import { createServer } from "node:http";
-import { join, dirname } from "node:path";
+import { join, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { spawn, execSync } from "node:child_process";
 import { setupTerminalWs } from "./terminal.js";
-import { getProvider, listProviders } from "../../packages/agent/src/index.js";
+import {
+  getProvider,
+  listProviders,
+  installSkills,
+  removeSkills,
+  listInstalledSkills,
+} from "../../packages/agent/src/index.js";
+import type { SkillRuntime, SkillLocation } from "../../packages/agent/src/index.js";
 import {
   readState,
   writeState,
@@ -584,6 +591,100 @@ app.get("/api/providers", async (_req, res) => {
     }
   }
   res.json(available);
+});
+
+// ---------------------------------------------------------------------------
+// Skills
+// ---------------------------------------------------------------------------
+
+const DEMO_SKILL_DIRS = [
+  join(__dirname, "skills", "code-review"),
+  join(__dirname, "skills", "testing"),
+  join(__dirname, "skills", "security"),
+];
+
+const GLOBAL_SKILL_RUNTIMES: SkillRuntime[] = ["gemini", "cursor", "opencode", "pi"];
+const WORKSPACE_SKILL_RUNTIMES: SkillRuntime[] = ["claude", "codex", "gemini", "cursor", "opencode", "pi"];
+const SKILLS_CWD = __dirname;
+
+function resolveSkillOpts(location: SkillLocation): {
+  runtimes: SkillRuntime[];
+  location: SkillLocation;
+  cwd?: string;
+} {
+  if (location === "workspace") {
+    return { runtimes: WORKSPACE_SKILL_RUNTIMES, location: "workspace", cwd: SKILLS_CWD };
+  }
+  return { runtimes: GLOBAL_SKILL_RUNTIMES, location: "global" };
+}
+
+// List available demo skills (source dirs on disk)
+app.get("/api/skills/available", (_req, res) => {
+  const skills = DEMO_SKILL_DIRS.map((dir) => ({
+    name: basename(dir),
+    sourcePath: dir,
+  }));
+  res.json({ skills, cwd: SKILLS_CWD });
+});
+
+// List installed skills for all runtimes at a given location
+app.get("/api/skills", async (req, res) => {
+  const location = (req.query.location as SkillLocation) || "workspace";
+  const opts = resolveSkillOpts(location);
+  const result: Record<string, Awaited<ReturnType<typeof listInstalledSkills>>> = {};
+  for (const runtime of opts.runtimes) {
+    try {
+      result[runtime] = await listInstalledSkills(runtime, { location: opts.location, cwd: opts.cwd });
+    } catch {
+      result[runtime] = [];
+    }
+  }
+  res.json(result);
+});
+
+// List installed skills for a runtime
+app.get("/api/skills/:runtime", async (req, res) => {
+  const runtime = req.params.runtime as SkillRuntime;
+  const location = (req.query.location as SkillLocation) || "workspace";
+  const opts = resolveSkillOpts(location);
+  try {
+    const installed = await listInstalledSkills(runtime, { location: opts.location, cwd: opts.cwd });
+    res.json(installed);
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// Install demo skills
+app.post("/api/skills/install", async (req, res) => {
+  const { runtimes, location } = req.body as { runtimes?: SkillRuntime[]; location?: SkillLocation };
+  const opts = resolveSkillOpts(location ?? "workspace");
+  try {
+    const result = await installSkills(DEMO_SKILL_DIRS, {
+      runtimes: runtimes ?? opts.runtimes,
+      location: opts.location,
+      cwd: opts.cwd,
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// Remove demo skills
+app.post("/api/skills/remove", async (req, res) => {
+  const { runtimes, location } = req.body as { runtimes?: SkillRuntime[]; location?: SkillLocation };
+  const opts = resolveSkillOpts(location ?? "workspace");
+  try {
+    const result = await removeSkills(DEMO_SKILL_DIRS, {
+      runtimes: runtimes ?? opts.runtimes,
+      location: opts.location,
+      cwd: opts.cwd,
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
 });
 
 // ---------------------------------------------------------------------------

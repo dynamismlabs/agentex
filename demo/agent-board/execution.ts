@@ -7,6 +7,9 @@ import type { StreamEvent, ExecutionResult } from "../../packages/agent/src/inde
 import { execSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 import process from "node:process";
 import {
   readState,
@@ -101,6 +104,12 @@ function extractFilePath(event: StreamEvent): string | null {
 // In-memory state
 // ---------------------------------------------------------------------------
 
+const DEMO_SKILL_DIRS = [
+  join(__dirname, "skills", "code-review"),
+  join(__dirname, "skills", "testing"),
+  join(__dirname, "skills", "security"),
+];
+
 const MAX_BUFFER = 500;
 
 /** Console output buffers per agent */
@@ -178,6 +187,7 @@ export async function executeTask(agentId: string, taskId: string): Promise<void
         maxTurns: state.settings.maxTurns,
         timeoutSec: state.settings.timeoutSec,
         model: state.settings.model,
+        skillDirs: DEMO_SKILL_DIRS,
       },
       onStart: (pid) => setAgentPid(agentId, pid),
       onEvent: (event: StreamEvent) => {
@@ -307,6 +317,7 @@ export async function sendMessage(agentId: string, message: string): Promise<voi
         maxTurns: state.settings.maxTurns,
         timeoutSec: state.settings.timeoutSec,
         model: state.settings.model,
+        skillDirs: DEMO_SKILL_DIRS,
       },
       onStart: (pid) => setAgentPid(agentId, pid),
       onEvent: (event: StreamEvent) => {

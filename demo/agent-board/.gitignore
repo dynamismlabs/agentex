@@ -1,3 +1,9 @@
 data/
 dist/
 node_modules/
+
+.agents
+.claude
+.cursor
+.gemini
+.pi
