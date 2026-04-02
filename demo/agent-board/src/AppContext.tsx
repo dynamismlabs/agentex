@@ -7,7 +7,7 @@ import {
   useCallback,
   type ReactNode,
 } from "react";
-import type { AppState } from "../types";
+import type { AppState, AgentQuestion } from "../types";
 import { api } from "./api";
 
 const DEFAULT_STATE: AppState = {
@@ -61,6 +61,7 @@ interface AppContextType {
   openTerminalTab: (req: TerminalTabRequest) => void;
   pendingTerminalTab: TerminalTabRequest | null;
   clearPendingTerminalTab: () => void;
+  pendingQuestions: AgentQuestion[];
 }
 
 const AppContext = createContext<AppContextType | null>(null);
@@ -80,6 +81,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [addTaskOpen, setAddTaskOpen] = useState(false);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [pendingTerminalTab, setPendingTerminalTab] = useState<TerminalTabRequest | null>(null);
+  const [pendingQuestions, setPendingQuestions] = useState<AgentQuestion[]>([]);
 
   const openTerminalTab = useCallback((req: TerminalTabRequest) => {
     setPendingTerminalTab(req);
@@ -174,6 +176,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
               notifications: [msg.data, ...prev.notifications],
             }));
             break;
+          case "agent_question":
+            setPendingQuestions((prev) => [...prev, msg.question]);
+            break;
+          case "agent_question_answered":
+            setPendingQuestions((prev) => prev.filter((q) => q.requestId !== msg.requestId));
+            break;
         }
       };
       es.onerror = () => {
@@ -183,6 +191,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
 
     refreshState();
+    // Load pending questions
+    api<AgentQuestion[]>("GET", "/api/questions").then((qs) => setPendingQuestions(qs)).catch(() => {});
     connect();
 
     return () => {
@@ -216,6 +226,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         openTerminalTab,
         pendingTerminalTab,
         clearPendingTerminalTab,
+        pendingQuestions,
       }}
     >
       {children}

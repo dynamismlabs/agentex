@@ -37,7 +37,7 @@ import {
   WORKSPACE_DIR,
 } from "./store.js";
 import { seedData } from "./seed.js";
-import { executeTask, sendMessage, consoleBuffers, setBroadcast, getAgentPids, isProcessAlive, clearAgentPid, closeAgentSession, closeAllSessions } from "./execution.js";
+import { executeTask, sendMessage, consoleBuffers, setBroadcast, getAgentPids, isProcessAlive, clearAgentPid, closeAgentSession, closeAllSessions, resolveQuestion, getPendingQuestions } from "./execution.js";
 import { heartbeatTick, setHeartbeatBroadcast } from "./heartbeat.js";
 import type { SSEEvent } from "./types.js";
 
@@ -353,6 +353,28 @@ app.patch("/api/decisions/:id", (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Agent Questions (AskUserQuestion from onUserInputRequest)
+// ---------------------------------------------------------------------------
+
+app.get("/api/questions", (_req, res) => {
+  res.json(getPendingQuestions());
+});
+
+app.post("/api/questions/:requestId/answer", (req, res) => {
+  const { answers } = req.body;
+  if (!answers || typeof answers !== "object") {
+    res.status(400).json({ error: "answers object required" });
+    return;
+  }
+  const ok = resolveQuestion(req.params.requestId, answers);
+  if (!ok) {
+    res.status(404).json({ error: "Question not found or already answered" });
+    return;
+  }
+  res.json({ ok: true });
+});
+
+// ---------------------------------------------------------------------------
 // Notes
 // ---------------------------------------------------------------------------
 
@@ -608,6 +630,7 @@ const DEMO_SKILL_DIRS = [
   join(__dirname, "skills", "code-review"),
   join(__dirname, "skills", "testing"),
   join(__dirname, "skills", "security"),
+  join(__dirname, "skills", "test-interactive"),
 ];
 
 const SKILLS_CWD = __dirname;

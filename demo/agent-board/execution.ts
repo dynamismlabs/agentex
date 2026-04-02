@@ -2,8 +2,8 @@
 // Agent Board – Agent execution, console buffers, session resume
 // ---------------------------------------------------------------------------
 
-import { getProvider } from "../../packages/agent/src/index.js";
-import type { StreamEvent, ExecutionResult, AgentSession } from "../../packages/agent/src/index.js";
+import { getProvider, parseAskUserQuestion } from "../../packages/agent/src/index.js";
+import type { StreamEvent, ExecutionResult, AgentSession, UserInputRequest, UserInputResponse } from "../../packages/agent/src/index.js";
 import { execSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -21,7 +21,7 @@ import {
   ensureWorkspace,
   DATA_DIR,
 } from "./store.js";
-import type { SSEEvent } from "./types.js";
+import type { SSEEvent, AgentQuestion } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // PID tracking – persist child process PIDs so we can verify liveness on restart
@@ -108,9 +108,93 @@ const DEMO_SKILL_DIRS = [
   join(__dirname, "skills", "code-review"),
   join(__dirname, "skills", "testing"),
   join(__dirname, "skills", "security"),
+  join(__dirname, "skills", "test-interactive"),
 ];
 
 const MAX_BUFFER = 500;
+
+// ---------------------------------------------------------------------------
+// Pending AskUserQuestion — waiting for UI answers
+// ---------------------------------------------------------------------------
+
+interface PendingQuestion {
+  resolve: (answers: Record<string, string>) => void;
+  question: AgentQuestion;
+}
+
+const pendingQuestions = new Map<string, PendingQuestion>();
+
+/**
+ * Called by the server when the UI answers a question.
+ * Returns true if the requestId was found and resolved.
+ */
+export function resolveQuestion(requestId: string, answers: Record<string, string>): boolean {
+  const pending = pendingQuestions.get(requestId);
+  if (!pending) return false;
+  const { question } = pending;
+  pendingQuestions.delete(requestId);
+  pending.resolve(answers);
+  broadcast({ type: "agent_question_answered", requestId });
+
+  // Show the user's answers in the console feed
+  const summary = Object.entries(answers)
+    .map(([q, a]) => `${q}: ${a}`)
+    .join("\n");
+  const answerEvent: StreamEvent = {
+    type: "assistant",
+    text: `[you] ${summary}`,
+    timestamp: new Date().toISOString(),
+  };
+  pushBuffer(question.agentId, answerEvent);
+  broadcast({ type: "agent_output", agentId: question.agentId, event: answerEvent });
+
+  return true;
+}
+
+/** Get all pending questions (for initial page load). */
+export function getPendingQuestions(): AgentQuestion[] {
+  return Array.from(pendingQuestions.values()).map((p) => p.question);
+}
+
+/**
+ * Build an onUserInputRequest callback for a given agent/task.
+ * AskUserQuestion → broadcast to UI, wait for answer.
+ * Regular tools → auto-allow.
+ */
+function makeUserInputHandler(agentId: string, taskId: string | null): (req: UserInputRequest) => Promise<UserInputResponse> {
+  return async (req: UserInputRequest): Promise<UserInputResponse> => {
+    const questions = parseAskUserQuestion(req);
+    if (questions) {
+      const requestId = `q_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const agentQuestion: AgentQuestion = {
+        requestId,
+        agentId,
+        taskId,
+        questions: questions.map((q) => ({
+          question: q.question,
+          header: q.header,
+          options: q.options.map((o) => ({ label: o.label, description: o.description })),
+          multiSelect: q.multiSelect,
+        })),
+        createdAt: new Date().toISOString(),
+      };
+
+      // Wait for UI to answer
+      const answersPromise = new Promise<Record<string, string>>((resolve) => {
+        pendingQuestions.set(requestId, { resolve, question: agentQuestion });
+      });
+
+      // Broadcast to all SSE clients
+      broadcast({ type: "agent_question", question: agentQuestion });
+
+      const answers = await answersPromise;
+      return { allow: true, updatedInput: { ...req.input, answers } };
+    }
+
+    // Regular tool — auto-allow
+    return { allow: true };
+  };
+}
 
 /** Console output buffers per agent */
 export const consoleBuffers = new Map<string, StreamEvent[]>();
@@ -160,12 +244,14 @@ async function getOrCreateSession(
   const state = readState();
   const agent = state.agents.find((a) => a.id === agentId);
 
+  // Determine the current task for this agent (for question context)
+  const currentTaskId = agent?.currentTaskId ?? null;
+
   console.log(`[session] creating new session for agent=${agentId} cwd=${cwd}`);
   const session = await provider.createSession({
     cwd,
     sessionParams: agent?.sessionParams ?? undefined,
     config: {
-      skipPermissions: true,
       maxTurns: state.settings.maxTurns,
       timeoutSec: state.settings.timeoutSec,
       model: state.settings.model,
@@ -175,6 +261,7 @@ async function getOrCreateSession(
       pushBuffer(agentId, event);
       broadcast({ type: "agent_output", agentId, event });
     },
+    onUserInputRequest: makeUserInputHandler(agentId, currentTaskId),
   });
 
   agentSessions.set(agentId, session);

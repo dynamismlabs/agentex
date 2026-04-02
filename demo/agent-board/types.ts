@@ -120,10 +120,27 @@ export interface AppState {
   settings: Settings;
 }
 
+/** A structured question from the AskUserQuestion tool. */
+export interface AgentQuestion {
+  /** Unique ID for this question request (used to send the answer back). */
+  requestId: string;
+  agentId: string;
+  taskId: string | null;
+  questions: {
+    question: string;
+    header?: string;
+    options: { label: string; description?: string }[];
+    multiSelect?: boolean;
+  }[];
+  createdAt: string;
+}
+
 export type SSEEvent =
   | { type: "agent_output"; agentId: string; event: unknown }
   | { type: "agent_status"; agentId: string; status: string; taskId: string | null; sessionParams?: unknown }
   | { type: "task_update"; task: Task }
   | { type: "notification"; data: Notification }
   | { type: "heartbeat_tick"; timestamp: string; idleAgents: number; availableTasks: number }
-  | { type: "state_sync"; data: AppState };
+  | { type: "state_sync"; data: AppState }
+  | { type: "agent_question"; question: AgentQuestion }
+  | { type: "agent_question_answered"; requestId: string };

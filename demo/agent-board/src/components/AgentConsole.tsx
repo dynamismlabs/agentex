@@ -2,6 +2,7 @@ import { useRef, useEffect, useCallback } from "react";
 import { useApp } from "../AppContext";
 import { api } from "../api";
 import { Send, TerminalSquare, Bot, Sparkles, Wrench, CheckCircle, RotateCcw, ExternalLink, Eye, MessageSquare, HelpCircle } from "lucide-react";
+import QuestionOverlay from "./QuestionOverlay";
 
 const eventClasses: Record<string, string> = {
   system: "text-zinc-500 italic",
@@ -228,11 +229,14 @@ export default function AgentConsole() {
         </button>
       </div>
 
-      {/* Output */}
-      <div
-        ref={outputRef}
-        className="flex-1 overflow-y-auto p-4 font-mono text-[13px] leading-relaxed bg-[#0a0a0c]"
-      />
+      {/* Output + question overlay */}
+      <div className="flex-1 relative overflow-hidden">
+        <div
+          ref={outputRef}
+          className="absolute inset-0 overflow-y-auto p-4 font-mono text-[13px] leading-relaxed bg-[#0a0a0c]"
+        />
+        <QuestionOverlay />
+      </div>
 
       {/* Action items for active agent */}
       {(() => {
