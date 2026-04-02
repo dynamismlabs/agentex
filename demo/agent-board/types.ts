@@ -104,6 +104,8 @@ export interface Settings {
   maxTurns: number;
   timeoutSec: number;
   editorCommand: string;
+  /** "execute" = one-shot per turn, "session" = persistent multi-turn process */
+  executionMode: "execute" | "session";
 }
 
 export interface AppState {

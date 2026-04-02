@@ -29,6 +29,7 @@ const DEFAULT_SETTINGS: Settings = {
   maxTurns: 10,
   timeoutSec: 300,
   editorCommand: "code",
+  executionMode: "execute",
 };
 
 function defaultState(): AppState {
@@ -62,6 +63,9 @@ export function readState(): AppState {
     }
     if (!state.settings.editorCommand) {
       state.settings.editorCommand = DEFAULT_SETTINGS.editorCommand;
+    }
+    if (!state.settings.executionMode) {
+      state.settings.executionMode = DEFAULT_SETTINGS.executionMode;
     }
     if (!state.activity) state.activity = [];
     if (!state.notifications) state.notifications = [];

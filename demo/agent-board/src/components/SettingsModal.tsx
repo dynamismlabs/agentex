@@ -77,6 +77,17 @@ export default function SettingsModal() {
 
           <div className="h-px bg-border my-4" />
 
+          <Row label="Execution">
+            <select
+              className="px-3 py-1.5 bg-background border border-border rounded-lg text-sm text-text-primary outline-none focus:border-primary focus:ring-1 focus:ring-primary/50 transition-all"
+              value={s.executionMode ?? "execute"}
+              onChange={(e) => update({ executionMode: e.target.value })}
+            >
+              <option value="execute">One-shot</option>
+              <option value="session">Multi-turn</option>
+            </select>
+          </Row>
+
           <Row label="Model">
             <input
               className="w-[220px] px-3 py-1.5 bg-background border border-border rounded-lg text-sm text-text-primary outline-none focus:border-primary focus:ring-1 focus:ring-primary/50 transition-all"

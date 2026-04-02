@@ -27,6 +27,7 @@ const DEFAULT_STATE: AppState = {
     maxTurns: 10,
     timeoutSec: 300,
     editorCommand: "code",
+    executionMode: "execute",
   },
 };
 

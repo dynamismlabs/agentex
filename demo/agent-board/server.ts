@@ -37,7 +37,7 @@ import {
   WORKSPACE_DIR,
 } from "./store.js";
 import { seedData } from "./seed.js";
-import { executeTask, sendMessage, consoleBuffers, setBroadcast, getAgentPids, isProcessAlive, clearAgentPid } from "./execution.js";
+import { executeTask, sendMessage, consoleBuffers, setBroadcast, getAgentPids, isProcessAlive, clearAgentPid, closeAgentSession, closeAllSessions } from "./execution.js";
 import { heartbeatTick, setHeartbeatBroadcast } from "./heartbeat.js";
 import type { SSEEvent } from "./types.js";
 
@@ -255,7 +255,7 @@ app.post("/api/tasks/seed", (_req, res) => {
 // Agents
 // ---------------------------------------------------------------------------
 
-app.post("/api/agents/:id/new-session", (req, res) => {
+app.post("/api/agents/:id/new-session", async (req, res) => {
   const state = readState();
   const agent = state.agents.find((a) => a.id === req.params.id);
   if (!agent) {
@@ -266,6 +266,8 @@ app.post("/api/agents/:id/new-session", (req, res) => {
     res.status(409).json({ error: "Agent is currently working" });
     return;
   }
+  // Close persistent session if one exists
+  await closeAgentSession(req.params.id);
   updateAgent(req.params.id, { sessionParams: null, pendingMessage: null });
   consoleBuffers.delete(req.params.id);
   broadcast({ type: "agent_status", agentId: req.params.id, status: agent.status, taskId: agent.currentTaskId });
@@ -286,9 +288,14 @@ app.post("/api/agents/:id/message", (req, res) => {
 // Settings
 // ---------------------------------------------------------------------------
 
-app.patch("/api/settings", (req, res) => {
+app.patch("/api/settings", async (req, res) => {
+  const prevMode = readState().settings.executionMode;
   const settings = updateSettings(req.body);
   restartHeartbeat();
+  // If switching away from session mode, close all persistent sessions
+  if (prevMode === "session" && settings.executionMode !== "session") {
+    await closeAllSessions();
+  }
   broadcast({ type: "state_sync", data: readState() });
   res.json(settings);
 });
@@ -709,6 +716,15 @@ reconcileOnStartup();
 
 const httpServer = createServer(app);
 setupTerminalWs(httpServer);
+
+// Graceful shutdown — close persistent sessions before exit
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.on(signal, async () => {
+    console.log(`\n${signal} received — closing sessions…`);
+    await closeAllSessions();
+    process.exit(0);
+  });
+}
 
 httpServer.listen(PORT, () => {
   console.log(`Agent Board demo running at http://localhost:${PORT}`);

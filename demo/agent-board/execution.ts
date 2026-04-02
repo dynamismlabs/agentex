@@ -3,7 +3,7 @@
 // ---------------------------------------------------------------------------
 
 import { getProvider } from "../../packages/agent/src/index.js";
-import type { StreamEvent, ExecutionResult } from "../../packages/agent/src/index.js";
+import type { StreamEvent, ExecutionResult, AgentSession } from "../../packages/agent/src/index.js";
 import { execSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -137,6 +137,67 @@ function pushBuffer(agentId: string, event: StreamEvent): void {
 }
 
 // ---------------------------------------------------------------------------
+// Persistent sessions (session mode) — one AgentSession per agent
+// ---------------------------------------------------------------------------
+
+const agentSessions = new Map<string, AgentSession>();
+
+/**
+ * Get or create a persistent session for an agent.
+ * Returns null if the provider doesn't support createSession.
+ */
+async function getOrCreateSession(
+  agentId: string,
+  cwd: string,
+): Promise<AgentSession | null> {
+  // Reuse existing live session
+  const existing = agentSessions.get(agentId);
+  if (existing && existing.state !== "closed") return existing;
+
+  const provider = getProvider("claude");
+  if (!provider.createSession) return null;
+
+  const state = readState();
+  const agent = state.agents.find((a) => a.id === agentId);
+
+  console.log(`[session] creating new session for agent=${agentId} cwd=${cwd}`);
+  const session = await provider.createSession({
+    cwd,
+    sessionParams: agent?.sessionParams ?? undefined,
+    config: {
+      skipPermissions: true,
+      maxTurns: state.settings.maxTurns,
+      timeoutSec: state.settings.timeoutSec,
+      model: state.settings.model,
+      skillDirs: DEMO_SKILL_DIRS,
+    },
+    onEvent: (event: StreamEvent) => {
+      pushBuffer(agentId, event);
+      broadcast({ type: "agent_output", agentId, event });
+    },
+  });
+
+  agentSessions.set(agentId, session);
+  console.log(`[session] session created for agent=${agentId} sessionId=${session.sessionId}`);
+  return session;
+}
+
+/** Close and remove the persistent session for an agent. */
+export async function closeAgentSession(agentId: string): Promise<void> {
+  const session = agentSessions.get(agentId);
+  if (session) {
+    agentSessions.delete(agentId);
+    try { await session.close(); } catch { /* best-effort */ }
+  }
+}
+
+/** Close all persistent sessions (server shutdown / reconciliation). */
+export async function closeAllSessions(): Promise<void> {
+  const ids = [...agentSessions.keys()];
+  await Promise.allSettled(ids.map((id) => closeAgentSession(id)));
+}
+
+// ---------------------------------------------------------------------------
 // Execute a task
 // ---------------------------------------------------------------------------
 
@@ -146,7 +207,6 @@ export async function executeTask(agentId: string, taskId: string): Promise<void
   const task = state.tasks.find((t) => t.id === taskId);
   if (!agent || !task) return;
 
-  const provider = getProvider("claude");
   const cwd = ensureWorkspace(taskId);
   snapshotWorkspace(cwd);
   const prompt = `Task: ${task.title}\n\nDetails: ${task.description}`;
@@ -175,10 +235,35 @@ export async function executeTask(agentId: string, taskId: string): Promise<void
   // Log activity
   addActivity({ type: "task_claimed", agentId, taskId, message: `${agent.name} claimed "${task.title}"` });
 
+  const useSession = state.settings.executionMode === "session";
+  console.log(`[execute] agent=${agent.name} task="${task.title}" mode=${useSession ? "session" : "one-shot"}`);
+
+  if (useSession) {
+    await executeTaskSession(agentId, taskId, cwd, prompt, agent, task);
+  } else {
+    await executeTaskOneShot(agentId, taskId, cwd, prompt, agent, task);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Execute task — one-shot (execute mode)
+// ---------------------------------------------------------------------------
+
+async function executeTaskOneShot(
+  agentId: string,
+  taskId: string,
+  cwd: string,
+  prompt: string,
+  agent: { name: string; totalRuns: number; totalCostUsd: number },
+  task: { title: string },
+): Promise<void> {
+  const state = readState();
+  const provider = getProvider("claude");
   const startTime = Date.now();
   const modifiedFiles = new Set<string>();
 
   try {
+    console.log(`[one-shot] starting provider.execute() for agent=${agent.name}`);
     const result: ExecutionResult = await provider.execute({
       prompt,
       cwd,
@@ -202,6 +287,7 @@ export async function executeTask(agentId: string, taskId: string): Promise<void
     const success = result.exitCode === 0;
     const durationMs = result.durationMs || (Date.now() - startTime);
     const costUsd = result.costUsd ?? 0;
+    console.log(`[one-shot] finished agent=${agent.name} exit=${result.exitCode} duration=${(durationMs / 1000).toFixed(1)}s cost=$${costUsd.toFixed(4)} model=${result.model}`);
 
     // Update task
     const updatedTask = updateTask(taskId, {
@@ -252,37 +338,135 @@ export async function executeTask(agentId: string, taskId: string): Promise<void
     }
   } catch (err: unknown) {
     clearAgentPid(agentId);
-    const errorMessage = err instanceof Error ? err.message : String(err);
-    const durationMs = Date.now() - startTime;
+    handleTaskError(agentId, taskId, agent, task, err, Date.now() - startTime);
+  }
+}
 
-    updateTask(taskId, {
-      status: "failed",
+// ---------------------------------------------------------------------------
+// Execute task — session mode (persistent process)
+// ---------------------------------------------------------------------------
+
+async function executeTaskSession(
+  agentId: string,
+  taskId: string,
+  cwd: string,
+  prompt: string,
+  agent: { name: string; totalRuns: number; totalCostUsd: number },
+  task: { title: string },
+): Promise<void> {
+  const startTime = Date.now();
+
+  try {
+    console.log(`[session] getting/creating session for agent=${agent.name}`);
+    const session = await getOrCreateSession(agentId, cwd);
+    if (!session) {
+      console.log(`[session] createSession not available, falling back to one-shot`);
+      await executeTaskOneShot(agentId, taskId, cwd, prompt, agent, task);
+      return;
+    }
+    console.log(`[session] sending turn via session.send() sessionId=${session.sessionId}`);
+
+    const result = await session.send(prompt);
+    const durationMs = Date.now() - startTime;
+    const success = !result.isError;
+    const costUsd = result.costUsd ?? 0;
+    console.log(`[session] turn complete agent=${agent.name} success=${success} duration=${(durationMs / 1000).toFixed(1)}s cost=$${costUsd.toFixed(4)} stopReason=${result.stopReason}`);
+
+    // Update task
+    const updatedTask = updateTask(taskId, {
+      status: success ? "review" : "failed",
       completedAt: new Date().toISOString(),
+      modifiedFiles: [],
       result: {
-        exitCode: null,
-        summary: null,
-        costUsd: null,
+        exitCode: success ? 0 : 1,
+        summary: result.summary,
+        costUsd: result.costUsd,
         model: null,
-        errorMessage,
+        errorMessage: result.errorMessage,
         durationMs,
-        usage: null,
+        usage: result.usage ?? null,
       },
     });
 
-    appendTaskActivity(taskId, agent.name, "Failed", `Error: ${errorMessage}`);
+    // Append completion to markdown
+    const statusLabel = success ? "Completed" : "Failed";
+    const summary = result.summary || (success ? "Task completed successfully." : result.errorMessage || "Task failed.");
+    appendTaskActivity(taskId, agent.name, statusLabel, `${summary}\n\n**Result:** ${statusLabel} | Duration: ${(durationMs / 1000).toFixed(1)}s | Cost: $${costUsd.toFixed(4)}`);
 
+    // Update agent — session stays alive, persist sessionId for display
     updateAgent(agentId, {
       status: "idle",
       currentTaskId: null,
+      sessionParams: session.sessionId ? { sessionId: session.sessionId, cwd } : null,
       totalRuns: agent.totalRuns + 1,
+      totalCostUsd: agent.totalCostUsd + costUsd,
       lastActiveAt: new Date().toISOString(),
     });
 
-    addNotification({ type: "task_failed", agentId, taskId, message: `${agent.name} failed: "${task.title}" - ${errorMessage}` });
-    addActivity({ type: "task_failed", agentId, taskId, message: `${agent.name} failed "${task.title}": ${errorMessage}` });
+    // Notification + activity
+    const notifType = success ? "task_completed" as const : "task_failed" as const;
+    addNotification({ type: notifType, agentId, taskId, message: `${agent.name} ${success ? "completed" : "failed"}: "${task.title}"` });
+    addActivity({ type: success ? "task_completed" : "task_failed", agentId, taskId, message: `${agent.name} ${success ? "completed" : "failed"} "${task.title}"` });
 
+    // Broadcast updates
+    if (updatedTask) broadcast({ type: "task_update", task: updatedTask });
     broadcast({ type: "agent_status", agentId, status: "idle", taskId: null });
+
+    // Handle pending message
+    const refreshedAgent = readState().agents.find((a) => a.id === agentId);
+    if (refreshedAgent?.pendingMessage) {
+      const msg = refreshedAgent.pendingMessage;
+      updateAgent(agentId, { pendingMessage: null });
+      sendMessage(agentId, msg);
+    }
+  } catch (err: unknown) {
+    // If session died, remove it so next attempt starts fresh
+    agentSessions.delete(agentId);
+    handleTaskError(agentId, taskId, agent, task, err, Date.now() - startTime);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Shared error handler for task execution
+// ---------------------------------------------------------------------------
+
+function handleTaskError(
+  agentId: string,
+  taskId: string,
+  agent: { name: string; totalRuns: number },
+  task: { title: string },
+  err: unknown,
+  durationMs: number,
+): void {
+  const errorMessage = err instanceof Error ? err.message : String(err);
+
+  updateTask(taskId, {
+    status: "failed",
+    completedAt: new Date().toISOString(),
+    result: {
+      exitCode: null,
+      summary: null,
+      costUsd: null,
+      model: null,
+      errorMessage,
+      durationMs,
+      usage: null,
+    },
+  });
+
+  appendTaskActivity(taskId, agent.name, "Failed", `Error: ${errorMessage}`);
+
+  updateAgent(agentId, {
+    status: "idle",
+    currentTaskId: null,
+    totalRuns: agent.totalRuns + 1,
+    lastActiveAt: new Date().toISOString(),
+  });
+
+  addNotification({ type: "task_failed", agentId, taskId, message: `${agent.name} failed: "${task.title}" - ${errorMessage}` });
+  addActivity({ type: "task_failed", agentId, taskId, message: `${agent.name} failed "${task.title}": ${errorMessage}` });
+
+  broadcast({ type: "agent_status", agentId, status: "idle", taskId: null });
 }
 
 // ---------------------------------------------------------------------------
@@ -300,14 +484,36 @@ export async function sendMessage(agentId: string, message: string): Promise<voi
     return;
   }
 
-  const provider = getProvider("claude");
-  const sessionCwd = (agent.sessionParams as Record<string, unknown> | null)?.cwd as string | undefined;
+  const useSession = state.settings.executionMode === "session";
 
   // Set working (no task)
   updateAgent(agentId, { status: "working", lastActiveAt: new Date().toISOString() });
   broadcast({ type: "agent_status", agentId, status: "working", taskId: null });
 
+  console.log(`[message] agent=${agentId} mode=${useSession ? "session" : "one-shot"}`);
+
+  if (useSession) {
+    await sendMessageSession(agentId, message, agent);
+  } else {
+    await sendMessageOneShot(agentId, message, agent);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Send message — one-shot (execute mode)
+// ---------------------------------------------------------------------------
+
+async function sendMessageOneShot(
+  agentId: string,
+  message: string,
+  agent: { sessionParams: Record<string, unknown> | null; totalCostUsd: number },
+): Promise<void> {
+  const state = readState();
+  const provider = getProvider("claude");
+  const sessionCwd = (agent.sessionParams as Record<string, unknown> | null)?.cwd as string | undefined;
+
   try {
+    console.log(`[one-shot] sendMessage via provider.execute() agent=${agentId} resumeSession=${!!agent.sessionParams}`);
     const result: ExecutionResult = await provider.execute({
       prompt: message,
       cwd: sessionCwd,
@@ -338,18 +544,65 @@ export async function sendMessage(agentId: string, message: string): Promise<voi
     broadcast({ type: "agent_status", agentId, status: "idle", taskId: null, sessionParams: updatedSessionParams });
   } catch (err: unknown) {
     clearAgentPid(agentId);
-    updateAgent(agentId, { status: "idle", lastActiveAt: new Date().toISOString() });
-    broadcast({ type: "agent_status", agentId, status: "idle", taskId: null });
-
-    // Push error to console buffer
-    const errorEvent: StreamEvent = {
-      type: "result",
-      text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-      cost: null,
-      isError: true,
-      timestamp: new Date().toISOString(),
-    };
-    pushBuffer(agentId, errorEvent);
-    broadcast({ type: "agent_output", agentId, event: errorEvent });
+    finishMessageError(agentId, err);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Send message — session mode (persistent process)
+// ---------------------------------------------------------------------------
+
+async function sendMessageSession(
+  agentId: string,
+  message: string,
+  agent: { sessionParams: Record<string, unknown> | null; totalCostUsd: number },
+): Promise<void> {
+  const sessionCwd = (agent.sessionParams as Record<string, unknown> | null)?.cwd as string | undefined;
+
+  try {
+    console.log(`[session] sendMessage via session.send() agent=${agentId}`);
+    const session = await getOrCreateSession(agentId, sessionCwd ?? process.cwd());
+    if (!session) {
+      console.log(`[session] createSession not available, falling back to one-shot`);
+      await sendMessageOneShot(agentId, message, agent);
+      return;
+    }
+    console.log(`[session] sending message via session.send() sessionId=${session.sessionId}`);
+
+    const result = await session.send(message);
+    const costUsd = result.costUsd ?? 0;
+    console.log(`[session] message complete agent=${agentId} cost=$${costUsd.toFixed(4)} stopReason=${result.stopReason}`);
+
+    updateAgent(agentId, {
+      status: "idle",
+      sessionParams: session.sessionId ? { sessionId: session.sessionId, cwd: sessionCwd ?? process.cwd() } : agent.sessionParams,
+      totalCostUsd: agent.totalCostUsd + costUsd,
+      lastActiveAt: new Date().toISOString(),
+    });
+
+    broadcast({ type: "agent_status", agentId, status: "idle", taskId: null });
+  } catch (err: unknown) {
+    // If session died, remove it so next attempt starts fresh
+    agentSessions.delete(agentId);
+    finishMessageError(agentId, err);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Shared error handler for messages
+// ---------------------------------------------------------------------------
+
+function finishMessageError(agentId: string, err: unknown): void {
+  updateAgent(agentId, { status: "idle", lastActiveAt: new Date().toISOString() });
+  broadcast({ type: "agent_status", agentId, status: "idle", taskId: null });
+
+  const errorEvent: StreamEvent = {
+    type: "result",
+    text: `Error: ${err instanceof Error ? err.message : String(err)}`,
+    cost: null,
+    isError: true,
+    timestamp: new Date().toISOString(),
+  };
+  pushBuffer(agentId, errorEvent);
+  broadcast({ type: "agent_output", agentId, event: errorEvent });
 }

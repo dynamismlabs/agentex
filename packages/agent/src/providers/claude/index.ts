@@ -1,5 +1,6 @@
-import type { ProviderModule, ProviderModel } from "../../types.js";
+import type { ProviderModule, ProviderModel, SessionContext, AgentSession } from "../../types.js";
 import { executeClaudeProvider } from "./execute.js";
+import { createClaudeSession } from "./session.js";
 import { testClaudeEnvironment } from "./test.js";
 import { claudeSessionCodec } from "./codec.js";
 import { findBinary } from "../../utils/binary.js";
@@ -44,6 +45,7 @@ async function listModels(): Promise<ProviderModel[]> {
 export const claudeProvider: ProviderModule = {
   type: "claude",
   execute: executeClaudeProvider,
+  createSession: (ctx: SessionContext): Promise<AgentSession> => createClaudeSession(ctx),
   testEnvironment: testClaudeEnvironment,
   sessionCodec: claudeSessionCodec,
   listModels,
