@@ -39,7 +39,7 @@ describe("executeProcessProvider", () => {
       config: { command: "sleep", extraArgs: ["60"], timeoutSec: 1, graceSec: 1 },
     }));
 
-    expect(result.timedOut).toBe(true);
+    expect(result.status).toBe("timeout");
     expect(result.errorCode).toBe("timeout");
   }, 10_000);
 

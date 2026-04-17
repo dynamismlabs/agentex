@@ -153,6 +153,59 @@ describe("parseCursorStreamLine", () => {
     }
   });
 
+  it("returns tool_call from assistant message with tool_use block", () => {
+    const line = JSON.stringify({
+      type: "assistant",
+      message: {
+        content: [
+          { type: "tool_use", id: "cur-tu-001", name: "Edit", input: { file: "test.ts" } },
+        ],
+      },
+    });
+    const event = parseCursorStreamLine(line);
+    expect(event).not.toBeNull();
+    expect(event!.type).toBe("tool_call");
+    if (event?.type === "tool_call") {
+      expect(event.callId).toBe("cur-tu-001");
+      expect(event.name).toBe("Edit");
+    }
+  });
+
+  it("returns tool_result from assistant message with tool_result block", () => {
+    const line = JSON.stringify({
+      type: "assistant",
+      message: {
+        content: [
+          { type: "tool_result", tool_use_id: "cur-tu-001", content: "edited successfully", is_error: false },
+        ],
+      },
+    });
+    const event = parseCursorStreamLine(line);
+    expect(event).not.toBeNull();
+    expect(event!.type).toBe("tool_result");
+    if (event?.type === "tool_result") {
+      expect(event.toolCallId).toBe("cur-tu-001");
+      expect(event.content).toBe("edited successfully");
+      expect(event.isError).toBe(false);
+    }
+  });
+
+  it("callId is undefined when tool_use block has no id", () => {
+    const line = JSON.stringify({
+      type: "assistant",
+      message: {
+        content: [
+          { type: "tool_use", name: "Bash", input: { command: "pwd" } },
+        ],
+      },
+    });
+    const event = parseCursorStreamLine(line);
+    expect(event).not.toBeNull();
+    if (event?.type === "tool_call") {
+      expect(event.callId).toBeUndefined();
+    }
+  });
+
   it("returns null for malformed JSON", () => {
     expect(parseCursorStreamLine("not json")).toBeNull();
   });

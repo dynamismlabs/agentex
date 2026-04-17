@@ -114,7 +114,7 @@ describe("parseGeminiStreamLine", () => {
       message: {
         content: [
           { type: "text", text: "Let me read that file." },
-          { type: "tool_use", name: "Read", input: { file_path: "/tmp/test.txt" } },
+          { type: "tool_use", id: "gem-tu-001", name: "Read", input: { file_path: "/tmp/test.txt" } },
         ],
       },
     });
@@ -124,6 +124,39 @@ describe("parseGeminiStreamLine", () => {
     expect(events[1]!.type).toBe("tool_call");
     if (events[1]!.type === "tool_call") {
       expect(events[1]!.name).toBe("Read");
+      expect(events[1]!.callId).toBe("gem-tu-001");
+    }
+  });
+
+  it("returns callId from tool_use_id when id is absent", () => {
+    const line = JSON.stringify({
+      type: "assistant",
+      message: {
+        content: [
+          { type: "tool_use", tool_use_id: "gem-tuid-002", name: "Bash", input: { command: "ls" } },
+        ],
+      },
+    });
+    const events = parseGeminiStreamLine(line);
+    expect(events).toHaveLength(1);
+    if (events[0]!.type === "tool_call") {
+      expect(events[0]!.callId).toBe("gem-tuid-002");
+    }
+  });
+
+  it("callId is undefined when tool_use has no id fields", () => {
+    const line = JSON.stringify({
+      type: "assistant",
+      message: {
+        content: [
+          { type: "tool_use", name: "Grep", input: { pattern: "test" } },
+        ],
+      },
+    });
+    const events = parseGeminiStreamLine(line);
+    expect(events).toHaveLength(1);
+    if (events[0]!.type === "tool_call") {
+      expect(events[0]!.callId).toBeUndefined();
     }
   });
 

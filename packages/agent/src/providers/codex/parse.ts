@@ -142,11 +142,22 @@ export function parseCodexStreamLine(line: string): StreamEvent | null {
 
   if (type === "item.started") {
     const item = parseObject(event["item"]);
-    if (asString(item["type"], "") === "command_execution") {
+    const itemType = asString(item["type"], "");
+    if (itemType === "command_execution") {
       return {
         type: "tool_call",
+        callId: asString(item["id"], "") || undefined,
         name: "command_execution",
         input: asString(item["command"], ""),
+        timestamp,
+      };
+    }
+    if (itemType === "function_call") {
+      return {
+        type: "tool_call",
+        callId: asString(item["id"], "") || asString(item["call_id"], "") || undefined,
+        name: asString(item["name"], "function_call"),
+        input: item["arguments"] ?? item["input"] ?? "",
         timestamp,
       };
     }
@@ -154,7 +165,8 @@ export function parseCodexStreamLine(line: string): StreamEvent | null {
 
   if (type === "item.completed") {
     const item = parseObject(event["item"]);
-    if (asString(item["type"], "") === "command_execution") {
+    const itemType = asString(item["type"], "");
+    if (itemType === "command_execution") {
       const exitCode = typeof item["exit_code"] === "number" ? item["exit_code"] : null;
       return {
         type: "tool_result",
@@ -164,7 +176,17 @@ export function parseCodexStreamLine(line: string): StreamEvent | null {
         timestamp,
       };
     }
-    if (asString(item["type"], "") === "agent_message") {
+    if (itemType === "function_call") {
+      const output = item["output"] ?? item["result"] ?? "";
+      return {
+        type: "tool_result",
+        toolCallId: asString(item["id"], "") || asString(item["call_id"], ""),
+        content: typeof output === "string" ? output : JSON.stringify(output),
+        isError: item["status"] === "failed",
+        timestamp,
+      };
+    }
+    if (itemType === "agent_message") {
       // Direct text field (Codex 0.30+)
       const directText = asString(item["text"], "");
       if (directText) {

@@ -97,6 +97,81 @@ describe("parseOpenCodeStreamLine", () => {
     }
   });
 
+  it("returns callId on tool_call when part has id", () => {
+    const line = JSON.stringify({
+      type: "tool_use",
+      part: {
+        id: "oc-tu-001",
+        name: "bash",
+        input: { command: "echo hi" },
+        state: { status: "running" },
+      },
+    });
+    const event = parseOpenCodeStreamLine(line);
+    expect(event).not.toBeNull();
+    if (event?.type === "tool_call") {
+      expect(event.callId).toBe("oc-tu-001");
+      expect(event.name).toBe("bash");
+    }
+  });
+
+  it("returns callId from tool_use_id when id is absent", () => {
+    const line = JSON.stringify({
+      type: "tool_use",
+      part: {
+        tool_use_id: "oc-tuid-002",
+        name: "read",
+        input: { file: "test.txt" },
+        state: { status: "running" },
+      },
+    });
+    const event = parseOpenCodeStreamLine(line);
+    expect(event).not.toBeNull();
+    if (event?.type === "tool_call") {
+      expect(event.callId).toBe("oc-tuid-002");
+    }
+  });
+
+  it("returns tool_result from completed tool_use", () => {
+    const line = JSON.stringify({
+      type: "tool_use",
+      part: {
+        id: "oc-tu-003",
+        name: "bash",
+        input: { command: "ls" },
+        state: { status: "completed", result: "file1.txt\nfile2.txt" },
+      },
+    });
+    const event = parseOpenCodeStreamLine(line);
+    expect(event).not.toBeNull();
+    expect(event!.type).toBe("tool_result");
+    if (event?.type === "tool_result") {
+      expect(event.toolCallId).toBe("oc-tu-003");
+      expect(event.content).toBe("file1.txt\nfile2.txt");
+      expect(event.isError).toBe(false);
+    }
+  });
+
+  it("returns tool_result from errored tool_use", () => {
+    const line = JSON.stringify({
+      type: "tool_use",
+      part: {
+        id: "oc-tu-004",
+        name: "bash",
+        input: { command: "cat /missing" },
+        state: { status: "error", error: "No such file" },
+      },
+    });
+    const event = parseOpenCodeStreamLine(line);
+    expect(event).not.toBeNull();
+    expect(event!.type).toBe("tool_result");
+    if (event?.type === "tool_result") {
+      expect(event.toolCallId).toBe("oc-tu-004");
+      expect(event.content).toBe("No such file");
+      expect(event.isError).toBe(true);
+    }
+  });
+
   it("returns result from step_finish", () => {
     const line = JSON.stringify({ type: "step_finish" });
     const event = parseOpenCodeStreamLine(line);

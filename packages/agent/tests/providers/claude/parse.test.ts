@@ -95,7 +95,7 @@ describe("parseStreamLine", () => {
       message: {
         content: [
           { type: "text", text: "I'll create that file." },
-          { type: "tool_use", name: "write_file", input: { path: "test.ts" } },
+          { type: "tool_use", id: "toolu_write_01", name: "write_file", input: { path: "test.ts" } },
         ],
       },
     });
@@ -105,6 +105,41 @@ describe("parseStreamLine", () => {
     expect(events[1]!.type).toBe("tool_call");
     if (events[1]!.type === "tool_call") {
       expect(events[1]!.name).toBe("write_file");
+      expect(events[1]!.callId).toBe("toolu_write_01");
+    }
+  });
+
+  it("returns callId from tool_use block id field", () => {
+    const line = JSON.stringify({
+      type: "assistant",
+      message: {
+        content: [
+          { type: "tool_use", id: "toolu_abc_999", name: "Bash", input: { command: "echo hi" } },
+        ],
+      },
+    });
+    const events = parseStreamLine(line);
+    expect(events).toHaveLength(1);
+    expect(events[0]!.type).toBe("tool_call");
+    if (events[0]!.type === "tool_call") {
+      expect(events[0]!.callId).toBe("toolu_abc_999");
+      expect(events[0]!.name).toBe("Bash");
+    }
+  });
+
+  it("callId is undefined when tool_use block has no id", () => {
+    const line = JSON.stringify({
+      type: "assistant",
+      message: {
+        content: [
+          { type: "tool_use", name: "Grep", input: { pattern: "foo" } },
+        ],
+      },
+    });
+    const events = parseStreamLine(line);
+    expect(events).toHaveLength(1);
+    if (events[0]!.type === "tool_call") {
+      expect(events[0]!.callId).toBeUndefined();
     }
   });
 });
@@ -129,12 +164,13 @@ describe("toStreamEvents", () => {
     expect(result).toBeDefined();
   });
 
-  it("extracts tool_call events", () => {
+  it("extracts tool_call events with callId", () => {
     const events = toStreamEvents(CLAUDE_TOOL_USE_OUTPUT);
     const toolCall = events.find((e) => e.type === "tool_call");
     expect(toolCall).toBeDefined();
     if (toolCall?.type === "tool_call") {
       expect(toolCall.name).toBe("Read");
+      expect(toolCall.callId).toBe("toolu_01ABC123");
     }
   });
 

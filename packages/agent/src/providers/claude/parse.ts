@@ -151,6 +151,7 @@ export function toStreamEvents(stdout: string): StreamEvent[] {
         } else if (blockType === "tool_use") {
           events.push({
             type: "tool_call",
+            callId: asString(block["id"], "") || undefined,
             name: asString(block["name"], ""),
             input: block["input"],
             timestamp,
@@ -208,7 +209,7 @@ export function parseStreamLine(line: string): StreamEvent[] {
       } else if (blockType === "thinking") {
         events.push({ type: "thinking", text: asString(block["thinking"], ""), timestamp });
       } else if (blockType === "tool_use") {
-        events.push({ type: "tool_call", name: asString(block["name"], ""), input: block["input"], timestamp });
+        events.push({ type: "tool_call", callId: asString(block["id"], "") || undefined, name: asString(block["name"], ""), input: block["input"], timestamp });
       } else if (blockType === "tool_result") {
         events.push({
           type: "tool_result",

@@ -7,7 +7,12 @@ export async function executeOpenclawProvider(ctx: ExecutionContext): Promise<Ex
   const config = ctx.config ?? {};
   const startedAt = new Date().toISOString();
   const startMs = Date.now();
-  const gatewayUrl = config.command?.trim() || "http://localhost:3001";
+  // Restore gatewayUrl from session params (set during prior runs), then
+  // fall back to config.command, then to the default localhost address.
+  const savedGatewayUrl = ctx.sessionParams
+    ? (ctx.sessionParams["gatewayUrl"] as string | undefined)?.trim() || null
+    : null;
+  const gatewayUrl = config.command?.trim() || savedGatewayUrl || "http://localhost:3001";
   const endpoint = gatewayUrl.replace(/\/$/, "") + "/api/agent/run";
 
   // Extract session key from session params
@@ -48,7 +53,7 @@ export async function executeOpenclawProvider(ctx: ExecutionContext): Promise<Ex
         runId,
         exitCode: 1,
         signal: null,
-        timedOut: false,
+        status: "failed" as const,
         startedAt,
         completedAt: new Date().toISOString(),
         durationMs: Date.now() - startMs,
@@ -89,7 +94,7 @@ export async function executeOpenclawProvider(ctx: ExecutionContext): Promise<Ex
       runId,
       exitCode: 0,
       signal: null,
-      timedOut: false,
+      status: "completed" as const,
       startedAt,
       completedAt: new Date().toISOString(),
       durationMs: Date.now() - startMs,
@@ -110,7 +115,7 @@ export async function executeOpenclawProvider(ctx: ExecutionContext): Promise<Ex
         runId,
         exitCode: null,
         signal: null,
-        timedOut: true,
+        status: "timeout" as const,
         startedAt,
         completedAt: new Date().toISOString(),
         durationMs: Date.now() - startMs,
@@ -130,7 +135,7 @@ export async function executeOpenclawProvider(ctx: ExecutionContext): Promise<Ex
       runId,
       exitCode: null,
       signal: null,
-      timedOut: false,
+      status: "failed" as const,
       startedAt,
       completedAt: new Date().toISOString(),
       durationMs: Date.now() - startMs,

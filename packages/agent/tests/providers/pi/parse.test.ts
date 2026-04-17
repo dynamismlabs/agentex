@@ -118,6 +118,34 @@ describe("parsePiStreamLine", () => {
     }
   });
 
+  it("returns callId on tool_call when toolCallId is present", () => {
+    const line = JSON.stringify({
+      type: "tool_execution_start",
+      toolCallId: "pi-tc-001",
+      toolName: "bash",
+      args: { command: "echo hello" },
+    });
+    const event = parsePiStreamLine(line);
+    expect(event).not.toBeNull();
+    if (event?.type === "tool_call") {
+      expect(event.callId).toBe("pi-tc-001");
+      expect(event.name).toBe("bash");
+    }
+  });
+
+  it("callId is undefined when toolCallId is absent on tool_execution_start", () => {
+    const line = JSON.stringify({
+      type: "tool_execution_start",
+      toolName: "grep",
+      args: { pattern: "test" },
+    });
+    const event = parsePiStreamLine(line);
+    expect(event).not.toBeNull();
+    if (event?.type === "tool_call") {
+      expect(event.callId).toBeUndefined();
+    }
+  });
+
   it("returns tool_result from tool_execution_end", () => {
     const line = JSON.stringify({
       type: "tool_execution_end",

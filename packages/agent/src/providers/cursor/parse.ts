@@ -206,6 +206,32 @@ export function parseCursorStreamLine(line: string): StreamEvent | null {
   }
 
   if (type === "assistant") {
+    // Check for tool_use / tool_result blocks in the content
+    const message = parseObject(event["message"]);
+    const content = Array.isArray(message["content"]) ? message["content"] : [];
+    for (const partRaw of content) {
+      const part = parseObject(partRaw);
+      const blockType = asString(part["type"], "").trim();
+      if (blockType === "tool_use") {
+        return {
+          type: "tool_call",
+          callId: asString(part["id"], "") || undefined,
+          name: asString(part["name"], ""),
+          input: part["input"],
+          timestamp,
+        };
+      }
+      if (blockType === "tool_result") {
+        return {
+          type: "tool_result",
+          toolCallId: asString(part["tool_use_id"], ""),
+          content: asString(part["content"], ""),
+          isError: part["is_error"] === true,
+          timestamp,
+        };
+      }
+    }
+
     const texts = collectAssistantText(event["message"]);
     if (texts.length > 0) {
       return { type: "assistant", text: texts.join("\n"), timestamp };

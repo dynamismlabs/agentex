@@ -3,7 +3,11 @@ import type { ExecutionContext, ExecutionResult } from "../../types.js";
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { runChildProcess, deriveErrorCode } from "../../utils/process.js";
+import { detectAuth } from "../../utils/auth.js";
 import { injectHomeSkills } from "../../utils/skills.js";
+import { resolveInstructions } from "../../utils/instructions.js";
+import { prepareWorkspace } from "../../utils/workspace.js";
+import type { PreparedWorkspace } from "../../utils/workspace.js";
 import { uuidv7 } from "../../utils/uuid.js";
 import {
   parseCursorJsonl,
@@ -13,32 +17,30 @@ import {
   isCursorAuthRequired,
 } from "./parse.js";
 
-function hasNonEmptyEnvValue(env: Record<string, string>, key: string): boolean {
-  const raw = env[key];
-  return typeof raw === "string" && raw.trim().length > 0;
-}
-
 export async function executeCursorProvider(ctx: ExecutionContext): Promise<ExecutionResult> {
   const runId = ctx.runId ?? uuidv7();
-  const cwd = ctx.cwd ?? process.cwd();
+  let cwd = ctx.cwd ?? process.cwd();
   const model = ctx.model ?? ctx.config?.model ?? "";
   const config = ctx.config ?? {};
   const startedAt = new Date().toISOString();
 
   // 1. Resolve binary
+  ctx.onLifecycle?.({ phase: "preparing", step: "binary" });
   let resolvedBinary;
   try {
     resolvedBinary = await findBinary("agent", config.command);
   } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : "Binary not found";
+    ctx.onLifecycle?.({ phase: "error", message: errorMessage });
     return {
       runId,
       exitCode: null,
       signal: null,
-      timedOut: false,
+      status: "failed" as const,
       startedAt,
       completedAt: new Date().toISOString(),
       durationMs: Date.now() - new Date(startedAt).getTime(),
-      errorMessage: err instanceof Error ? err.message : "Binary not found",
+      errorMessage,
       errorCode: "binary_not_found",
       costUsd: null,
       model: null,
@@ -50,15 +52,27 @@ export async function executeCursorProvider(ctx: ExecutionContext): Promise<Exec
     };
   }
 
-  // 2. Build env & detect billing
+  // 2. Workspace isolation
+  let workspace: PreparedWorkspace | undefined;
+  if (config.workspace) {
+    ctx.onLifecycle?.({ phase: "preparing", step: "workspace" });
+    workspace = await prepareWorkspace(cwd, config.workspace);
+    cwd = workspace.cwd;
+  }
+
+  // 3. Build env & detect auth/billing
+  ctx.onLifecycle?.({ phase: "preparing", step: "auth" });
   const env = buildEnv(ctx.env);
   ensurePathInEnv(env);
-  const billingType =
-    hasNonEmptyEnvValue(env, "CURSOR_API_KEY") || hasNonEmptyEnvValue(env, "OPENAI_API_KEY")
-      ? ("api" as const)
-      : ("subscription" as const);
+  const billingType = detectAuth("cursor", env).billingType;
 
-  // 3. Inject skills into ~/.cursor/skills/
+  // 3. Resolve instructions
+  ctx.onLifecycle?.({ phase: "preparing", step: "instructions" });
+  const instructions = await resolveInstructions(config.instructionsFile);
+  const fullPrompt = instructions ? `${instructions}\n\n${ctx.prompt}` : ctx.prompt;
+
+  // 4. Inject skills into ~/.cursor/skills/
+  ctx.onLifecycle?.({ phase: "preparing", step: "skills" });
   if (config.skillDirs && config.skillDirs.length > 0) {
     try {
       await injectHomeSkills(config.skillDirs, "cursor");
@@ -96,16 +110,21 @@ export async function executeCursorProvider(ctx: ExecutionContext): Promise<Exec
     const args = buildArgs(resumeSessionId);
     let stdoutLineBuffer = "";
 
+    ctx.onLifecycle?.({ phase: "spawning" });
     const proc = await runChildProcess({
       runId,
       command: resolvedBinary.bin,
       args,
       cwd,
       env,
-      stdin: ctx.prompt,
+      stdin: fullPrompt,
       timeoutSec: config.timeoutSec,
       graceSec: config.graceSec,
-      onStart: ctx.onStart,
+      onStart: (pid) => {
+        ctx.onLifecycle?.({ phase: "running", pid });
+        ctx.onStart?.(pid);
+      },
+      signal: ctx.signal,
       onOutput: async (stream, chunk) => {
         if (stream !== "stdout") {
           if (ctx.onOutput) {
@@ -193,26 +212,41 @@ export async function executeCursorProvider(ctx: ExecutionContext): Promise<Exec
   const resultSessionParams = resolvedSessionId ? { sessionId: resolvedSessionId, cwd } : null;
 
   const completedAt = new Date().toISOString();
+  const resolvedModel = parsed.model ?? model ?? null;
+  const status = proc.aborted ? "aborted" as const
+    : proc.timedOut ? "timeout" as const
+    : (errorCode || errorMessage) ? "failed" as const
+    : "completed" as const;
+
+  if (status === "completed") {
+    ctx.onLifecycle?.({ phase: "completed" });
+  } else if (status === "aborted") {
+    ctx.onLifecycle?.({ phase: "cancelled" });
+  } else {
+    ctx.onLifecycle?.({ phase: "error", message: errorMessage ?? "Unknown error" });
+  }
+
   return {
     runId,
     exitCode: proc.exitCode,
     signal: proc.signal ?? null,
-    timedOut: proc.timedOut,
+    status,
     startedAt,
     completedAt,
     durationMs: new Date(completedAt).getTime() - new Date(startedAt).getTime(),
     errorMessage,
     errorCode,
-    usage: parsed.usage
-      ? { inputTokens: parsed.usage.inputTokens, outputTokens: parsed.usage.outputTokens, cachedInputTokens: parsed.usage.cachedInputTokens }
+    usage: parsed.usage && resolvedModel
+      ? { [resolvedModel]: { inputTokens: parsed.usage.inputTokens, outputTokens: parsed.usage.outputTokens, cachedInputTokens: parsed.usage.cachedInputTokens } }
       : undefined,
     costUsd: parsed.costUsd,
-    model: parsed.model ?? model ?? null,
+    model: resolvedModel,
     summary: parsed.summary,
     sessionParams: resultSessionParams,
     sessionDisplayId: resolvedSessionId,
     clearSession,
     billingType,
     raw: null,
+    workspace,
   };
 }

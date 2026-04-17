@@ -95,7 +95,7 @@ describe("executeOpenclawProvider", () => {
       config: { command: `http://localhost:${port}`, timeoutSec: 1 },
     }));
 
-    expect(result.timedOut).toBe(true);
+    expect(result.status).toBe("timeout");
     expect(result.errorCode).toBe("timeout");
   }, 10_000);
 

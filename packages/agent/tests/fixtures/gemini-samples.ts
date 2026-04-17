@@ -137,7 +137,7 @@ export const GEMINI_TOOL_USE_OUTPUT = [
     message: {
       content: [
         { type: "text", text: "Let me read the file for you." },
-        { type: "tool_use", name: "Read", input: { file_path: "/tmp/example.txt" } },
+        { type: "tool_use", id: "tool-gem-call-001", name: "Read", input: { file_path: "/tmp/example.txt" } },
       ],
     },
   }),

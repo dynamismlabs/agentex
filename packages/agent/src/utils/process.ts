@@ -13,12 +13,15 @@ export interface RunProcessOptions {
   maxCaptureBytes?: number;
   onOutput?: (stream: "stdout" | "stderr", chunk: string) => void | Promise<void>;
   onStart?: (pid: number) => void;
+  /** AbortSignal to cancel the process. */
+  signal?: AbortSignal;
 }
 
 export interface RunProcessResult {
   exitCode: number | null;
   signal: string | null;
   timedOut: boolean;
+  aborted: boolean;
   stdout: string;
   stderr: string;
 }
@@ -27,6 +30,7 @@ const DEFAULT_MAX_CAPTURE = 4 * 1024 * 1024; // 4MB
 const DEFAULT_GRACE_SEC = 5;
 
 export function deriveErrorCode(result: RunProcessResult): string | null {
+  if (result.aborted) return "aborted";
   if (result.timedOut) return "timeout";
   if (result.signal && !result.timedOut) return "killed";
   return null;
@@ -56,6 +60,18 @@ export function killProcessTree(pid: number, signal: NodeJS.Signals = "SIGTERM")
 }
 
 export function runChildProcess(opts: RunProcessOptions): Promise<RunProcessResult> {
+  // If already aborted before spawn, return immediately
+  if (opts.signal?.aborted) {
+    return Promise.resolve({
+      exitCode: null,
+      signal: null,
+      timedOut: false,
+      aborted: true,
+      stdout: "",
+      stderr: "",
+    });
+  }
+
   return new Promise((resolve) => {
     const maxCapture = opts.maxCaptureBytes ?? DEFAULT_MAX_CAPTURE;
     const graceSec = opts.graceSec ?? DEFAULT_GRACE_SEC;
@@ -65,6 +81,7 @@ export function runChildProcess(opts: RunProcessOptions): Promise<RunProcessResu
     let stdoutBytes = 0;
     let stderrBytes = 0;
     let timedOut = false;
+    let aborted = false;
     let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
     let graceHandle: ReturnType<typeof setTimeout> | null = null;
 
@@ -141,9 +158,32 @@ export function runChildProcess(opts: RunProcessOptions): Promise<RunProcessResu
       }, opts.timeoutSec * 1000);
     }
 
-    child.on("close", (code, signal) => {
+    // AbortSignal handling
+    let abortGraceHandle: ReturnType<typeof setTimeout> | null = null;
+    const onAbort = () => {
+      aborted = true;
+      if (child.pid != null) {
+        killProcessTree(child.pid, "SIGTERM");
+        abortGraceHandle = setTimeout(() => {
+          if (child.pid != null) {
+            killProcessTree(child.pid, "SIGKILL");
+          }
+        }, graceSec * 1000);
+      }
+    };
+    if (opts.signal) {
+      opts.signal.addEventListener("abort", onAbort, { once: true });
+    }
+
+    const cleanup = () => {
       if (timeoutHandle) clearTimeout(timeoutHandle);
       if (graceHandle) clearTimeout(graceHandle);
+      if (abortGraceHandle) clearTimeout(abortGraceHandle);
+      if (opts.signal) opts.signal.removeEventListener("abort", onAbort);
+    };
+
+    child.on("close", (code, signal) => {
+      cleanup();
 
       // Wait for callbacks to complete before resolving
       callbackChain.then(() => {
@@ -151,6 +191,7 @@ export function runChildProcess(opts: RunProcessOptions): Promise<RunProcessResu
           exitCode: code,
           signal: signal ?? null,
           timedOut,
+          aborted,
           stdout: stdoutBuf,
           stderr: stderrBuf,
         });
@@ -159,6 +200,7 @@ export function runChildProcess(opts: RunProcessOptions): Promise<RunProcessResu
           exitCode: code,
           signal: signal ?? null,
           timedOut,
+          aborted,
           stdout: stdoutBuf,
           stderr: stderrBuf,
         });
@@ -166,13 +208,13 @@ export function runChildProcess(opts: RunProcessOptions): Promise<RunProcessResu
     });
 
     child.on("error", (err) => {
-      if (timeoutHandle) clearTimeout(timeoutHandle);
-      if (graceHandle) clearTimeout(graceHandle);
+      cleanup();
 
       resolve({
         exitCode: null,
         signal: null,
         timedOut: false,
+        aborted: false,
         stdout: stdoutBuf,
         stderr: err.message,
       });

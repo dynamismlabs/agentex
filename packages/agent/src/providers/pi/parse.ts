@@ -171,6 +171,7 @@ export function parsePiStreamLine(line: string): StreamEvent | null {
   if (eventType === "tool_execution_start") {
     return {
       type: "tool_call",
+      callId: asString(event["toolCallId"], "") || undefined,
       name: asString(event["toolName"], ""),
       input: event["args"],
       timestamp,

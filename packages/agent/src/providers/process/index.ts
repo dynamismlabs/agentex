@@ -47,6 +47,15 @@ async function testProcessEnvironment(ctx: EnvironmentTestContext): Promise<Envi
 
 export const processProvider: ProviderModule = {
   type: "process",
+  capabilities: {
+    sessions: false,
+    modelDiscovery: false,
+    quotaProbing: false,
+    mcp: false,
+    skills: false,
+    instructions: true,
+    workspace: true,
+  },
   execute: executeProcessProvider,
   testEnvironment: testProcessEnvironment,
 };

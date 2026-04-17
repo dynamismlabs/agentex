@@ -9,7 +9,7 @@
  */
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { getProvider, parseAskUserQuestion } from "../src/index.js";
+import { getProvider, parseAskUserQuestion, aggregateUsage } from "../src/index.js";
 import type {
   StreamEvent,
   TurnResult,
@@ -100,14 +100,15 @@ async function testProvider(type: string, useMock: boolean) {
   });
 
   console.log(`\n  Exit code: ${result.exitCode}`);
-  console.log(`  Timed out: ${result.timedOut}`);
+  console.log(`  Status: ${result.status}`);
   console.log(`  Duration: ${(result.durationMs / 1000).toFixed(1)}s`);
   console.log(`  Model: ${result.model}`);
   console.log(`  Billing: ${result.billingType}`);
   console.log(`  Cost: ${result.costUsd != null ? `$${result.costUsd.toFixed(4)}` : "n/a"}`);
-  if (result.usage) {
+  const agg = aggregateUsage(result.usage);
+  if (agg) {
     console.log(
-      `  Tokens: ${result.usage.inputTokens} in / ${result.usage.outputTokens} out${result.usage.cachedInputTokens ? ` (${result.usage.cachedInputTokens} cached)` : ""}`,
+      `  Tokens: ${agg.inputTokens} in / ${agg.outputTokens} out${agg.cachedInputTokens ? ` (${agg.cachedInputTokens} cached)` : ""}`,
     );
   }
   console.log(`  Summary: ${result.summary?.slice(0, 120)}`);
@@ -118,7 +119,7 @@ async function testProvider(type: string, useMock: boolean) {
   if (useMock) {
     const issues: string[] = [];
     if (result.exitCode !== 0) issues.push(`exit code ${result.exitCode} (expected 0)`);
-    if (result.timedOut) issues.push("timed out unexpectedly");
+    if (result.status === "timeout") issues.push("timed out unexpectedly");
     if (result.errorMessage) issues.push(`error: ${result.errorMessage}`);
     if (!result.summary) issues.push("missing summary");
 
@@ -165,21 +166,21 @@ async function testSession(useMock: boolean) {
   console.log("\n--- Turn 1 ---");
   const r1 = await session.send("Hello from smoke test turn 1");
   logTurn(r1);
-  if (r1.isError) issues.push(`turn 1 error: ${r1.errorMessage}`);
+  if (r1.status === "failed") issues.push(`turn 1 error: ${r1.errorMessage}`);
   if (!r1.summary) issues.push("turn 1 missing summary");
 
   // Turn 2 — verify context retention (session stays alive)
   console.log("\n--- Turn 2 ---");
   const r2 = await session.send("This is turn 2, do you remember turn 1?");
   logTurn(r2);
-  if (r2.isError) issues.push(`turn 2 error: ${r2.errorMessage}`);
+  if (r2.status === "failed") issues.push(`turn 2 error: ${r2.errorMessage}`);
   if (!r2.summary) issues.push("turn 2 missing summary");
 
   // Turn 3
   console.log("\n--- Turn 3 ---");
   const r3 = await session.send("Final turn, turn 3");
   logTurn(r3);
-  if (r3.isError) issues.push(`turn 3 error: ${r3.errorMessage}`);
+  if (r3.status === "failed") issues.push(`turn 3 error: ${r3.errorMessage}`);
   if (!r3.summary) issues.push("turn 3 missing summary");
 
   // Verify session state
@@ -205,10 +206,11 @@ async function testSession(useMock: boolean) {
 
 function logTurn(r: TurnResult): void {
   console.log(`  Summary: ${r.summary?.slice(0, 100)}`);
-  console.log(`  Stop: ${r.stopReason ?? "unknown"}`);
+  console.log(`  Status: ${r.status}`);
   console.log(`  Error: ${r.errorMessage ?? "none"}`);
-  if (r.usage) {
-    console.log(`  Tokens: ${r.usage.inputTokens} in / ${r.usage.outputTokens} out`);
+  const turnAgg = aggregateUsage(r.usage);
+  if (turnAgg) {
+    console.log(`  Tokens: ${turnAgg.inputTokens} in / ${turnAgg.outputTokens} out`);
   }
   if (r.costUsd != null) console.log(`  Cost: $${r.costUsd.toFixed(4)}`);
 }
@@ -277,7 +279,7 @@ async function testSessionProtocol(useMock: boolean): Promise<boolean> {
   console.log("\n--- Permission (can_use_tool) ---");
   const r1 = await session.send("test-permissions");
   logTurn(r1);
-  if (r1.isError) issues.push(`permission turn error: ${r1.errorMessage}`);
+  if (r1.status === "failed") issues.push(`permission turn error: ${r1.errorMessage}`);
   if (permissionCalls.length === 0) {
     issues.push("onUserInputRequest was never called");
   } else {
@@ -299,7 +301,7 @@ async function testSessionProtocol(useMock: boolean): Promise<boolean> {
   permissionCalls.length = 0;
   const r2 = await session.send("test-ask-question");
   logTurn(r2);
-  if (r2.isError) issues.push(`ask-question turn error: ${r2.errorMessage}`);
+  if (r2.status === "failed") issues.push(`ask-question turn error: ${r2.errorMessage}`);
   if (permissionCalls.length === 0) {
     issues.push("onUserInputRequest not called for AskUserQuestion");
   } else {
@@ -321,7 +323,7 @@ async function testSessionProtocol(useMock: boolean): Promise<boolean> {
   permissionCalls.length = 0;
   const r2b = await session.send("test-ask-multiselect");
   logTurn(r2b);
-  if (r2b.isError) issues.push(`ask-multiselect turn error: ${r2b.errorMessage}`);
+  if (r2b.status === "failed") issues.push(`ask-multiselect turn error: ${r2b.errorMessage}`);
   if (permissionCalls.length === 0) {
     issues.push("onUserInputRequest not called for multiSelect AskUserQuestion");
   } else {
@@ -341,7 +343,7 @@ async function testSessionProtocol(useMock: boolean): Promise<boolean> {
   console.log("\n--- Elicitation ---");
   const r3 = await session.send("test-elicitation");
   logTurn(r3);
-  if (r3.isError) issues.push(`elicitation turn error: ${r3.errorMessage}`);
+  if (r3.status === "failed") issues.push(`elicitation turn error: ${r3.errorMessage}`);
   if (elicitationCalls.length === 0) {
     issues.push("onElicitation was never called");
   } else {
@@ -370,7 +372,7 @@ async function testSessionProtocol(useMock: boolean): Promise<boolean> {
   console.log("\n--- Hook callback ---");
   const r4 = await session.send("test-hook");
   logTurn(r4);
-  if (r4.isError) issues.push(`hook turn error: ${r4.errorMessage}`);
+  if (r4.status === "failed") issues.push(`hook turn error: ${r4.errorMessage}`);
   if (hookCalls.length === 0) {
     issues.push("onHookCallback was never called");
   } else {
@@ -388,7 +390,7 @@ async function testSessionProtocol(useMock: boolean): Promise<boolean> {
   permissionCalls.length = 0;
   const r5 = await session.send("test-cancel");
   logTurn(r5);
-  if (r5.isError) issues.push(`cancel turn error: ${r5.errorMessage}`);
+  if (r5.status === "failed") issues.push(`cancel turn error: ${r5.errorMessage}`);
   // The permission callback may or may not fire — the cancel races it.
   // The key test is that the turn completes without hanging or crashing.
   console.log("  Turn completed without hanging — cancel handled correctly");
@@ -444,17 +446,17 @@ async function testSessionEdgeCases(useMock: boolean): Promise<boolean> {
 
     // Permission with no callback → should auto-allow, turn completes
     const r1 = await session.send("test-permissions");
-    if (r1.isError) issues.push(`fallback permission turn error: ${r1.errorMessage}`);
+    if (r1.status === "failed") issues.push(`fallback permission turn error: ${r1.errorMessage}`);
     else console.log("  auto-allow (no onUserInputRequest): turn completed");
 
     // Elicitation with no callback → should auto-decline, turn completes
     const r2 = await session.send("test-elicitation");
-    if (r2.isError) issues.push(`fallback elicitation turn error: ${r2.errorMessage}`);
+    if (r2.status === "failed") issues.push(`fallback elicitation turn error: ${r2.errorMessage}`);
     else console.log("  auto-decline (no onElicitation): turn completed");
 
     // Hook with no callback → should return empty, turn completes
     const r3 = await session.send("test-hook");
-    if (r3.isError) issues.push(`fallback hook turn error: ${r3.errorMessage}`);
+    if (r3.status === "failed") issues.push(`fallback hook turn error: ${r3.errorMessage}`);
     else console.log("  auto-empty (no onHookCallback): turn completed");
 
     await session.close();
@@ -480,7 +482,7 @@ async function testSessionEdgeCases(useMock: boolean): Promise<boolean> {
 
     const r = await session.send("test-permissions");
     logTurn(r);
-    if (r.isError) issues.push(`deny turn error: ${r.errorMessage}`);
+    if (r.status === "failed") issues.push(`deny turn error: ${r.errorMessage}`);
     if (deniedToolName !== "Bash") issues.push(`deny: expected toolName "Bash", got "${deniedToolName}"`);
     // Turn should complete — the mock gets the deny response and continues
     console.log(`  Denied tool="${deniedToolName}" — turn completed`);
@@ -509,7 +511,7 @@ async function testSessionEdgeCases(useMock: boolean): Promise<boolean> {
     const r = await session.send("test-permissions");
     logTurn(r);
     if (!callbackFired) issues.push("error test: onUserInputRequest never fired");
-    if (r.isError) issues.push(`error test turn error: ${r.errorMessage}`);
+    if (r.status === "failed") issues.push(`error test turn error: ${r.errorMessage}`);
     // Turn should complete — session.ts catch block sends deny
     console.log(`  Callback threw, turn completed (catch → deny)`);
     if (!issues.some((i) => i.startsWith("error test"))) console.log("  PASS");
@@ -537,7 +539,7 @@ async function testSessionEdgeCases(useMock: boolean): Promise<boolean> {
     const r = await session.send("test-elicitation");
     logTurn(r);
     if (!callbackFired) issues.push("elicitation error test: callback never fired");
-    if (r.isError) issues.push(`elicitation error test turn error: ${r.errorMessage}`);
+    if (r.status === "failed") issues.push(`elicitation error test turn error: ${r.errorMessage}`);
     console.log(`  Callback threw, turn completed (catch → cancel)`);
     if (!issues.some((i) => i.startsWith("elicitation error"))) console.log("  PASS");
 
@@ -564,7 +566,7 @@ async function testSessionEdgeCases(useMock: boolean): Promise<boolean> {
     const r = await session.send("test-hook");
     logTurn(r);
     if (!callbackFired) issues.push("hook error test: callback never fired");
-    if (r.isError) issues.push(`hook error test turn error: ${r.errorMessage}`);
+    if (r.status === "failed") issues.push(`hook error test turn error: ${r.errorMessage}`);
     console.log(`  Callback threw, turn completed (catch → error response)`);
     if (!issues.some((i) => i.startsWith("hook error"))) console.log("  PASS");
 

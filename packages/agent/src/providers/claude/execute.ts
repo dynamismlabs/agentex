@@ -3,36 +3,37 @@ import type { ExecutionContext, ExecutionResult } from "../../types.js";
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { runChildProcess, deriveErrorCode } from "../../utils/process.js";
+import { detectAuth } from "../../utils/auth.js";
 import { buildSkillsDir, cleanupSkillsDir } from "../../utils/skills.js";
 import { uuidv7 } from "../../utils/uuid.js";
+import { prepareWorkspace } from "../../utils/workspace.js";
+import type { PreparedWorkspace } from "../../utils/workspace.js";
 import { parseClaudeStreamJson, parseStreamLine, isClaudeUnknownSessionError, isClaudeAuthRequired } from "./parse.js";
-
-function hasNonEmptyEnvValue(env: Record<string, string>, key: string): boolean {
-  const raw = env[key];
-  return typeof raw === "string" && raw.trim().length > 0;
-}
 
 export async function executeClaudeProvider(ctx: ExecutionContext): Promise<ExecutionResult> {
   const runId = ctx.runId ?? uuidv7();
-  const cwd = ctx.cwd ?? process.cwd();
-  const model = ctx.model ?? ctx.config?.model;
+  let cwd = ctx.cwd ?? process.cwd();
   const config = ctx.config ?? {};
+  const rawModel = ctx.model ?? config.model;
   const startedAt = new Date().toISOString();
 
   // 1. Resolve binary
+  ctx.onLifecycle?.({ phase: "preparing", step: "binary" });
   let resolvedBinary;
   try {
     resolvedBinary = await findBinary("claude", config.command);
   } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : "Binary not found";
+    ctx.onLifecycle?.({ phase: "error", message: errorMessage });
     return {
       runId,
       exitCode: null,
       signal: null,
-      timedOut: false,
+      status: "failed" as const,
       startedAt,
       completedAt: new Date().toISOString(),
       durationMs: Date.now() - new Date(startedAt).getTime(),
-      errorMessage: err instanceof Error ? err.message : "Binary not found",
+      errorMessage,
       errorCode: "binary_not_found",
       costUsd: null,
       model: null,
@@ -44,12 +45,24 @@ export async function executeClaudeProvider(ctx: ExecutionContext): Promise<Exec
     };
   }
 
-  // 2. Build env & detect billing
+  // 2. Workspace isolation
+  let workspace: PreparedWorkspace | undefined;
+  if (config.workspace) {
+    ctx.onLifecycle?.({ phase: "preparing", step: "workspace" });
+    workspace = await prepareWorkspace(cwd, config.workspace);
+    cwd = workspace.cwd;
+  }
+
+  // 3. Build env & detect auth/billing
+  ctx.onLifecycle?.({ phase: "preparing", step: "auth" });
   const env = buildEnv(ctx.env);
   ensurePathInEnv(env);
-  const billingType = hasNonEmptyEnvValue(env, "ANTHROPIC_API_KEY") ? "api" as const : "subscription" as const;
+  const auth = detectAuth("claude", env);
+  const billingType = auth.billingType;
+  const model = rawModel && auth.resolveModelId ? auth.resolveModelId(rawModel) : rawModel;
 
   // 3. Build skills dir
+  ctx.onLifecycle?.({ phase: "preparing", step: "skills" });
   let skillsDir: string | null = null;
   if (config.skillDirs && config.skillDirs.length > 0) {
     try {
@@ -96,6 +109,7 @@ export async function executeClaudeProvider(ctx: ExecutionContext): Promise<Exec
     // stdout line buffer for real-time event parsing
     let lineBuffer = "";
 
+    ctx.onLifecycle?.({ phase: "spawning" });
     const proc = await runChildProcess({
       runId,
       command: resolvedBinary.bin,
@@ -105,7 +119,11 @@ export async function executeClaudeProvider(ctx: ExecutionContext): Promise<Exec
       stdin: ctx.prompt,
       timeoutSec: config.timeoutSec,
       graceSec: config.graceSec,
-      onStart: ctx.onStart,
+      onStart: (pid) => {
+        ctx.onLifecycle?.({ phase: "running", pid });
+        ctx.onStart?.(pid);
+      },
+      signal: ctx.signal,
       onOutput: async (stream, chunk) => {
         // Forward raw output
         if (ctx.onOutput) {
@@ -185,31 +203,46 @@ export async function executeClaudeProvider(ctx: ExecutionContext): Promise<Exec
       : null;
 
     const completedAt = new Date().toISOString();
+    const resolvedModel = parsed.model ?? model ?? null;
+    const status = proc.aborted ? "aborted" as const
+      : proc.timedOut ? "timeout" as const
+      : (errorCode || errorMessage) ? "failed" as const
+      : "completed" as const;
+
+    if (status === "completed") {
+      ctx.onLifecycle?.({ phase: "completed" });
+    } else if (status === "aborted") {
+      ctx.onLifecycle?.({ phase: "cancelled" });
+    } else {
+      ctx.onLifecycle?.({ phase: "error", message: errorMessage ?? "Unknown error" });
+    }
+
     return {
       runId,
       exitCode: proc.exitCode,
       signal: proc.signal ?? null,
-      timedOut: proc.timedOut,
+      status,
       startedAt,
       completedAt,
       durationMs: new Date(completedAt).getTime() - new Date(startedAt).getTime(),
       errorMessage,
       errorCode,
-      usage: parsed.usage
-        ? {
+      usage: parsed.usage && resolvedModel
+        ? { [resolvedModel]: {
             inputTokens: parsed.usage.inputTokens,
             outputTokens: parsed.usage.outputTokens,
             cachedInputTokens: parsed.usage.cachedInputTokens,
-          }
+          } }
         : undefined,
       costUsd: parsed.costUsd,
-      model: parsed.model,
+      model: resolvedModel,
       summary: parsed.summary,
       sessionParams: resultSessionParams,
       sessionDisplayId: resolvedSessionId,
       clearSession,
       billingType,
       raw: null,
+      workspace,
     };
   } finally {
     // 10. Clean up skills dir

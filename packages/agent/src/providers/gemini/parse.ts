@@ -208,7 +208,7 @@ export function parseGeminiStreamLine(line: string): StreamEvent[] {
       if (blockType === "text") {
         events.push({ type: "assistant", text: asString(block["text"], ""), timestamp });
       } else if (blockType === "tool_use") {
-        events.push({ type: "tool_call", name: asString(block["name"], ""), input: block["input"], timestamp });
+        events.push({ type: "tool_call", callId: asString(block["id"], "") || asString(block["tool_use_id"], "") || undefined, name: asString(block["name"], ""), input: block["input"], timestamp });
       } else if (blockType === "tool_result") {
         events.push({
           type: "tool_result",

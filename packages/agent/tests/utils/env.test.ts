@@ -17,12 +17,12 @@ describe("buildEnv", () => {
     process.env = originalEnv;
   });
 
-  it("only includes allow-listed vars from process.env", () => {
+  it("includes base and auth allow-listed vars from process.env", () => {
     const env = buildEnv();
     expect(env["PATH"]).toBe("/usr/bin");
     expect(env["HOME"]).toBe("/home/test");
+    expect(env["ANTHROPIC_API_KEY"]).toBe("sk-secret");
     expect(env["RANDOM_VAR"]).toBeUndefined();
-    expect(env["ANTHROPIC_API_KEY"]).toBeUndefined();
   });
 
   it("includes caller-provided vars", () => {
@@ -33,6 +33,42 @@ describe("buildEnv", () => {
   it("caller env overrides allow-listed vars", () => {
     const env = buildEnv({ PATH: "/custom/path" });
     expect(env["PATH"]).toBe("/custom/path");
+  });
+
+  it("passes through all provider auth env vars", () => {
+    process.env = {
+      ANTHROPIC_API_KEY: "sk-ant",
+      ANTHROPIC_BEDROCK_BASE_URL: "https://bedrock.example.com",
+      AWS_ACCESS_KEY_ID: "AKIA",
+      AWS_SECRET_ACCESS_KEY: "secret",
+      AWS_SESSION_TOKEN: "token",
+      AWS_REGION: "us-east-1",
+      AWS_PROFILE: "prod",
+      OPENAI_API_KEY: "sk-openai",
+      GEMINI_API_KEY: "gem",
+      GOOGLE_API_KEY: "goog",
+      CURSOR_API_KEY: "cur",
+      RANDOM_VAR: "nope",
+    };
+    const env = buildEnv();
+    expect(env["ANTHROPIC_API_KEY"]).toBe("sk-ant");
+    expect(env["ANTHROPIC_BEDROCK_BASE_URL"]).toBe("https://bedrock.example.com");
+    expect(env["AWS_ACCESS_KEY_ID"]).toBe("AKIA");
+    expect(env["AWS_SECRET_ACCESS_KEY"]).toBe("secret");
+    expect(env["AWS_SESSION_TOKEN"]).toBe("token");
+    expect(env["AWS_REGION"]).toBe("us-east-1");
+    expect(env["AWS_PROFILE"]).toBe("prod");
+    expect(env["OPENAI_API_KEY"]).toBe("sk-openai");
+    expect(env["GEMINI_API_KEY"]).toBe("gem");
+    expect(env["GOOGLE_API_KEY"]).toBe("goog");
+    expect(env["CURSOR_API_KEY"]).toBe("cur");
+    expect(env["RANDOM_VAR"]).toBeUndefined();
+  });
+
+  it("caller env overrides auth vars from process.env", () => {
+    process.env = { ANTHROPIC_API_KEY: "from-shell" };
+    const env = buildEnv({ ANTHROPIC_API_KEY: "from-caller" });
+    expect(env["ANTHROPIC_API_KEY"]).toBe("from-caller");
   });
 
   it("returns empty for missing allow-listed vars", () => {

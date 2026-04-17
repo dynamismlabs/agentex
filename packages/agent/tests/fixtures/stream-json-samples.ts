@@ -99,7 +99,7 @@ export const CLAUDE_TOOL_USE_OUTPUT = [
     message: {
       content: [
         { type: "text", text: "Let me read the file." },
-        { type: "tool_use", name: "Read", input: { file_path: "/tmp/test.txt" } },
+        { type: "tool_use", id: "toolu_01ABC123", name: "Read", input: { file_path: "/tmp/test.txt" } },
       ],
     },
   }),

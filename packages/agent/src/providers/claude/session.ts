@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import type {
   AgentSession,
   SessionContext,
+  SessionState,
   TurnResult,
 } from "../../types.js";
 import { findBinary } from "../../utils/binary.js";
@@ -120,7 +121,18 @@ export async function createClaudeSession(ctx: SessionContext): Promise<AgentSes
     throw new Error("Failed to open stdio on Claude process");
   }
 
-  return new ClaudeSessionImpl(proc, ctx, skillsDir);
+  const session = new ClaudeSessionImpl(proc, ctx, skillsDir);
+
+  // Wire up AbortSignal to close the session
+  if (ctx.signal) {
+    if (ctx.signal.aborted) {
+      void session.close();
+    } else {
+      ctx.signal.addEventListener("abort", () => void session.close(), { once: true });
+    }
+  }
+
+  return session;
 }
 
 // ---------------------------------------------------------------------------
@@ -128,7 +140,7 @@ export async function createClaudeSession(ctx: SessionContext): Promise<AgentSes
 // ---------------------------------------------------------------------------
 
 class ClaudeSessionImpl implements AgentSession {
-  private _state: "idle" | "running" | "closed" = "idle";
+  private _state: SessionState = "idle";
   private _sessionId: string | null = null;
   private _lineBuffer = "";
   private _stderrBuffer = "";
@@ -188,7 +200,7 @@ class ClaudeSessionImpl implements AgentSession {
   }
 
   get sessionId(): string | null { return this._sessionId; }
-  get state(): "idle" | "running" | "closed" { return this._state; }
+  get state(): SessionState { return this._state; }
 
   // -------------------------------------------------------------------------
   // Public API
@@ -196,9 +208,9 @@ class ClaudeSessionImpl implements AgentSession {
 
   async send(message: string): Promise<TurnResult> {
     if (this._state === "closed") throw new Error("Session is closed");
-    if (this._state === "running") throw new Error("A turn is already in progress");
+    if (this._state !== "idle") throw new Error("A turn is already in progress");
 
-    this._state = "running";
+    this._state = "thinking";
 
     // Write user message in stream-json format
     const userMsg = ndjsonLine({
@@ -217,7 +229,7 @@ class ClaudeSessionImpl implements AgentSession {
   }
 
   async interrupt(): Promise<void> {
-    if (this._state !== "running") return;
+    if (this._state === "idle" || this._state === "closed") return;
 
     // Send interrupt control request
     const requestId = randomUUID();
@@ -325,10 +337,12 @@ class ClaudeSessionImpl implements AgentSession {
         break;
 
       case "can_use_tool":
+        this._state = "waiting_for_approval";
         this.handlePermissionRequest(requestId, request);
         break;
 
       case "elicitation":
+        this._state = "waiting_for_input";
         this.handleElicitationRequest(requestId, request);
         break;
 
@@ -390,6 +404,7 @@ class ClaudeSessionImpl implements AgentSession {
       if (resp.updatedInput) response["updatedInput"] = resp.updatedInput;
 
       this.sendControlResponse(requestId, response);
+      if (this._state === "waiting_for_approval") this._state = "thinking";
     } catch {
       if (!this._pendingCallbacks.delete(requestId)) return;
       this.sendControlResponse(requestId, {
@@ -397,6 +412,7 @@ class ClaudeSessionImpl implements AgentSession {
         toolUseID: toolUseId,
         message: "Permission callback threw an error",
       });
+      if (this._state === "waiting_for_approval") this._state = "thinking";
     }
   }
 
@@ -436,9 +452,11 @@ class ClaudeSessionImpl implements AgentSession {
       }
 
       this.sendControlResponse(requestId, response);
+      if (this._state === "waiting_for_input") this._state = "thinking";
     } catch {
       if (!this._pendingCallbacks.delete(requestId)) return;
       this.sendControlResponse(requestId, { action: "cancel" });
+      if (this._state === "waiting_for_input") this._state = "thinking";
     }
   }
 
@@ -510,42 +528,52 @@ class ClaudeSessionImpl implements AgentSession {
     const isError = msg["is_error"] === true;
     const costUsd = typeof msg["total_cost_usd"] === "number" ? msg["total_cost_usd"] : null;
     const stopReason = str(msg, "stop_reason") || null;
+    const modelName = str(msg, "model") || null;
 
     const usageObj = typeof msg["usage"] === "object" && msg["usage"] !== null
       ? msg["usage"] as Record<string, unknown>
       : null;
 
-    const usage = usageObj ? {
+    const usageData = usageObj ? {
       inputTokens: typeof usageObj["input_tokens"] === "number" ? usageObj["input_tokens"] : 0,
       outputTokens: typeof usageObj["output_tokens"] === "number" ? usageObj["output_tokens"] : 0,
       cachedInputTokens: typeof usageObj["cache_read_input_tokens"] === "number"
         ? usageObj["cache_read_input_tokens"] : undefined,
     } : undefined;
 
+    // Key usage by model name
+    const usage = usageData && modelName
+      ? { [modelName]: usageData }
+      : undefined;
+
     // Extract session ID
     if (typeof msg["session_id"] === "string" && msg["session_id"]) {
       this._sessionId = msg["session_id"];
     }
 
-    // Detect error codes
+    // Detect error codes and derive status
     let errorCode: string | null = null;
     const subtype = str(msg, "subtype");
+    let status: TurnResult["status"] = "completed";
+
     if (subtype === "error_max_turns" || stopReason === "max_turns") {
       errorCode = "max_turns";
+      status = "max_turns";
     } else if (subtype === "error_max_budget_usd") {
       errorCode = "max_budget";
-    } else if (subtype === "error_during_execution") {
-      errorCode = "execution_error";
+      status = "max_budget";
+    } else if (subtype === "error_during_execution" || isError) {
+      errorCode = errorCode ?? "execution_error";
+      status = "failed";
     }
 
     const result: TurnResult = {
       summary,
       usage,
       costUsd,
-      isError,
+      status,
       errorCode,
       errorMessage: isError ? summary : null,
-      stopReason,
     };
 
     this._state = "idle";
@@ -565,6 +593,16 @@ class ClaudeSessionImpl implements AgentSession {
     // Extract session ID from any message that has one
     if (typeof msg["session_id"] === "string" && msg["session_id"]) {
       this._sessionId = msg["session_id"];
+    }
+
+    // Update session state based on message type
+    const type = str(msg, "type");
+    if (type === "assistant" || type === "thinking") {
+      this._state = "thinking";
+    } else if (type === "tool_use") {
+      this._state = "tool_executing";
+    } else if (type === "tool_result") {
+      this._state = "thinking";
     }
 
     // Forward as StreamEvent via onEvent callback

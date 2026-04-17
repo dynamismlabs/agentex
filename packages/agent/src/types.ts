@@ -1,11 +1,26 @@
+/** Static declaration of what a provider supports. */
+export interface ProviderCapabilities {
+  sessions: boolean;
+  modelDiscovery: boolean;
+  quotaProbing: boolean;
+  mcp: boolean;
+  skills: boolean;
+  instructions: boolean;
+  workspace: boolean;
+}
+
 // Core provider interface — every provider must implement this
 export interface ProviderModule {
   type: string;
+  capabilities: ProviderCapabilities;
   execute(ctx: ExecutionContext): Promise<ExecutionResult>;
   createSession?(ctx: SessionContext): Promise<AgentSession>;
   testEnvironment(ctx: EnvironmentTestContext): Promise<EnvironmentTestResult>;
   sessionCodec?: SessionCodec;
-  listModels?(): Promise<ProviderModel[]>;
+  /** List available models. Pass cacheTtlMs to cache results (0 = no cache, default). */
+  listModels?(options?: { cacheTtlMs?: number }): Promise<ProviderModel[]>;
+  /** Check current quota/rate limit status. Not all providers support this. */
+  checkQuota?(ctx: QuotaContext): Promise<QuotaStatus>;
 }
 
 // Execution input
@@ -20,6 +35,11 @@ export interface ExecutionContext {
   onOutput?: (stream: "stdout" | "stderr", chunk: string) => void | Promise<void>;
   onEvent?: (event: StreamEvent) => void | Promise<void>;
   onStart?: (pid: number) => void;
+  /** AbortSignal to cancel execution. When aborted, the process receives SIGTERM
+   *  followed by SIGKILL after the grace period. */
+  signal?: AbortSignal;
+  /** Called at key execution lifecycle phases (preparing, spawning, running, etc.). */
+  onLifecycle?: (event: LifecycleEvent) => void;
 }
 
 // Provider-specific configuration
@@ -39,6 +59,90 @@ export interface ProviderConfig {
   sandbox?: boolean;
   thinking?: string;
   mode?: string;
+  /** Run the agent in an isolated workspace. The library creates a worktree
+   *  before execution and uses it as the working directory. */
+  workspace?: {
+    strategy: "worktree";
+    baseBranch?: string;
+    branchName?: string;
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Quota probing
+// ---------------------------------------------------------------------------
+
+export interface QuotaStatus {
+  /** Whether the provider currently has available capacity */
+  available: boolean;
+  /** Remaining tokens in current window, if known */
+  remainingTokens?: number;
+  /** When the current rate limit window resets, if known */
+  resetAt?: string;
+  /** Billing type detected */
+  billingType: "api" | "subscription" | "metered_api";
+  /** Additional provider-specific info */
+  detail?: Record<string, unknown>;
+}
+
+export interface QuotaContext {
+  config?: ProviderConfig;
+  env?: Record<string, string>;
+}
+
+// ---------------------------------------------------------------------------
+// Execution status & session state
+// ---------------------------------------------------------------------------
+
+/** Final outcome of a single-turn execution. */
+export type ExecutionStatus =
+  | "completed"    // success
+  | "failed"       // agent or execution error
+  | "aborted"      // cancelled via AbortSignal
+  | "timeout"      // exceeded time limit
+  | "blocked";     // agent reported a blocker it can't resolve
+
+/** Live state of an interactive session. */
+export type SessionState =
+  | "idle"                  // session created, no turn in progress
+  | "thinking"              // agent is generating/reasoning
+  | "tool_executing"        // agent is running a tool
+  | "waiting_for_approval"  // blocked on tool permission request
+  | "waiting_for_input"     // blocked on user input (AskUserQuestion, elicitation)
+  | "closed";               // session ended
+
+// ---------------------------------------------------------------------------
+// Token usage
+// ---------------------------------------------------------------------------
+
+/** Token usage for a single model within a run. */
+export interface TokenUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cachedInputTokens?: number;
+  cacheCreationInputTokens?: number;
+}
+
+/**
+ * Get aggregate usage across all models. Convenience for when you don't
+ * care about per-model breakdown.
+ */
+export function aggregateUsage(usage: Record<string, TokenUsage> | undefined): TokenUsage | null {
+  if (!usage) return null;
+  const entries = Object.values(usage);
+  if (entries.length === 0) return null;
+  const result: TokenUsage = { inputTokens: 0, outputTokens: 0 };
+  for (const u of entries) {
+    result.inputTokens += u.inputTokens;
+    result.outputTokens += u.outputTokens;
+    if (u.cachedInputTokens != null) {
+      result.cachedInputTokens = (result.cachedInputTokens ?? 0) + u.cachedInputTokens;
+    }
+    if (u.cacheCreationInputTokens != null) {
+      result.cacheCreationInputTokens = (result.cacheCreationInputTokens ?? 0) + u.cacheCreationInputTokens;
+    }
+  }
+  return result;
 }
 
 // Execution output
@@ -46,21 +150,23 @@ export interface ExecutionResult {
   runId: string;
   exitCode: number | null;
   signal: string | null;
-  timedOut: boolean;
+  status: ExecutionStatus;
   startedAt: string;
   completedAt: string;
   durationMs: number;
   errorMessage: string | null;
   errorCode: string | null;
-  usage?: { inputTokens: number; outputTokens: number; cachedInputTokens?: number };
+  usage?: Record<string, TokenUsage>;
   costUsd: number | null;
   model: string | null;
   summary: string | null;
   sessionParams: Record<string, unknown> | null;
   sessionDisplayId: string | null;
   clearSession: boolean;
-  billingType: "api" | "subscription" | null;
+  billingType: "api" | "subscription" | "metered_api" | null;
   raw?: Record<string, unknown> | null;
+  /** If the run used a workspace, this contains the workspace handle for diffing/cleanup */
+  workspace?: import("./utils/workspace.js").PreparedWorkspace;
 }
 
 // Stream events — discriminated union
@@ -68,9 +174,19 @@ export type StreamEvent =
   | { type: "system"; subtype: string; sessionId: string | null; model: string | null; timestamp: string }
   | { type: "assistant"; text: string; timestamp: string }
   | { type: "thinking"; text: string; timestamp: string }
-  | { type: "tool_call"; name: string; input: unknown; timestamp: string }
+  | { type: "tool_call"; callId?: string; name: string; input: unknown; timestamp: string }
   | { type: "tool_result"; toolCallId: string; content: string; isError: boolean; timestamp: string }
   | { type: "result"; text: string; cost: number | null; isError: boolean; timestamp: string };
+
+// Lifecycle events — execution phase tracking
+export type LifecycleEvent =
+  | { phase: "preparing"; step: "workspace" | "skills" | "auth" | "instructions" | "binary" }
+  | { phase: "spawning" }
+  | { phase: "running"; pid: number }
+  | { phase: "waiting_for_input"; request: UserInputRequest }
+  | { phase: "completed" }
+  | { phase: "cancelled" }
+  | { phase: "error"; message: string };
 
 // Session persistence
 export interface SessionCodec {
@@ -126,11 +242,16 @@ export interface SessionContext {
   config?: ProviderConfig;
   /** Resume an existing session. If omitted, starts fresh. */
   sessionParams?: Record<string, unknown> | null;
+  /** AbortSignal to cancel the session. When aborted, the session is closed
+   *  and the underlying process is terminated. */
+  signal?: AbortSignal;
 
   /** Called for every stream event across all turns. */
   onEvent?: (event: StreamEvent) => void | Promise<void>;
   /** Called for raw stdout/stderr output across all turns. */
   onOutput?: (stream: "stdout" | "stderr", chunk: string) => void | Promise<void>;
+  /** Called at key execution lifecycle phases (preparing, spawning, running, etc.). */
+  onLifecycle?: (event: LifecycleEvent) => void;
 
   /**
    * Called when the agent needs confirmation or user input before proceeding
@@ -165,7 +286,7 @@ export interface SessionContext {
 /** A persistent session handle for multi-turn conversations. */
 export interface AgentSession {
   readonly sessionId: string | null;
-  readonly state: "idle" | "running" | "closed";
+  readonly state: SessionState;
 
   /** Send a user message and wait for the agent's turn to complete. */
   send(message: string): Promise<TurnResult>;
@@ -180,13 +301,11 @@ export interface AgentSession {
 /** Result of a single turn within a session. */
 export interface TurnResult {
   summary: string | null;
-  usage?: { inputTokens: number; outputTokens: number; cachedInputTokens?: number };
+  usage?: Record<string, TokenUsage>;
   costUsd: number | null;
-  isError: boolean;
+  status: "completed" | "failed" | "max_turns" | "max_budget" | "aborted";
   errorCode: string | null;
   errorMessage: string | null;
-  /** Why the turn ended: "end_turn", "max_turns", "interrupt", etc. */
-  stopReason: string | null;
 }
 
 /**

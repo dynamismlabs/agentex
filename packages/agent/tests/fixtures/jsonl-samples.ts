@@ -98,6 +98,67 @@ export const CODEX_COMMAND_FAILURE_OUTPUT = [
   }),
 ].join("\n");
 
+export const CODEX_FUNCTION_CALL_OUTPUT = [
+  JSON.stringify({ type: "thread.started", thread_id: "thread-fn-1" }),
+  JSON.stringify({
+    type: "item.started",
+    item: {
+      type: "function_call",
+      id: "fc-001",
+      name: "read_file",
+      arguments: JSON.stringify({ path: "/tmp/test.txt" }),
+      status: "in_progress",
+    },
+  }),
+  JSON.stringify({
+    type: "item.completed",
+    item: {
+      type: "function_call",
+      id: "fc-001",
+      name: "read_file",
+      arguments: JSON.stringify({ path: "/tmp/test.txt" }),
+      output: "file contents here",
+      status: "completed",
+    },
+  }),
+  JSON.stringify({
+    type: "item.completed",
+    item: {
+      type: "agent_message",
+      content: [{ type: "output_text", text: "Read the file for you." }],
+    },
+  }),
+  JSON.stringify({
+    type: "turn.completed",
+    usage: { input_tokens: 100, output_tokens: 35 },
+    model: "o4-mini",
+  }),
+].join("\n");
+
+export const CODEX_FUNCTION_CALL_FAILURE_OUTPUT = [
+  JSON.stringify({ type: "thread.started", thread_id: "thread-fn-fail" }),
+  JSON.stringify({
+    type: "item.started",
+    item: {
+      type: "function_call",
+      call_id: "fc-002",
+      name: "write_file",
+      input: { path: "/readonly/file.txt", content: "data" },
+      status: "in_progress",
+    },
+  }),
+  JSON.stringify({
+    type: "item.completed",
+    item: {
+      type: "function_call",
+      call_id: "fc-002",
+      name: "write_file",
+      result: "Permission denied",
+      status: "failed",
+    },
+  }),
+].join("\n");
+
 export const CODEX_ROLLOUT_NOISE = [
   "2025-01-01T00:00:00.000Z ERROR codex_core::rollout::list: state db missing rollout path for thread abc-123",
   "actual useful stderr output",

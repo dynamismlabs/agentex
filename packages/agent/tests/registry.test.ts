@@ -70,7 +70,7 @@ describe("registry", () => {
         runId: "test",
         exitCode: 0,
         signal: null,
-        timedOut: false,
+        status: "completed" as const,
         startedAt: new Date().toISOString(),
         completedAt: new Date().toISOString(),
         durationMs: 0,

@@ -28,7 +28,7 @@ describe("executeCodexProvider", () => {
     }));
 
     expect(result.exitCode).toBe(0);
-    expect(result.timedOut).toBe(false);
+    expect(result.status).toBe("completed");
     expect(result.sessionParams?.["sessionId"]).toBe("codex-thread-1");
     expect(result.summary).toContain("Codex done");
     expect(result.billingType).toBe("subscription");
@@ -51,7 +51,7 @@ describe("executeCodexProvider", () => {
       env: { MOCK_BEHAVIOR: "timeout" },
     }));
 
-    expect(result.timedOut).toBe(true);
+    expect(result.status).toBe("timeout");
     expect(result.errorCode).toBe("timeout");
   }, 10_000);
 

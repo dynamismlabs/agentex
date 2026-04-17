@@ -28,7 +28,7 @@ describe("executePiProvider", () => {
     }));
 
     expect(result.exitCode).toBe(0);
-    expect(result.timedOut).toBe(false);
+    expect(result.status).toBe("completed");
     expect(result.sessionParams).toBeDefined();
     expect(result.summary).toContain("Done");
     expect(result.errorCode).toBeNull();
@@ -43,7 +43,7 @@ describe("executePiProvider", () => {
       env: { MOCK_BEHAVIOR: "timeout" },
     }));
 
-    expect(result.timedOut).toBe(true);
+    expect(result.status).toBe("timeout");
     expect(result.errorCode).toBe("timeout");
   }, 10_000);
 

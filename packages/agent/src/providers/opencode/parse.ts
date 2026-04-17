@@ -120,7 +120,19 @@ export function parseOpenCodeStreamLine(line: string): StreamEvent | null {
   if (type === "tool_use") {
     const part = parseObject(event["part"]);
     const name = asString(part["name"], "");
-    return { type: "tool_call", name, input: part["input"], timestamp };
+    const state = parseObject(part["state"]);
+    const status = asString(state["status"], "");
+    // If the tool has completed with a result/error, emit tool_result instead
+    if (status === "error" || status === "completed") {
+      return {
+        type: "tool_result",
+        toolCallId: asString(part["id"], "") || asString(part["tool_use_id"], ""),
+        content: status === "error" ? asString(state["error"], "") : asString(state["result"], ""),
+        isError: status === "error",
+        timestamp,
+      };
+    }
+    return { type: "tool_call", callId: asString(part["id"], "") || asString(part["tool_use_id"], "") || undefined, name, input: part["input"], timestamp };
   }
 
   if (type === "step_finish") {

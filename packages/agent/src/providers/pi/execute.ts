@@ -6,6 +6,9 @@ import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { runChildProcess, deriveErrorCode } from "../../utils/process.js";
 import { injectHomeSkills } from "../../utils/skills.js";
+import { resolveInstructions } from "../../utils/instructions.js";
+import { prepareWorkspace } from "../../utils/workspace.js";
+import type { PreparedWorkspace } from "../../utils/workspace.js";
 import { uuidv7 } from "../../utils/uuid.js";
 import { parsePiJsonl, parsePiStreamLine, isPiUnknownSessionError } from "./parse.js";
 
@@ -32,25 +35,28 @@ function buildSessionPath(runId: string): string {
 
 export async function executePiProvider(ctx: ExecutionContext): Promise<ExecutionResult> {
   const runId = ctx.runId ?? uuidv7();
-  const cwd = ctx.cwd ?? process.cwd();
+  let cwd = ctx.cwd ?? process.cwd();
   const model = ctx.model ?? ctx.config?.model ?? "";
   const config = ctx.config ?? {};
   const startedAt = new Date().toISOString();
 
   // 1. Resolve binary
+  ctx.onLifecycle?.({ phase: "preparing", step: "binary" });
   let resolvedBinary;
   try {
     resolvedBinary = await findBinary("pi", config.command);
   } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : "Binary not found";
+    ctx.onLifecycle?.({ phase: "error", message: errorMessage });
     return {
       runId,
       exitCode: null,
       signal: null,
-      timedOut: false,
+      status: "failed" as const,
       startedAt,
       completedAt: new Date().toISOString(),
       durationMs: Date.now() - new Date(startedAt).getTime(),
-      errorMessage: err instanceof Error ? err.message : "Binary not found",
+      errorMessage,
       errorCode: "binary_not_found",
       costUsd: null,
       model: null,
@@ -62,11 +68,25 @@ export async function executePiProvider(ctx: ExecutionContext): Promise<Executio
     };
   }
 
-  // 2. Build env
+  // 2. Workspace isolation
+  let workspace: PreparedWorkspace | undefined;
+  if (config.workspace) {
+    ctx.onLifecycle?.({ phase: "preparing", step: "workspace" });
+    workspace = await prepareWorkspace(cwd, config.workspace);
+    cwd = workspace.cwd;
+  }
+
+  // 3. Build env
   const env = buildEnv(ctx.env);
   ensurePathInEnv(env);
 
-  // 3. Inject skills into ~/.pi/agent/skills/
+  // 3. Resolve instructions — Pi uses native --append-system-prompt flag,
+  // but we still validate the file exists early so failures are clear.
+  ctx.onLifecycle?.({ phase: "preparing", step: "instructions" });
+  if (config.instructionsFile) await resolveInstructions(config.instructionsFile);
+
+  // 4. Inject skills into ~/.pi/agent/skills/
+  ctx.onLifecycle?.({ phase: "preparing", step: "skills" });
   let piSkillsDir: string | null = null;
   if (config.skillDirs && config.skillDirs.length > 0) {
     try {
@@ -118,6 +138,7 @@ export async function executePiProvider(ctx: ExecutionContext): Promise<Executio
     args.push("--tools", "read,bash,edit,write,grep,find,ls");
     args.push("--session", sessionFile);
     if (piSkillsDir) args.push("--skill", piSkillsDir);
+    if (config.instructionsFile) args.push("--append-system-prompt", config.instructionsFile);
     if (config.extraArgs) args.push(...config.extraArgs);
     return args;
   };
@@ -130,6 +151,7 @@ export async function executePiProvider(ctx: ExecutionContext): Promise<Executio
     const args = buildArgs(sessionFile);
     let stdoutBuffer = "";
 
+    ctx.onLifecycle?.({ phase: "spawning" });
     const proc = await runChildProcess({
       runId,
       command: resolvedBinary.bin,
@@ -139,7 +161,11 @@ export async function executePiProvider(ctx: ExecutionContext): Promise<Executio
       stdin: rpcStdin,
       timeoutSec: config.timeoutSec,
       graceSec: config.graceSec,
-      onStart: ctx.onStart,
+      onStart: (pid) => {
+        ctx.onLifecycle?.({ phase: "running", pid });
+        ctx.onStart?.(pid);
+      },
+      signal: ctx.signal,
       onOutput: async (stream, chunk) => {
         if (stream === "stderr") {
           if (ctx.onOutput) {
@@ -225,29 +251,47 @@ export async function executePiProvider(ctx: ExecutionContext): Promise<Executio
     return null;
   })();
 
-  const resultSessionParams = clearSession ? null : { sessionId: finalSessionPath, cwd };
+  // Always return the current session path so callers can continue.
+  // clearSession tells callers the OLD session was invalid, but we still
+  // provide the NEW session handle from the retry.
+  const resultSessionParams = { sessionId: finalSessionPath, cwd };
 
   const completedAt = new Date().toISOString();
+  const resolvedModel = model || null;
+  const status = proc.aborted ? "aborted" as const
+    : proc.timedOut ? "timeout" as const
+    : (errorCode || errorMessage) ? "failed" as const
+    : "completed" as const;
+
+  if (status === "completed") {
+    ctx.onLifecycle?.({ phase: "completed" });
+  } else if (status === "aborted") {
+    ctx.onLifecycle?.({ phase: "cancelled" });
+  } else {
+    ctx.onLifecycle?.({ phase: "error", message: errorMessage ?? "Unknown error" });
+  }
+
   return {
     runId,
     exitCode: proc.exitCode,
     signal: proc.signal ?? null,
-    timedOut: proc.timedOut,
+    status,
     startedAt,
     completedAt,
     durationMs: new Date(completedAt).getTime() - new Date(startedAt).getTime(),
     errorMessage,
     errorCode,
-    usage: parsed.usage
-      ? { inputTokens: parsed.usage.inputTokens, outputTokens: parsed.usage.outputTokens, cachedInputTokens: parsed.usage.cachedInputTokens }
+    usage: parsed.usage && resolvedModel
+      ? { [resolvedModel]: { inputTokens: parsed.usage.inputTokens, outputTokens: parsed.usage.outputTokens, cachedInputTokens: parsed.usage.cachedInputTokens } }
       : undefined,
     costUsd: parsed.usage?.costUsd ?? null,
-    model: model || null,
+    model: resolvedModel,
     summary: parsed.summary,
     sessionParams: resultSessionParams,
     sessionDisplayId: finalSessionPath,
     clearSession,
     billingType: "api",
     raw: null,
+    workspace,
   };
 }

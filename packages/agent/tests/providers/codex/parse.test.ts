@@ -13,6 +13,8 @@ import {
   CODEX_MALFORMED_OUTPUT,
   CODEX_COMMAND_EXECUTION_OUTPUT,
   CODEX_COMMAND_FAILURE_OUTPUT,
+  CODEX_FUNCTION_CALL_OUTPUT,
+  CODEX_FUNCTION_CALL_FAILURE_OUTPUT,
   CODEX_ROLLOUT_NOISE,
 } from "../../fixtures/jsonl-samples.js";
 
@@ -81,6 +83,105 @@ describe("parseCodexStreamLine", () => {
     if (event?.type === "tool_call") {
       expect(event.name).toBe("command_execution");
       expect(event.input).toBe('/bin/bash -lc "ls -la"');
+    }
+  });
+
+  it("includes callId on command_execution tool_call when item has id", () => {
+    const line = JSON.stringify({
+      type: "item.started",
+      item: {
+        type: "command_execution",
+        id: "cmd-start-001",
+        command: '/bin/bash -lc "echo hello"',
+        status: "in_progress",
+      },
+    });
+    const event = parseCodexStreamLine(line);
+    expect(event).not.toBeNull();
+    if (event?.type === "tool_call") {
+      expect(event.callId).toBe("cmd-start-001");
+    }
+  });
+
+  it("returns tool_call from item.started with function_call", () => {
+    const line = JSON.stringify({
+      type: "item.started",
+      item: {
+        type: "function_call",
+        id: "fc-001",
+        name: "read_file",
+        arguments: JSON.stringify({ path: "/tmp/test.txt" }),
+        status: "in_progress",
+      },
+    });
+    const event = parseCodexStreamLine(line);
+    expect(event).not.toBeNull();
+    expect(event!.type).toBe("tool_call");
+    if (event?.type === "tool_call") {
+      expect(event.callId).toBe("fc-001");
+      expect(event.name).toBe("read_file");
+      expect(event.input).toBe(JSON.stringify({ path: "/tmp/test.txt" }));
+    }
+  });
+
+  it("returns tool_call from item.started with function_call using call_id", () => {
+    const line = JSON.stringify({
+      type: "item.started",
+      item: {
+        type: "function_call",
+        call_id: "fc-alt-001",
+        name: "write_file",
+        input: { path: "/tmp/out.txt", content: "data" },
+        status: "in_progress",
+      },
+    });
+    const event = parseCodexStreamLine(line);
+    expect(event).not.toBeNull();
+    if (event?.type === "tool_call") {
+      expect(event.callId).toBe("fc-alt-001");
+      expect(event.name).toBe("write_file");
+    }
+  });
+
+  it("returns tool_result from item.completed with function_call (success)", () => {
+    const line = JSON.stringify({
+      type: "item.completed",
+      item: {
+        type: "function_call",
+        id: "fc-001",
+        name: "read_file",
+        output: "file contents here",
+        status: "completed",
+      },
+    });
+    const event = parseCodexStreamLine(line);
+    expect(event).not.toBeNull();
+    expect(event!.type).toBe("tool_result");
+    if (event?.type === "tool_result") {
+      expect(event.toolCallId).toBe("fc-001");
+      expect(event.content).toBe("file contents here");
+      expect(event.isError).toBe(false);
+    }
+  });
+
+  it("returns tool_result from item.completed with function_call (failed)", () => {
+    const line = JSON.stringify({
+      type: "item.completed",
+      item: {
+        type: "function_call",
+        call_id: "fc-002",
+        name: "write_file",
+        result: "Permission denied",
+        status: "failed",
+      },
+    });
+    const event = parseCodexStreamLine(line);
+    expect(event).not.toBeNull();
+    expect(event!.type).toBe("tool_result");
+    if (event?.type === "tool_result") {
+      expect(event.toolCallId).toBe("fc-002");
+      expect(event.content).toBe("Permission denied");
+      expect(event.isError).toBe(true);
     }
   });
 
