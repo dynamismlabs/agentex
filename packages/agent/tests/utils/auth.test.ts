@@ -1,5 +1,15 @@
-import { describe, it, expect } from "vitest";
-import { detectAuth } from "../../src/utils/auth.js";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
+import {
+  detectAuth,
+  resolveAuthForProvider,
+  hasApiKey,
+  hasBedrock,
+  hasSubscription,
+} from "../../src/utils/auth.js";
+import type { ProviderModule } from "../../src/types.js";
 
 describe("detectAuth", () => {
   describe("claude provider", () => {
@@ -106,5 +116,167 @@ describe("detectAuth", () => {
       expect(result.method).toBe("subscription");
       expect(result.billingType).toBe("subscription");
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveAuthForProvider — structured report of every auth path
+// ---------------------------------------------------------------------------
+
+describe("resolveAuthForProvider", () => {
+  let tmpHome: string;
+  const originalEnv = { ...process.env };
+
+  beforeEach(async () => {
+    tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "agex-auth-test-"));
+    // Point each provider's home env override at a clean empty dir.
+    process.env.CODEX_HOME = path.join(tmpHome, "codex");
+    process.env.CLAUDE_CONFIG_DIR = path.join(tmpHome, "claude");
+    process.env.GEMINI_CONFIG_DIR = path.join(tmpHome, "gemini");
+    delete process.env.OPENAI_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
+    delete process.env.GEMINI_API_KEY;
+    delete process.env.GOOGLE_API_KEY;
+    delete process.env.ANTHROPIC_BEDROCK_BASE_URL;
+    delete process.env.AWS_ACCESS_KEY_ID;
+    delete process.env.AWS_SECRET_ACCESS_KEY;
+    delete process.env.AWS_REGION;
+    delete process.env.CURSOR_API_KEY;
+  });
+
+  afterEach(async () => {
+    await fs.rm(tmpHome, { recursive: true, force: true });
+    process.env = { ...originalEnv };
+  });
+
+  describe("codex", () => {
+    it("reports api_key absent and subscription absent when nothing is set", async () => {
+      const report = await resolveAuthForProvider("codex");
+      expect(report.providerType).toBe("codex");
+      const apiKey = report.options.find((o) => o.method === "api_key")!;
+      const sub = report.options.find((o) => o.method === "subscription")!;
+      expect(apiKey.present).toBe(false);
+      expect(sub.present).toBe(false);
+      expect(apiKey.source).toEqual({ kind: "env", var: "OPENAI_API_KEY" });
+      expect(sub.source.kind).toBe("file");
+    });
+
+    it("detects api_key presence from caller env", async () => {
+      const report = await resolveAuthForProvider("codex", {
+        env: { OPENAI_API_KEY: "sk-test" },
+      });
+      const apiKey = report.options.find((o) => o.method === "api_key")!;
+      expect(apiKey.present).toBe(true);
+    });
+
+    it("detects subscription when auth.json exists in CODEX_HOME", async () => {
+      const codexHome = process.env.CODEX_HOME!;
+      await fs.mkdir(codexHome, { recursive: true });
+      await fs.writeFile(path.join(codexHome, "auth.json"), "{}");
+      const report = await resolveAuthForProvider("codex");
+      const sub = report.options.find((o) => o.method === "subscription")!;
+      expect(sub.present).toBe(true);
+    });
+  });
+
+  describe("claude", () => {
+    it("reports bedrock present when AWS creds + region are set", async () => {
+      const report = await resolveAuthForProvider("claude", {
+        env: { AWS_ACCESS_KEY_ID: "AKIA", AWS_REGION: "us-west-2" },
+      });
+      const bedrock = report.options.find((o) => o.method === "bedrock")!;
+      expect(bedrock.present).toBe(true);
+    });
+
+    it("reports bedrock present when ANTHROPIC_BEDROCK_BASE_URL is set", async () => {
+      const report = await resolveAuthForProvider("claude", {
+        env: { ANTHROPIC_BEDROCK_BASE_URL: "https://bedrock.example.com" },
+      });
+      const bedrock = report.options.find((o) => o.method === "bedrock")!;
+      expect(bedrock.present).toBe(true);
+    });
+
+    it("subscription option uses keychain on darwin and file elsewhere", async () => {
+      const report = await resolveAuthForProvider("claude");
+      const sub = report.options.find((o) => o.method === "subscription")!;
+      if (process.platform === "darwin") {
+        expect(sub.source.kind).toBe("keychain");
+        expect(sub.present).toBe("unknown");
+      } else {
+        expect(sub.source.kind).toBe("file");
+        expect(sub.present).toBe(false);
+      }
+    });
+
+    it("detects api key presence independent of bedrock", async () => {
+      const report = await resolveAuthForProvider("claude", {
+        env: { ANTHROPIC_API_KEY: "sk-ant" },
+      });
+      const apiKey = report.options.find((o) => o.method === "api_key")!;
+      expect(apiKey.present).toBe(true);
+    });
+  });
+
+  describe("gemini", () => {
+    it("reports both GEMINI_API_KEY and GOOGLE_API_KEY as separate options", async () => {
+      const report = await resolveAuthForProvider("gemini");
+      const apiKeys = report.options.filter((o) => o.method === "api_key");
+      expect(apiKeys).toHaveLength(2);
+      expect(apiKeys.map((k) => (k.source.kind === "env" ? k.source.var : ""))).toEqual([
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+      ]);
+    });
+
+    it("detects subscription when oauth_creds.json exists", async () => {
+      const geminiHome = process.env.GEMINI_CONFIG_DIR!;
+      await fs.mkdir(geminiHome, { recursive: true });
+      await fs.writeFile(path.join(geminiHome, "oauth_creds.json"), "{}");
+      const report = await resolveAuthForProvider("gemini");
+      const sub = report.options.find((o) => o.method === "subscription")!;
+      expect(sub.present).toBe(true);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Sugar helpers — method-specific presence checks
+// ---------------------------------------------------------------------------
+
+function fakeProvider(options: { method: "api_key" | "bedrock" | "subscription"; present: boolean | "unknown" }[]): ProviderModule {
+  return {
+    type: "fake",
+    capabilities: { sessions: false, modelDiscovery: false, quotaProbing: false, mcp: false, skills: false, instructions: false, workspace: false },
+    execute: vi.fn() as unknown as ProviderModule["execute"],
+    testEnvironment: vi.fn() as unknown as ProviderModule["testEnvironment"],
+    resolveAuth: async () => ({
+      providerType: "fake",
+      options: options.map((o) => ({
+        method: o.method,
+        source: { kind: "env", var: "X" },
+        present: o.present,
+      })),
+    }),
+  };
+}
+
+describe("sugar helpers", () => {
+  it("hasSubscription returns true only when subscription is confirmed present", async () => {
+    expect(await hasSubscription(fakeProvider([{ method: "subscription", present: true }]))).toBe(true);
+    expect(await hasSubscription(fakeProvider([{ method: "subscription", present: false }]))).toBe(false);
+    // "unknown" (e.g. macOS keychain) is NOT treated as present.
+    expect(await hasSubscription(fakeProvider([{ method: "subscription", present: "unknown" }]))).toBe(false);
+  });
+
+  it("hasApiKey returns true only when api_key is confirmed present", async () => {
+    expect(await hasApiKey(fakeProvider([{ method: "api_key", present: true }]))).toBe(true);
+    expect(await hasApiKey(fakeProvider([{ method: "api_key", present: false }]))).toBe(false);
+    // Subscription-present does NOT satisfy hasApiKey.
+    expect(await hasApiKey(fakeProvider([{ method: "subscription", present: true }]))).toBe(false);
+  });
+
+  it("hasBedrock returns true only when bedrock is confirmed present", async () => {
+    expect(await hasBedrock(fakeProvider([{ method: "bedrock", present: true }]))).toBe(true);
+    expect(await hasBedrock(fakeProvider([{ method: "bedrock", present: false }]))).toBe(false);
   });
 });

@@ -1,6 +1,6 @@
 import type { EnvironmentTestContext, EnvironmentTestResult, EnvironmentCheck } from "../../types.js";
 import { findBinary } from "../../utils/binary.js";
-import { buildEnv } from "../../utils/env.js";
+import { resolveAuthForProvider } from "../../utils/auth.js";
 
 function summarizeStatus(checks: EnvironmentCheck[]): EnvironmentTestResult["status"] {
   if (checks.some((c) => c.level === "error")) return "fail";
@@ -15,7 +15,6 @@ export async function testCursorEnvironment(
   const config = (ctx.config ?? {}) as Record<string, unknown>;
   const command = typeof config["command"] === "string" ? config["command"] : undefined;
 
-  // Check binary resolvable
   try {
     await findBinary("agent", command);
     checks.push({
@@ -32,20 +31,19 @@ export async function testCursorEnvironment(
     });
   }
 
-  // Check API key
-  const env = buildEnv(
+  const callerEnv =
     typeof config["env"] === "object" && config["env"] !== null
       ? (config["env"] as Record<string, string>)
-      : undefined,
-  );
-  const hasCursorKey = typeof env["CURSOR_API_KEY"] === "string" && env["CURSOR_API_KEY"].trim().length > 0;
-  const hasOpenAiKey = typeof env["OPENAI_API_KEY"] === "string" && env["OPENAI_API_KEY"].trim().length > 0;
+      : undefined;
+  const auth = await resolveAuthForProvider("cursor", { env: callerEnv });
 
-  if (hasCursorKey || hasOpenAiKey) {
+  const apiKey = auth.options.find((o) => o.method === "api_key" && o.present === true);
+  if (apiKey) {
+    const varName = apiKey.source.kind === "env" ? apiKey.source.var : "an API key";
     checks.push({
       code: "cursor_api_key_present",
       level: "info",
-      message: `${hasCursorKey ? "CURSOR_API_KEY" : "OPENAI_API_KEY"} is set.`,
+      message: `${varName} is set.`,
     });
   } else {
     checks.push({
@@ -58,6 +56,7 @@ export async function testCursorEnvironment(
   return {
     providerType: ctx.providerType,
     status: summarizeStatus(checks),
+    auth,
     checks,
     testedAt: new Date().toISOString(),
   };

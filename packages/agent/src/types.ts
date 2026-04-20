@@ -16,6 +16,14 @@ export interface ProviderModule {
   execute(ctx: ExecutionContext): Promise<ExecutionResult>;
   createSession?(ctx: SessionContext): Promise<AgentSession>;
   testEnvironment(ctx: EnvironmentTestContext): Promise<EnvironmentTestResult>;
+  /**
+   * Enumerate every auth path this provider supports and report which are
+   * currently present. Cheap: inspects env vars and files only — does not
+   * spawn the binary. Callers should use the `hasSubscription` / `hasApiKey`
+   * / `hasBedrock` helpers rather than interpreting the report directly when
+   * they only want a yes/no for a specific billing mode.
+   */
+  resolveAuth(ctx?: AuthResolveContext): Promise<AuthReport>;
   sessionCodec?: SessionCodec;
   /** List available models. Pass cacheTtlMs to cache results (0 = no cache, default). */
   listModels?(options?: { cacheTtlMs?: number }): Promise<ProviderModel[]>;
@@ -204,6 +212,8 @@ export interface EnvironmentTestContext {
 export interface EnvironmentTestResult {
   providerType: string;
   status: "pass" | "warn" | "fail";
+  /** Structured auth report: every supported auth path with presence state. */
+  auth: AuthReport;
   checks: EnvironmentCheck[];
   testedAt: string;
 }
@@ -214,6 +224,51 @@ export interface EnvironmentCheck {
   message: string;
   detail?: string;
   hint?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Auth reporting
+// ---------------------------------------------------------------------------
+
+/** How a provider is authenticated. Determines billing behavior at runtime. */
+export type AuthMethod = "api_key" | "bedrock" | "subscription";
+
+/** Where an auth credential lives. */
+export type AuthSource =
+  /** Single environment variable, e.g. OPENAI_API_KEY. */
+  | { kind: "env"; var: string }
+  /** Multiple env vars that together form one credential, e.g. AWS creds. */
+  | { kind: "env_combo"; vars: string[] }
+  /** A file on disk, e.g. ~/.codex/auth.json. Path is already resolved. */
+  | { kind: "file"; path: string }
+  /** macOS keychain entry. Cannot be read silently — present will be "unknown". */
+  | { kind: "keychain"; service: string; account?: string };
+
+/**
+ * One auth path this provider supports, with its current presence state.
+ *
+ * `present` values:
+ * - `true`: the source exists / env var is set and non-empty.
+ * - `false`: the source does not exist / env var is unset or empty.
+ * - `"unknown"`: we can't check without side-effects (e.g. macOS keychain
+ *   would prompt the user). Safe-by-default: sugar helpers treat this as
+ *   not-present.
+ */
+export interface AuthOption {
+  method: AuthMethod;
+  source: AuthSource;
+  present: boolean | "unknown";
+}
+
+/** Full auth report for a provider. */
+export interface AuthReport {
+  providerType: string;
+  options: AuthOption[];
+}
+
+/** Optional context for auth resolution (override env vars for testing). */
+export interface AuthResolveContext {
+  env?: Record<string, string>;
 }
 
 // Models

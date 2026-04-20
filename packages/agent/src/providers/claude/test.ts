@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import type { EnvironmentTestContext, EnvironmentTestResult, EnvironmentCheck } from "../../types.js";
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
+import { resolveAuthForProvider } from "../../utils/auth.js";
 import { runChildProcess } from "../../utils/process.js";
 import { parseClaudeStreamJson } from "./parse.js";
 
@@ -18,7 +19,6 @@ export async function testClaudeEnvironment(
   const config = (ctx.config ?? {}) as Record<string, unknown>;
   const command = typeof config["command"] === "string" ? config["command"] : undefined;
 
-  // Check CWD valid
   const cwd = typeof config["cwd"] === "string" ? config["cwd"] : process.cwd();
   try {
     const stat = await fs.stat(cwd);
@@ -43,7 +43,6 @@ export async function testClaudeEnvironment(
     });
   }
 
-  // Check binary resolvable
   let binaryResolved = false;
   try {
     await findBinary("claude", command);
@@ -62,29 +61,65 @@ export async function testClaudeEnvironment(
     });
   }
 
-  // Check API key / subscription
-  const env = buildEnv(
+  const callerEnv =
     typeof config["env"] === "object" && config["env"] !== null
       ? (config["env"] as Record<string, string>)
-      : undefined,
+      : undefined;
+  const env = buildEnv(callerEnv);
+  const auth = await resolveAuthForProvider("claude", { env: callerEnv });
+
+  const apiKey = auth.options.find(
+    (o) => o.method === "api_key" && o.source.kind === "env",
   );
-  const hasApiKey = typeof env["ANTHROPIC_API_KEY"] === "string" && env["ANTHROPIC_API_KEY"].trim().length > 0;
-  if (hasApiKey) {
+  const bedrock = auth.options.find((o) => o.method === "bedrock");
+  const subscription = auth.options.find((o) => o.method === "subscription");
+
+  if (bedrock?.present === true) {
+    checks.push({
+      code: "claude_bedrock_credentials_present",
+      level: "info",
+      message: "Bedrock credentials detected; Claude will use metered AWS billing.",
+    });
+  }
+
+  if (apiKey?.present === true && bedrock?.present !== true) {
+    // API key overrides subscription — flag as warn so the caller surfaces it.
     checks.push({
       code: "claude_anthropic_api_key_overrides_subscription",
       level: "warn",
       message: "ANTHROPIC_API_KEY is set. Claude will use API-key auth instead of subscription credentials.",
       hint: "Unset ANTHROPIC_API_KEY if you want subscription-based Claude login behavior.",
     });
-  } else {
+  }
+
+  if (subscription?.present === true) {
     checks.push({
-      code: "claude_subscription_mode_possible",
+      code: "claude_subscription_credentials_present",
       level: "info",
-      message: "ANTHROPIC_API_KEY is not set; subscription-based auth can be used if Claude is logged in.",
+      message: "Claude subscription credentials detected on disk.",
+    });
+  } else if (subscription?.present === "unknown") {
+    checks.push({
+      code: "claude_subscription_credentials_unknown",
+      level: "info",
+      message:
+        "Claude subscription credentials are stored in the macOS Keychain and cannot be verified silently.",
     });
   }
 
-  // Optional hello probe
+  if (
+    apiKey?.present !== true &&
+    bedrock?.present !== true &&
+    subscription?.present === false
+  ) {
+    checks.push({
+      code: "claude_no_auth_detected",
+      level: "warn",
+      message: "No Claude authentication detected.",
+      hint: "Run `claude login` for subscription auth, or set ANTHROPIC_API_KEY.",
+    });
+  }
+
   if (binaryResolved && !checks.some((c) => c.code === "claude_cwd_invalid")) {
     try {
       const resolved = await findBinary("claude", command);
@@ -137,6 +172,7 @@ export async function testClaudeEnvironment(
   return {
     providerType: ctx.providerType,
     status: summarizeStatus(checks),
+    auth,
     checks,
     testedAt: new Date().toISOString(),
   };

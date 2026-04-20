@@ -4,6 +4,7 @@ import { testOpenCodeEnvironment } from "./test.js";
 import { opencodeSessionCodec } from "./codec.js";
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
+import { resolveAuthForProvider } from "../../utils/auth.js";
 import { ModelCache } from "../../utils/model-cache.js";
 import { runChildProcess } from "../../utils/process.js";
 
@@ -62,6 +63,7 @@ export const opencodeProvider: ProviderModule = {
   },
   execute: executeOpenCodeProvider,
   testEnvironment: testOpenCodeEnvironment,
+  resolveAuth: (ctx) => resolveAuthForProvider("opencode", ctx),
   sessionCodec: opencodeSessionCodec,
   listModels,
 };

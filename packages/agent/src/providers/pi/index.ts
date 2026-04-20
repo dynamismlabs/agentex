@@ -4,6 +4,7 @@ import { testPiEnvironment } from "./test.js";
 import { piSessionCodec } from "./codec.js";
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
+import { resolveAuthForProvider } from "../../utils/auth.js";
 import { ModelCache } from "../../utils/model-cache.js";
 import { runChildProcess } from "../../utils/process.js";
 
@@ -64,6 +65,7 @@ export const piProvider: ProviderModule = {
   },
   execute: executePiProvider,
   testEnvironment: testPiEnvironment,
+  resolveAuth: (ctx) => resolveAuthForProvider("pi", ctx),
   sessionCodec: piSessionCodec,
   listModels,
 };

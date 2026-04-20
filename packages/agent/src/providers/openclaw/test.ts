@@ -1,4 +1,6 @@
-import type { EnvironmentTestContext, EnvironmentTestResult } from "../../types.js";
+import type { AuthReport, EnvironmentTestContext, EnvironmentTestResult } from "../../types.js";
+
+const EMPTY_AUTH: AuthReport = { providerType: "openclaw", options: [] };
 
 export async function testOpenclawEnvironment(
   ctx: EnvironmentTestContext,
@@ -23,6 +25,7 @@ export async function testOpenclawEnvironment(
           level: "info",
           message: `OpenClaw gateway is reachable at ${gatewayUrl}`,
         }],
+        auth: { ...EMPTY_AUTH, providerType: ctx.providerType },
         testedAt: new Date().toISOString(),
       };
     }
@@ -36,6 +39,7 @@ export async function testOpenclawEnvironment(
         message: `OpenClaw gateway returned status ${response.status}`,
         hint: `Check that the OpenClaw gateway at ${gatewayUrl} is running and healthy.`,
       }],
+      auth: { ...EMPTY_AUTH, providerType: ctx.providerType },
       testedAt: new Date().toISOString(),
     };
   } catch (err) {
@@ -49,6 +53,7 @@ export async function testOpenclawEnvironment(
         detail: err instanceof Error ? err.message : String(err),
         hint: `Ensure the OpenClaw gateway is running at ${gatewayUrl}.`,
       }],
+      auth: { ...EMPTY_AUTH, providerType: ctx.providerType },
       testedAt: new Date().toISOString(),
     };
   }

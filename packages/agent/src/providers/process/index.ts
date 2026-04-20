@@ -5,6 +5,7 @@ import { ensureCommandResolvable } from "../../utils/binary.js";
 async function testProcessEnvironment(ctx: EnvironmentTestContext): Promise<EnvironmentTestResult> {
   const config = (ctx.config ?? {}) as Record<string, unknown>;
   const command = typeof config["command"] === "string" ? config["command"] : null;
+  const auth = { providerType: ctx.providerType, options: [] };
 
   if (!command) {
     return {
@@ -15,6 +16,7 @@ async function testProcessEnvironment(ctx: EnvironmentTestContext): Promise<Envi
         level: "error",
         message: "Process provider requires config.command to be set.",
       }],
+      auth,
       testedAt: new Date().toISOString(),
     };
   }
@@ -29,6 +31,7 @@ async function testProcessEnvironment(ctx: EnvironmentTestContext): Promise<Envi
         level: "info",
         message: `Command is resolvable: ${command}`,
       }],
+      auth,
       testedAt: new Date().toISOString(),
     };
   } catch (err) {
@@ -40,6 +43,7 @@ async function testProcessEnvironment(ctx: EnvironmentTestContext): Promise<Envi
         level: "error",
         message: err instanceof Error ? err.message : "Command not found",
       }],
+      auth,
       testedAt: new Date().toISOString(),
     };
   }
@@ -58,4 +62,5 @@ export const processProvider: ProviderModule = {
   },
   execute: executeProcessProvider,
   testEnvironment: testProcessEnvironment,
+  resolveAuth: async () => ({ providerType: "process", options: [] }),
 };

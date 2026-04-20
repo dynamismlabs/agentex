@@ -1,6 +1,6 @@
 import type { EnvironmentTestContext, EnvironmentTestResult, EnvironmentCheck } from "../../types.js";
 import { findBinary } from "../../utils/binary.js";
-import { buildEnv } from "../../utils/env.js";
+import { resolveAuthForProvider } from "../../utils/auth.js";
 
 function summarizeStatus(checks: EnvironmentCheck[]): EnvironmentTestResult["status"] {
   if (checks.some((c) => c.level === "error")) return "fail";
@@ -15,7 +15,6 @@ export async function testPiEnvironment(
   const config = (ctx.config ?? {}) as Record<string, unknown>;
   const command = typeof config["command"] === "string" ? config["command"] : undefined;
 
-  // Check binary resolvable
   try {
     await findBinary("pi", command);
     checks.push({
@@ -32,21 +31,21 @@ export async function testPiEnvironment(
     });
   }
 
-  // Check for provider API keys (Pi routes to various providers)
-  const env = buildEnv(
+  const callerEnv =
     typeof config["env"] === "object" && config["env"] !== null
       ? (config["env"] as Record<string, string>)
-      : undefined,
-  );
-  const hasOpenAiKey = typeof env["OPENAI_API_KEY"] === "string" && env["OPENAI_API_KEY"].trim().length > 0;
-  const hasAnthropicKey = typeof env["ANTHROPIC_API_KEY"] === "string" && env["ANTHROPIC_API_KEY"].trim().length > 0;
+      : undefined;
+  const auth = await resolveAuthForProvider("pi", { env: callerEnv });
 
-  if (hasOpenAiKey || hasAnthropicKey) {
-    const keys = [hasOpenAiKey && "OPENAI_API_KEY", hasAnthropicKey && "ANTHROPIC_API_KEY"].filter(Boolean).join(", ");
+  const presentKeys = auth.options
+    .filter((o) => o.present === true && o.source.kind === "env")
+    .map((o) => (o.source.kind === "env" ? o.source.var : ""));
+
+  if (presentKeys.length > 0) {
     checks.push({
       code: "pi_api_key_present",
       level: "info",
-      message: `Provider API key(s) set: ${keys}`,
+      message: `Provider API key(s) set: ${presentKeys.join(", ")}`,
     });
   } else {
     checks.push({
@@ -60,6 +59,7 @@ export async function testPiEnvironment(
   return {
     providerType: ctx.providerType,
     status: summarizeStatus(checks),
+    auth,
     checks,
     testedAt: new Date().toISOString(),
   };

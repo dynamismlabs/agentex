@@ -16,5 +16,6 @@ export const openclawProvider: ProviderModule = {
   },
   execute: executeOpenclawProvider,
   testEnvironment: testOpenclawEnvironment,
+  resolveAuth: async () => ({ providerType: "openclaw", options: [] }),
   sessionCodec: openclawSessionCodec,
 };

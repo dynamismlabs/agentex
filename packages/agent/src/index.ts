@@ -6,7 +6,13 @@ export { parseAskUserQuestion } from "./utils/ask-user-question.js";
 export { aggregateUsage } from "./types.js";
 export { resolveInstructions } from "./utils/instructions.js";
 export { getRuntimeHomeEnvVar, getDefaultRuntimeHome } from "./utils/runtime-homes.js";
-export { detectAuth } from "./utils/auth.js";
+export {
+  detectAuth,
+  resolveAuthForProvider,
+  hasSubscription,
+  hasApiKey,
+  hasBedrock,
+} from "./utils/auth.js";
 export type { ResolvedAuth } from "./utils/auth.js";
 export { prepareWorkspace } from "./utils/workspace.js";
 export type { WorkspaceOptions, PreparedWorkspace, DiffOptions } from "./utils/workspace.js";
@@ -46,6 +52,11 @@ export type {
   EnvironmentTestContext,
   EnvironmentTestResult,
   EnvironmentCheck,
+  AuthMethod,
+  AuthSource,
+  AuthOption,
+  AuthReport,
+  AuthResolveContext,
   ProviderModel,
   SessionContext,
   AgentSession,

@@ -5,6 +5,7 @@ import { testCodexEnvironment } from "./test.js";
 import { codexSessionCodec } from "./codec.js";
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
+import { resolveAuthForProvider } from "../../utils/auth.js";
 import { ModelCache } from "../../utils/model-cache.js";
 import { runChildProcess } from "../../utils/process.js";
 
@@ -64,6 +65,7 @@ export const codexProvider: ProviderModule = {
   execute: executeCodexProvider,
   createSession: (ctx: SessionContext): Promise<AgentSession> => createCodexSession(ctx),
   testEnvironment: testCodexEnvironment,
+  resolveAuth: (ctx) => resolveAuthForProvider("codex", ctx),
   sessionCodec: codexSessionCodec,
   listModels,
 };

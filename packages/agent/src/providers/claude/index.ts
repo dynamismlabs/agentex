@@ -1,5 +1,5 @@
 import type { ProviderModule, ProviderModel, SessionContext, AgentSession, QuotaContext, QuotaStatus } from "../../types.js";
-import { detectAuth } from "../../utils/auth.js";
+import { detectAuth, resolveAuthForProvider } from "../../utils/auth.js";
 import { executeClaudeProvider } from "./execute.js";
 import { createClaudeSession } from "./session.js";
 import { testClaudeEnvironment } from "./test.js";
@@ -77,6 +77,7 @@ export const claudeProvider: ProviderModule = {
   execute: executeClaudeProvider,
   createSession: (ctx: SessionContext): Promise<AgentSession> => createClaudeSession(ctx),
   testEnvironment: testClaudeEnvironment,
+  resolveAuth: (ctx) => resolveAuthForProvider("claude", ctx),
   sessionCodec: claudeSessionCodec,
   listModels,
   checkQuota,

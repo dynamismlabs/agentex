@@ -1,6 +1,6 @@
 import type { EnvironmentTestContext, EnvironmentTestResult, EnvironmentCheck } from "../../types.js";
 import { findBinary } from "../../utils/binary.js";
-import { buildEnv } from "../../utils/env.js";
+import { resolveAuthForProvider } from "../../utils/auth.js";
 
 function summarizeStatus(checks: EnvironmentCheck[]): EnvironmentTestResult["status"] {
   if (checks.some((c) => c.level === "error")) return "fail";
@@ -15,7 +15,6 @@ export async function testGeminiEnvironment(
   const config = (ctx.config ?? {}) as Record<string, unknown>;
   const command = typeof config["command"] === "string" ? config["command"] : undefined;
 
-  // Check binary resolvable
   try {
     await findBinary("gemini", command);
     checks.push({
@@ -32,32 +31,47 @@ export async function testGeminiEnvironment(
     });
   }
 
-  // Check API key
-  const env = buildEnv(
+  const callerEnv =
     typeof config["env"] === "object" && config["env"] !== null
       ? (config["env"] as Record<string, string>)
-      : undefined,
-  );
-  const hasGeminiKey = typeof env["GEMINI_API_KEY"] === "string" && env["GEMINI_API_KEY"].trim().length > 0;
-  const hasGoogleKey = typeof env["GOOGLE_API_KEY"] === "string" && env["GOOGLE_API_KEY"].trim().length > 0;
+      : undefined;
+  const auth = await resolveAuthForProvider("gemini", { env: callerEnv });
 
-  if (hasGeminiKey || hasGoogleKey) {
+  const apiKey = auth.options.find(
+    (o) => o.method === "api_key" && o.present === true,
+  );
+  const subscription = auth.options.find((o) => o.method === "subscription");
+
+  if (apiKey) {
+    const varName = apiKey.source.kind === "env" ? apiKey.source.var : "an API key";
     checks.push({
       code: "gemini_api_key_present",
       level: "info",
-      message: `${hasGeminiKey ? "GEMINI_API_KEY" : "GOOGLE_API_KEY"} is set.`,
+      message: `${varName} is set; Gemini will use API-key billing.`,
     });
-  } else {
+  }
+
+  if (subscription?.present === true) {
     checks.push({
-      code: "gemini_api_key_missing",
+      code: "gemini_subscription_credentials_present",
       level: "info",
-      message: "No API key set; Gemini will use login-based auth if available.",
+      message: "Gemini login credentials detected on disk.",
+    });
+  }
+
+  if (!apiKey && subscription?.present !== true) {
+    checks.push({
+      code: "gemini_no_auth_detected",
+      level: "warn",
+      message: "No Gemini authentication detected.",
+      hint: "Run `gemini auth login` or set GEMINI_API_KEY / GOOGLE_API_KEY.",
     });
   }
 
   return {
     providerType: ctx.providerType,
     status: summarizeStatus(checks),
+    auth,
     checks,
     testedAt: new Date().toISOString(),
   };

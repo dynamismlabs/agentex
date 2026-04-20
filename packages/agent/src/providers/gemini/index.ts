@@ -4,6 +4,7 @@ import { testGeminiEnvironment } from "./test.js";
 import { geminiSessionCodec } from "./codec.js";
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
+import { resolveAuthForProvider } from "../../utils/auth.js";
 import { ModelCache } from "../../utils/model-cache.js";
 import { runChildProcess } from "../../utils/process.js";
 
@@ -62,6 +63,7 @@ export const geminiProvider: ProviderModule = {
   },
   execute: executeGeminiProvider,
   testEnvironment: testGeminiEnvironment,
+  resolveAuth: (ctx) => resolveAuthForProvider("gemini", ctx),
   sessionCodec: geminiSessionCodec,
   listModels,
 };

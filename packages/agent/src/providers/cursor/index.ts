@@ -2,6 +2,7 @@ import type { ProviderModule, ProviderModel } from "../../types.js";
 import { executeCursorProvider } from "./execute.js";
 import { testCursorEnvironment } from "./test.js";
 import { cursorSessionCodec } from "./codec.js";
+import { resolveAuthForProvider } from "../../utils/auth.js";
 
 const STATIC_MODELS: ProviderModel[] = [
   { id: "claude-sonnet-4-20250514", name: "Claude Sonnet 4", provider: "anthropic" },
@@ -26,6 +27,7 @@ export const cursorProvider: ProviderModule = {
   },
   execute: executeCursorProvider,
   testEnvironment: testCursorEnvironment,
+  resolveAuth: (ctx) => resolveAuthForProvider("cursor", ctx),
   sessionCodec: cursorSessionCodec,
   listModels,
 };
