@@ -16,11 +16,11 @@ describe("ProviderCapabilities", () => {
     }
   });
 
-  it("claude has all capabilities", () => {
+  it("claude declares its capabilities", () => {
     const caps = getProvider("claude").capabilities;
     expect(caps).toEqual({
       sessions: true,
-      modelDiscovery: true,
+      modelDiscovery: false,
       quotaProbing: true,
       mcp: true,
       skills: true,
@@ -29,10 +29,10 @@ describe("ProviderCapabilities", () => {
     });
   });
 
-  it("codex has sessions and model discovery but no mcp or quota", () => {
+  it("codex has sessions but no model discovery, mcp, or quota", () => {
     const caps = getProvider("codex").capabilities;
     expect(caps.sessions).toBe(true);
-    expect(caps.modelDiscovery).toBe(true);
+    expect(caps.modelDiscovery).toBe(false);
     expect(caps.quotaProbing).toBe(false);
     expect(caps.mcp).toBe(false);
   });

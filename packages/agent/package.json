@@ -1,6 +1,6 @@
 {
   "name": "@agentex/agent",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "description": "Programmatic execution of AI coding agents (Claude Code, Codex, OpenClaw)",
   "type": "module",
   "exports": {
@@ -20,7 +20,8 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "smoke": "tsx scripts/smoke.ts",
-    "smoke:mock": "tsx scripts/smoke.ts --mock"
+    "smoke:mock": "tsx scripts/smoke.ts --mock",
+    "list-models": "tsx scripts/list-models.ts"
   },
   "keywords": [
     "ai",

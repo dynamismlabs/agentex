@@ -452,7 +452,7 @@ registerProvider(myProvider);
 - `ensureCommandResolvable(command)` — like `findBinary` but accepts an absolute path too.
 - `clearBinaryCache()` — invalidate the binary-resolution cache.
 - `provider.checkQuota?(ctx)` — rate-limit / quota status (when `capabilities.quotaProbing`).
-- `provider.listModels?(opts?)` — enumerate models the binary can drive.
+- `provider.listModels?(opts?)` — enumerate models the binary can drive. Currently no built-in provider implements this: none of the Claude / Codex / Gemini CLIs expose a non-interactive model-listing subcommand yet (run `pnpm list-models` to re-probe). Pass the model you want directly via `ExecutionContext.model` or `ProviderConfig.model`.
 
 ### Workspace
 - `prepareWorkspace({ strategy, baseBranch?, branchName?, targetDir? })` → `PreparedWorkspace` with `cwd`, `diff()`, `cleanup()`.
