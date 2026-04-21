@@ -1,6 +1,5 @@
 import type { ProviderModule, ProviderModel } from "../../types.js";
 import { executeCursorProvider } from "./execute.js";
-import { testCursorEnvironment } from "./test.js";
 import { cursorSessionCodec } from "./codec.js";
 import { resolveAuthForProvider } from "../../utils/auth.js";
 
@@ -26,7 +25,6 @@ export const cursorProvider: ProviderModule = {
     workspace: true,
   },
   execute: executeCursorProvider,
-  testEnvironment: testCursorEnvironment,
   resolveAuth: (ctx) => resolveAuthForProvider("cursor", ctx),
   sessionCodec: cursorSessionCodec,
   listModels,

@@ -1,10 +1,29 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { executeCodexProvider } from "../../../src/providers/codex/execute.js";
 import type { ExecutionContext, StreamEvent } from "../../../src/types.js";
 
 const MOCK_CODEX = path.resolve(import.meta.dirname, "../../fixtures/mock-codex.sh");
 const CWD = process.cwd();
+
+// Isolate tests from the developer's real ~/.codex/auth.json so the Codex
+// billing-prediction logic (which prefers subscription when auth.json exists)
+// doesn't flip based on local state.
+let tmpCodexHome: string;
+const originalCodexHome = process.env.CODEX_HOME;
+
+beforeEach(async () => {
+  tmpCodexHome = await fs.mkdtemp(path.join(os.tmpdir(), "codex-test-"));
+  process.env.CODEX_HOME = tmpCodexHome;
+});
+
+afterEach(async () => {
+  if (originalCodexHome !== undefined) process.env.CODEX_HOME = originalCodexHome;
+  else delete process.env.CODEX_HOME;
+  await fs.rm(tmpCodexHome, { recursive: true, force: true });
+});
 
 function makeCtx(overrides: Partial<ExecutionContext> = {}): ExecutionContext {
   return {

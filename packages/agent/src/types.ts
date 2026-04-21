@@ -15,13 +15,17 @@ export interface ProviderModule {
   capabilities: ProviderCapabilities;
   execute(ctx: ExecutionContext): Promise<ExecutionResult>;
   createSession?(ctx: SessionContext): Promise<AgentSession>;
-  testEnvironment(ctx: EnvironmentTestContext): Promise<EnvironmentTestResult>;
   /**
-   * Enumerate every auth path this provider supports and report which are
-   * currently present. Cheap: inspects env vars and files only — does not
-   * spawn the binary. Callers should use the `hasSubscription` / `hasApiKey`
-   * / `hasBedrock` helpers rather than interpreting the report directly when
-   * they only want a yes/no for a specific billing mode.
+   * Single source of truth for "is this provider usable?" Returns binary
+   * status, every supported auth path with present: boolean, and (when
+   * available) rich identity info (email, org, subscription tier).
+   *
+   * Prefers the CLI's own status subcommand (e.g. `claude auth status --json`,
+   * `codex login status`) for definitive truth, falling back to filesystem
+   * heuristics if the binary is missing or too old.
+   *
+   * Results are cached for 60s per provider+env; pass `{ fresh: true }` to
+   * bypass the cache.
    */
   resolveAuth(ctx?: AuthResolveContext): Promise<AuthReport>;
   sessionCodec?: SessionCodec;
@@ -203,29 +207,6 @@ export interface SessionCodec {
   getDisplayId?(params: Record<string, unknown> | null): string | null;
 }
 
-// Environment testing
-export interface EnvironmentTestContext {
-  providerType: string;
-  config?: Record<string, unknown>;
-}
-
-export interface EnvironmentTestResult {
-  providerType: string;
-  status: "pass" | "warn" | "fail";
-  /** Structured auth report: every supported auth path with presence state. */
-  auth: AuthReport;
-  checks: EnvironmentCheck[];
-  testedAt: string;
-}
-
-export interface EnvironmentCheck {
-  code: string;
-  level: "info" | "warn" | "error";
-  message: string;
-  detail?: string;
-  hint?: string;
-}
-
 // ---------------------------------------------------------------------------
 // Auth reporting
 // ---------------------------------------------------------------------------
@@ -241,34 +222,88 @@ export type AuthSource =
   | { kind: "env_combo"; vars: string[] }
   /** A file on disk, e.g. ~/.codex/auth.json. Path is already resolved. */
   | { kind: "file"; path: string }
-  /** macOS keychain entry. Cannot be read silently — present will be "unknown". */
-  | { kind: "keychain"; service: string; account?: string };
+  /** macOS keychain entry. */
+  | { kind: "keychain"; service: string; account?: string }
+  /** Determined by spawning a CLI status command. */
+  | { kind: "cli"; command: string };
 
 /**
  * One auth path this provider supports, with its current presence state.
  *
- * `present` values:
- * - `true`: the source exists / env var is set and non-empty.
- * - `false`: the source does not exist / env var is unset or empty.
- * - `"unknown"`: we can't check without side-effects (e.g. macOS keychain
- *   would prompt the user). Safe-by-default: sugar helpers treat this as
- *   not-present.
+ * `present` is boolean: true if the credential is confirmed present,
+ * false otherwise. Previously `"unknown"` was a third state for macOS
+ * keychain; the CLI-status approach replaces it with definitive truth.
  */
 export interface AuthOption {
   method: AuthMethod;
   source: AuthSource;
-  present: boolean | "unknown";
+  present: boolean;
+}
+
+/** Binary status for a provider's CLI. */
+export interface BinaryStatus {
+  installed: boolean;
+  /** Resolved absolute path to the binary, when installed. */
+  resolvedPath?: string;
+  /** Version string from `<cli> --version`, when we could parse one. */
+  version?: string;
+  /** Error message when installed=false (e.g. "command not found"). */
+  error?: string;
+}
+
+/**
+ * Rich identity info reported by the CLI's own auth-status command.
+ * Only populated for providers that expose this (currently Claude;
+ * Codex exposes a limited version).
+ */
+export interface AuthIdentity {
+  /** Email address of the logged-in account, when known. */
+  email?: string;
+  /** Organization / team name, when known. */
+  orgName?: string;
+  /**
+   * Subscription tier as reported by the CLI (e.g. "max", "pro", "team",
+   * "enterprise"). Provider-specific free-form string.
+   */
+  subscriptionType?: string;
+  /**
+   * Active auth method as reported by the CLI (e.g. "claude.ai",
+   * "chatgpt", "api_key", "bedrock"). Provider-specific free-form string.
+   * Distinct from AuthMethod, which is the normalized billing-mode
+   * category.
+   */
+  authMethod?: string;
 }
 
 /** Full auth report for a provider. */
 export interface AuthReport {
   providerType: string;
+  /** Whether the CLI binary is installed and what we know about it. */
+  binary: BinaryStatus;
+  /**
+   * Every auth path this provider supports, with current presence state.
+   * Empty when the binary is missing (there's nothing to report against).
+   */
   options: AuthOption[];
+  /** Rich identity info from the CLI's status output, when available. */
+  identity?: AuthIdentity;
+  /**
+   * Where the presence data came from:
+   * - "cli": parsed from a live `<cli> auth status` call (definitive)
+   * - "filesystem": best-effort heuristic from env vars and files
+   *   (used when the binary is missing or its status subcommand failed)
+   */
+  source: "cli" | "filesystem";
 }
 
-/** Optional context for auth resolution (override env vars for testing). */
+/** Optional context for auth resolution. */
 export interface AuthResolveContext {
+  /** Additional env vars layered on top of process.env. */
   env?: Record<string, string>;
+  /** Override the CLI binary path (passed through to findBinary). */
+  command?: string;
+  /** Bypass the 60s result cache and refresh from source. */
+  fresh?: boolean;
 }
 
 // Models

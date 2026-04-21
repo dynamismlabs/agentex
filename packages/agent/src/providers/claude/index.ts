@@ -2,7 +2,6 @@ import type { ProviderModule, ProviderModel, SessionContext, AgentSession, Quota
 import { detectAuth, resolveAuthForProvider } from "../../utils/auth.js";
 import { executeClaudeProvider } from "./execute.js";
 import { createClaudeSession } from "./session.js";
-import { testClaudeEnvironment } from "./test.js";
 import { claudeSessionCodec } from "./codec.js";
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
@@ -76,7 +75,6 @@ export const claudeProvider: ProviderModule = {
   },
   execute: executeClaudeProvider,
   createSession: (ctx: SessionContext): Promise<AgentSession> => createClaudeSession(ctx),
-  testEnvironment: testClaudeEnvironment,
   resolveAuth: (ctx) => resolveAuthForProvider("claude", ctx),
   sessionCodec: claudeSessionCodec,
   listModels,

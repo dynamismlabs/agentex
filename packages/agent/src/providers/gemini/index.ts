@@ -1,6 +1,5 @@
 import type { ProviderModule, ProviderModel } from "../../types.js";
 import { executeGeminiProvider } from "./execute.js";
-import { testGeminiEnvironment } from "./test.js";
 import { geminiSessionCodec } from "./codec.js";
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
@@ -62,7 +61,6 @@ export const geminiProvider: ProviderModule = {
     workspace: true,
   },
   execute: executeGeminiProvider,
-  testEnvironment: testGeminiEnvironment,
   resolveAuth: (ctx) => resolveAuthForProvider("gemini", ctx),
   sessionCodec: geminiSessionCodec,
   listModels,

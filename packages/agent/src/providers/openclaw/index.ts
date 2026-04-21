@@ -1,6 +1,5 @@
 import type { ProviderModule } from "../../types.js";
 import { executeOpenclawProvider } from "./execute.js";
-import { testOpenclawEnvironment } from "./test.js";
 import { openclawSessionCodec } from "./codec.js";
 
 export const openclawProvider: ProviderModule = {
@@ -15,7 +14,11 @@ export const openclawProvider: ProviderModule = {
     workspace: false,
   },
   execute: executeOpenclawProvider,
-  testEnvironment: testOpenclawEnvironment,
-  resolveAuth: async () => ({ providerType: "openclaw", options: [] }),
+  resolveAuth: async () => ({
+    providerType: "openclaw",
+    binary: { installed: true }, // openclaw is a gateway URL, not a local binary
+    options: [],
+    source: "filesystem",
+  }),
   sessionCodec: openclawSessionCodec,
 };

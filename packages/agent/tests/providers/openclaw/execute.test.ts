@@ -2,7 +2,6 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import * as http from "node:http";
 import { executeOpenclawProvider } from "../../../src/providers/openclaw/execute.js";
 import { openclawSessionCodec } from "../../../src/providers/openclaw/codec.js";
-import { testOpenclawEnvironment } from "../../../src/providers/openclaw/test.js";
 import type { ExecutionContext } from "../../../src/types.js";
 
 let server: http.Server;
@@ -106,28 +105,6 @@ describe("executeOpenclawProvider", () => {
 
     expect(result.exitCode).toBeNull();
     expect(result.errorMessage).toBeTruthy();
-  });
-});
-
-describe("testOpenclawEnvironment", () => {
-  it("returns pass when gateway is reachable", async () => {
-    const result = await testOpenclawEnvironment({
-      providerType: "openclaw",
-      config: { command: `http://localhost:${port}` },
-    });
-
-    expect(result.status).toBe("pass");
-    expect(result.checks[0]?.code).toBe("openclaw_gateway_reachable");
-  });
-
-  it("returns fail when gateway is unreachable", async () => {
-    const result = await testOpenclawEnvironment({
-      providerType: "openclaw",
-      config: { command: "http://localhost:19999" },
-    });
-
-    expect(result.status).toBe("fail");
-    expect(result.checks[0]?.code).toBe("openclaw_gateway_unreachable");
   });
 });
 

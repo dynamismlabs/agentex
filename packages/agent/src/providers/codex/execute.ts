@@ -1,3 +1,5 @@
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { ExecutionContext, ExecutionResult } from "../../types.js";
 import { findBinary } from "../../utils/binary.js";
@@ -80,9 +82,22 @@ export async function executeCodexProvider(ctx: ExecutionContext): Promise<Execu
     }
   }
 
-  // Detect auth/billing
+  // Detect auth/billing. Codex prefers its stored subscription (`codex login`)
+  // over OPENAI_API_KEY when both exist, so env-only detection would wrongly
+  // predict "api" whenever OPENAI_API_KEY is set. Check the auth.json stat:
+  // if the subscription file is present, billing is "subscription" regardless.
   ctx.onLifecycle?.({ phase: "preparing", step: "auth" });
-  const billingType = detectAuth("codex", env).billingType;
+  const codexAuthPath = path.join(
+    process.env["CODEX_HOME"] || path.join(os.homedir(), ".codex"),
+    "auth.json",
+  );
+  const hasCodexSubscription = await fs.stat(codexAuthPath).then(
+    (s) => s.isFile(),
+    () => false,
+  );
+  const billingType = hasCodexSubscription
+    ? "subscription"
+    : detectAuth("codex", env).billingType;
 
   // 4. Determine session resume
   const sessionParams = ctx.sessionParams ?? null;

@@ -1,6 +1,5 @@
 import type { ProviderModule, ProviderModel } from "../../types.js";
 import { executeOpenCodeProvider } from "./execute.js";
-import { testOpenCodeEnvironment } from "./test.js";
 import { opencodeSessionCodec } from "./codec.js";
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
@@ -62,7 +61,6 @@ export const opencodeProvider: ProviderModule = {
     workspace: true,
   },
   execute: executeOpenCodeProvider,
-  testEnvironment: testOpenCodeEnvironment,
   resolveAuth: (ctx) => resolveAuthForProvider("opencode", ctx),
   sessionCodec: opencodeSessionCodec,
   listModels,

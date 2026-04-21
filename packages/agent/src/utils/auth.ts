@@ -2,21 +2,26 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
 import type {
+  AuthIdentity,
   AuthOption,
   AuthReport,
   AuthResolveContext,
+  BinaryStatus,
   ProviderModule,
 } from "../types.js";
-import { buildEnv } from "./env.js";
+import { buildEnv, ensurePathInEnv } from "./env.js";
+import { findBinary } from "./binary.js";
+import { runChildProcess } from "./process.js";
+
+// ---------------------------------------------------------------------------
+// Legacy env-only billing classifier — kept for ExecutionResult.billingType
+// prediction. Do not use for new code; prefer resolveAuthForProvider.
+// ---------------------------------------------------------------------------
 
 export interface ResolvedAuth {
-  /** How the user is authenticated */
   method: "api_key" | "bedrock" | "oauth" | "subscription";
-  /** How usage is billed */
   billingType: "api" | "metered_api" | "subscription";
-  /** If the auth method requires model ID transformation (e.g., Bedrock), this resolves it */
   resolveModelId?(requestedModel: string): string;
-  /** Cloud region, if applicable (Bedrock) */
   region?: string;
 }
 
@@ -34,10 +39,6 @@ async function fileExists(p: string): Promise<boolean> {
   }
 }
 
-/**
- * Returns the env-scoped home directory for a provider, honoring the provider's
- * config-dir override env var (e.g. CODEX_HOME, CLAUDE_CONFIG_DIR).
- */
 function providerHome(envVar: string, defaultDir: string): string {
   const override = process.env[envVar];
   if (typeof override === "string" && override.trim().length > 0) {
@@ -46,10 +47,6 @@ function providerHome(envVar: string, defaultDir: string): string {
   return path.join(os.homedir(), defaultDir);
 }
 
-/**
- * Map standard Claude model names to Bedrock-qualified IDs.
- * Unknown models pass through unchanged.
- */
 function bedrockModelId(model: string, region?: string): string {
   const prefix = region ?? "us";
   const mapping: Record<string, string> = {
@@ -62,13 +59,9 @@ function bedrockModelId(model: string, region?: string): string {
   return mapping[model] ?? model;
 }
 
-/**
- * Detect authentication method for a given provider based on environment variables.
- */
 export function detectAuth(providerType: string, env: Record<string, string>): ResolvedAuth {
   switch (providerType) {
     case "claude": {
-      // Check for Bedrock
       if (hasEnv(env, "ANTHROPIC_BEDROCK_BASE_URL") || (hasEnv(env, "AWS_ACCESS_KEY_ID") && hasEnv(env, "AWS_REGION"))) {
         const region = env["AWS_REGION"]?.trim();
         return {
@@ -78,180 +71,435 @@ export function detectAuth(providerType: string, env: Record<string, string>): R
           resolveModelId: (model: string) => bedrockModelId(model, region),
         };
       }
-      // Check for API key
       if (hasEnv(env, "ANTHROPIC_API_KEY")) {
         return { method: "api_key", billingType: "api" };
       }
-      // Subscription fallback
       return { method: "subscription", billingType: "subscription" };
     }
-
     case "codex": {
       if (hasEnv(env, "OPENAI_API_KEY")) {
         return { method: "api_key", billingType: "api" };
       }
       return { method: "subscription", billingType: "subscription" };
     }
-
     case "gemini": {
       if (hasEnv(env, "GEMINI_API_KEY") || hasEnv(env, "GOOGLE_API_KEY")) {
         return { method: "api_key", billingType: "api" };
       }
       return { method: "subscription", billingType: "subscription" };
     }
-
     case "cursor": {
       if (hasEnv(env, "CURSOR_API_KEY") || hasEnv(env, "OPENAI_API_KEY")) {
         return { method: "api_key", billingType: "api" };
       }
       return { method: "subscription", billingType: "subscription" };
     }
-
-    case "opencode": {
-      // OpenCode is typically API-based
+    case "opencode":
+    case "pi":
       return { method: "api_key", billingType: "api" };
-    }
-
-    case "pi": {
-      // Pi is typically API-based
-      return { method: "api_key", billingType: "api" };
-    }
-
     default:
       return { method: "subscription", billingType: "subscription" };
   }
 }
 
 // ---------------------------------------------------------------------------
-// resolveAuth — structured, side-effect-free (aside from file stats) report
-// of every auth path a provider supports, and which are currently present.
+// Binary status probe — spawns `<cli> --version` to populate BinaryStatus.
 // ---------------------------------------------------------------------------
 
-function envOption(
+async function checkBinary(
+  name: string,
+  configOverride: string | undefined,
   env: Record<string, string>,
-  method: AuthOption["method"],
-  varName: string,
-): AuthOption {
+): Promise<BinaryStatus & { prefixArgs: string[] }> {
+  let resolved;
+  try {
+    resolved = await findBinary(name, configOverride);
+  } catch (err) {
+    return {
+      installed: false,
+      prefixArgs: [],
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+
+  let version: string | undefined;
+  try {
+    ensurePathInEnv(env);
+    const proc = await runChildProcess({
+      runId: "check-binary",
+      command: resolved.bin,
+      args: [...resolved.prefixArgs, "--version"],
+      cwd: process.cwd(),
+      env,
+      timeoutSec: 5,
+    });
+    if (proc.exitCode === 0) {
+      const out = (proc.stdout || proc.stderr).trim();
+      const match = out.match(/\b\d+\.\d+(?:\.\d+)?(?:[-+][\w.-]+)?\b/);
+      version = match ? match[0] : (out.split(/\s+/)[0] || undefined);
+    }
+  } catch {
+    // Version detection is best-effort; binary is still "installed" if findBinary succeeded.
+  }
+
   return {
-    method,
-    source: { kind: "env", var: varName },
-    present: hasEnv(env, varName),
+    installed: true,
+    resolvedPath: resolved.bin,
+    prefixArgs: resolved.prefixArgs,
+    version,
   };
 }
 
-async function resolveCodexAuth(ctx?: AuthResolveContext): Promise<AuthReport> {
-  const env = buildEnv(ctx?.env);
-  const options: AuthOption[] = [];
+// ---------------------------------------------------------------------------
+// Claude — `claude auth status --json`
+// ---------------------------------------------------------------------------
 
-  options.push(envOption(env, "api_key", "OPENAI_API_KEY"));
+interface ClaudeAuthStatusJson {
+  loggedIn?: boolean;
+  authMethod?: string;        // e.g. "claude.ai", "api_key", "bedrock"
+  apiProvider?: string;       // e.g. "firstParty", "bedrock", "vertex", "foundry"
+  email?: string;
+  orgId?: string;
+  orgName?: string;
+  subscriptionType?: string;  // e.g. "max", "pro", "team", "enterprise"
+}
 
-  const authPath = path.join(providerHome("CODEX_HOME", ".codex"), "auth.json");
-  options.push({
-    method: "subscription",
-    source: { kind: "file", path: authPath },
-    present: await fileExists(authPath),
-  });
-
-  return { providerType: "codex", options };
+function classifyClaudeAuthMethod(raw: string | undefined): "subscription" | "api_key" | "bedrock" | null {
+  if (!raw) return null;
+  const m = raw.toLowerCase();
+  if (m.includes("bedrock") || m.includes("vertex") || m.includes("foundry")) return "bedrock";
+  if (m.includes("claude.ai") || m.includes("oauth") || m.includes("subscription")) return "subscription";
+  if (m.includes("api") || m.includes("console")) return "api_key";
+  return null;
 }
 
 async function resolveClaudeAuth(ctx?: AuthResolveContext): Promise<AuthReport> {
   const env = buildEnv(ctx?.env);
-  const options: AuthOption[] = [];
+  const binary = await checkBinary("claude", ctx?.command, env);
 
-  options.push(envOption(env, "api_key", "ANTHROPIC_API_KEY"));
-
-  const bedrockUrl = hasEnv(env, "ANTHROPIC_BEDROCK_BASE_URL");
-  const awsCreds = hasEnv(env, "AWS_ACCESS_KEY_ID") && hasEnv(env, "AWS_REGION");
-  options.push({
+  const apiKeyOption: AuthOption = {
+    method: "api_key",
+    source: { kind: "env", var: "ANTHROPIC_API_KEY" },
+    present: hasEnv(env, "ANTHROPIC_API_KEY"),
+  };
+  const bedrockPresent =
+    hasEnv(env, "ANTHROPIC_BEDROCK_BASE_URL") ||
+    (hasEnv(env, "AWS_ACCESS_KEY_ID") && hasEnv(env, "AWS_REGION"));
+  const bedrockOption: AuthOption = {
     method: "bedrock",
     source: {
       kind: "env_combo",
       vars: ["ANTHROPIC_BEDROCK_BASE_URL", "AWS_ACCESS_KEY_ID", "AWS_REGION"],
     },
-    present: bedrockUrl || awsCreds,
-  });
+    present: bedrockPresent,
+  };
 
-  if (process.platform === "darwin") {
-    // macOS stores Claude Code subscription creds in the system Keychain.
-    // Reading it triggers a user prompt, so we can't confirm silently.
-    options.push({
-      method: "subscription",
-      source: { kind: "keychain", service: "Claude Code" },
-      present: "unknown",
-    });
-  } else {
-    const credPath = path.join(providerHome("CLAUDE_CONFIG_DIR", ".claude"), ".credentials.json");
-    options.push({
-      method: "subscription",
-      source: { kind: "file", path: credPath },
-      present: await fileExists(credPath),
-    });
+  // Binary missing → fall back to filesystem/keychain heuristic.
+  if (!binary.installed) {
+    const subOption: AuthOption = process.platform === "darwin"
+      ? {
+          method: "subscription",
+          source: { kind: "keychain", service: "Claude Code" },
+          present: false, // can't verify without binary
+        }
+      : await (async () => {
+          const credPath = path.join(
+            providerHome("CLAUDE_CONFIG_DIR", ".claude"),
+            ".credentials.json",
+          );
+          return {
+            method: "subscription" as const,
+            source: { kind: "file" as const, path: credPath },
+            present: await fileExists(credPath),
+          };
+        })();
+    return {
+      providerType: "claude",
+      binary: stripPrefixArgs(binary),
+      options: [apiKeyOption, bedrockOption, subOption],
+      source: "filesystem",
+    };
   }
 
-  return { providerType: "claude", options };
+  // Binary present — try `claude auth status --json`.
+  try {
+    ensurePathInEnv(env);
+    const proc = await runChildProcess({
+      runId: "claude-auth-status",
+      command: binary.resolvedPath!,
+      args: [...binary.prefixArgs, "auth", "status", "--json"],
+      cwd: process.cwd(),
+      env,
+      timeoutSec: 10,
+    });
+
+    if (proc.exitCode === 0 && proc.stdout.trim()) {
+      const data: ClaudeAuthStatusJson = JSON.parse(proc.stdout);
+      const active = classifyClaudeAuthMethod(data.authMethod);
+      const loggedIn = data.loggedIn === true;
+
+      const subPresent = loggedIn && (active === "subscription" || active === null);
+      const subOption: AuthOption = {
+        method: "subscription",
+        source: { kind: "cli", command: "claude auth status --json" },
+        present: subPresent,
+      };
+
+      // Identity
+      const identity: AuthIdentity = {};
+      if (data.email) identity.email = data.email;
+      if (data.orgName) identity.orgName = data.orgName;
+      if (data.subscriptionType) identity.subscriptionType = data.subscriptionType;
+      if (data.authMethod) identity.authMethod = data.authMethod;
+
+      return {
+        providerType: "claude",
+        binary: stripPrefixArgs(binary),
+        options: [apiKeyOption, bedrockOption, subOption],
+        identity: Object.keys(identity).length > 0 ? identity : undefined,
+        source: "cli",
+      };
+    }
+  } catch {
+    // fall through to filesystem
+  }
+
+  // CLI call failed (old version, parse error, etc). Fall back to filesystem.
+  const subOption: AuthOption = process.platform === "darwin"
+    ? {
+        method: "subscription",
+        source: { kind: "keychain", service: "Claude Code" },
+        present: false,
+      }
+    : await (async () => {
+        const credPath = path.join(
+          providerHome("CLAUDE_CONFIG_DIR", ".claude"),
+          ".credentials.json",
+        );
+        return {
+          method: "subscription" as const,
+          source: { kind: "file" as const, path: credPath },
+          present: await fileExists(credPath),
+        };
+      })();
+
+  return {
+    providerType: "claude",
+    binary: stripPrefixArgs(binary),
+    options: [apiKeyOption, bedrockOption, subOption],
+    source: "filesystem",
+  };
 }
+
+// ---------------------------------------------------------------------------
+// Codex — `codex login status`. Text-only output; regex with multiple
+// tolerant patterns + filesystem fallback for forward-compat.
+// ---------------------------------------------------------------------------
+
+const CODEX_SUBSCRIPTION_PATTERNS: RegExp[] = [
+  /logged\s+in\s+using\s+chatgpt/i,
+  /logged\s+in\s+with\s+chatgpt/i,
+  /authenticated\s+via\s+chatgpt/i,
+  /signed\s+in.*chatgpt/i,
+  /using\s+subscription/i,
+];
+const CODEX_API_KEY_PATTERNS: RegExp[] = [
+  /logged\s+in\s+using\s+(an?\s+)?api[-_ ]?key/i,
+  /logged\s+in\s+with\s+(an?\s+)?api[-_ ]?key/i,
+  /authenticated\s+via\s+api[-_ ]?key/i,
+  /signed\s+in.*api[-_ ]?key/i,
+];
+const CODEX_NOT_LOGGED_IN_PATTERNS: RegExp[] = [
+  /not\s+logged\s+in/i,
+  /not\s+authenticated/i,
+  /please\s+(run\s+)?`?codex\s+login`?/i,
+  /no\s+authentication/i,
+];
+
+async function resolveCodexAuth(ctx?: AuthResolveContext): Promise<AuthReport> {
+  const env = buildEnv(ctx?.env);
+  const binary = await checkBinary("codex", ctx?.command, env);
+
+  const apiKeyOption: AuthOption = {
+    method: "api_key",
+    source: { kind: "env", var: "OPENAI_API_KEY" },
+    present: hasEnv(env, "OPENAI_API_KEY"),
+  };
+  const authPath = path.join(providerHome("CODEX_HOME", ".codex"), "auth.json");
+
+  if (!binary.installed) {
+    const subPresent = await fileExists(authPath);
+    return {
+      providerType: "codex",
+      binary: stripPrefixArgs(binary),
+      options: [
+        apiKeyOption,
+        {
+          method: "subscription",
+          source: { kind: "file", path: authPath },
+          present: subPresent,
+        },
+      ],
+      source: "filesystem",
+    };
+  }
+
+  let subscriptionPresent = false;
+  let activeAuthMethod: string | undefined;
+  let usedCli = false;
+
+  try {
+    ensurePathInEnv(env);
+    const proc = await runChildProcess({
+      runId: "codex-login-status",
+      command: binary.resolvedPath!,
+      args: [...binary.prefixArgs, "login", "status"],
+      cwd: process.cwd(),
+      env,
+      timeoutSec: 10,
+    });
+
+    const out = `${proc.stdout}\n${proc.stderr}`.trim();
+
+    if (CODEX_SUBSCRIPTION_PATTERNS.some((r) => r.test(out))) {
+      subscriptionPresent = true;
+      activeAuthMethod = "chatgpt";
+      usedCli = true;
+    } else if (CODEX_API_KEY_PATTERNS.some((r) => r.test(out))) {
+      // API key is the active auth; subscription status unknown from this output alone.
+      // Trust the filesystem to know if a subscription is ALSO stored.
+      subscriptionPresent = await fileExists(authPath);
+      activeAuthMethod = "api_key";
+      usedCli = true;
+    } else if (CODEX_NOT_LOGGED_IN_PATTERNS.some((r) => r.test(out))) {
+      subscriptionPresent = false;
+      usedCli = true;
+    } else {
+      // Unknown wording (forward-compat) — fall back to filesystem.
+      subscriptionPresent = await fileExists(authPath);
+    }
+  } catch {
+    subscriptionPresent = await fileExists(authPath);
+  }
+
+  return {
+    providerType: "codex",
+    binary: stripPrefixArgs(binary),
+    options: [
+      apiKeyOption,
+      {
+        method: "subscription",
+        source: usedCli
+          ? { kind: "cli", command: "codex login status" }
+          : { kind: "file", path: authPath },
+        present: subscriptionPresent,
+      },
+    ],
+    identity: activeAuthMethod ? { authMethod: activeAuthMethod } : undefined,
+    source: usedCli ? "cli" : "filesystem",
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Gemini — filesystem-only (no `gemini auth status` subcommand exists).
+// Still runs `gemini --version` to populate BinaryStatus.
+// ---------------------------------------------------------------------------
 
 async function resolveGeminiAuth(ctx?: AuthResolveContext): Promise<AuthReport> {
   const env = buildEnv(ctx?.env);
-  const options: AuthOption[] = [];
-
-  options.push(envOption(env, "api_key", "GEMINI_API_KEY"));
-  options.push(envOption(env, "api_key", "GOOGLE_API_KEY"));
+  const binary = await checkBinary("gemini", ctx?.command, env);
 
   const credPath = path.join(providerHome("GEMINI_CONFIG_DIR", ".gemini"), "oauth_creds.json");
-  options.push({
-    method: "subscription",
-    source: { kind: "file", path: credPath },
-    present: await fileExists(credPath),
-  });
-
-  return { providerType: "gemini", options };
+  return {
+    providerType: "gemini",
+    binary: stripPrefixArgs(binary),
+    options: [
+      {
+        method: "api_key",
+        source: { kind: "env", var: "GEMINI_API_KEY" },
+        present: hasEnv(env, "GEMINI_API_KEY"),
+      },
+      {
+        method: "api_key",
+        source: { kind: "env", var: "GOOGLE_API_KEY" },
+        present: hasEnv(env, "GOOGLE_API_KEY"),
+      },
+      {
+        method: "subscription",
+        source: { kind: "file", path: credPath },
+        present: await fileExists(credPath),
+      },
+    ],
+    source: "filesystem",
+  };
 }
+
+// ---------------------------------------------------------------------------
+// Cursor / OpenCode / Pi / OpenClaw / Process — no CLI auth commands;
+// straightforward env-only reports with binary status when applicable.
+// ---------------------------------------------------------------------------
 
 async function resolveCursorAuth(ctx?: AuthResolveContext): Promise<AuthReport> {
   const env = buildEnv(ctx?.env);
+  const binary = await checkBinary("agent", ctx?.command, env);
   return {
     providerType: "cursor",
+    binary: stripPrefixArgs(binary),
     options: [
-      envOption(env, "api_key", "CURSOR_API_KEY"),
-      envOption(env, "api_key", "OPENAI_API_KEY"),
+      { method: "api_key", source: { kind: "env", var: "CURSOR_API_KEY" }, present: hasEnv(env, "CURSOR_API_KEY") },
+      { method: "api_key", source: { kind: "env", var: "OPENAI_API_KEY" }, present: hasEnv(env, "OPENAI_API_KEY") },
     ],
+    source: "filesystem",
   };
 }
 
 async function resolveOpencodeAuth(ctx?: AuthResolveContext): Promise<AuthReport> {
   const env = buildEnv(ctx?.env);
+  const binary = await checkBinary("opencode", ctx?.command, env);
   return {
     providerType: "opencode",
+    binary: stripPrefixArgs(binary),
     options: [
-      envOption(env, "api_key", "OPENAI_API_KEY"),
-      envOption(env, "api_key", "ANTHROPIC_API_KEY"),
+      { method: "api_key", source: { kind: "env", var: "OPENAI_API_KEY" }, present: hasEnv(env, "OPENAI_API_KEY") },
+      { method: "api_key", source: { kind: "env", var: "ANTHROPIC_API_KEY" }, present: hasEnv(env, "ANTHROPIC_API_KEY") },
     ],
+    source: "filesystem",
   };
 }
 
 async function resolvePiAuth(ctx?: AuthResolveContext): Promise<AuthReport> {
   const env = buildEnv(ctx?.env);
+  const binary = await checkBinary("pi", ctx?.command, env);
   return {
     providerType: "pi",
+    binary: stripPrefixArgs(binary),
     options: [
-      envOption(env, "api_key", "OPENAI_API_KEY"),
-      envOption(env, "api_key", "ANTHROPIC_API_KEY"),
+      { method: "api_key", source: { kind: "env", var: "OPENAI_API_KEY" }, present: hasEnv(env, "OPENAI_API_KEY") },
+      { method: "api_key", source: { kind: "env", var: "ANTHROPIC_API_KEY" }, present: hasEnv(env, "ANTHROPIC_API_KEY") },
     ],
+    source: "filesystem",
   };
 }
 
-/**
- * Resolve the auth report for a provider by type. Providers call the matching
- * function from their own `resolveAuth` method; callers can use the helpers
- * below (`hasSubscription`, `hasApiKey`, `hasBedrock`) instead of this
- * directly.
- */
-export async function resolveAuthForProvider(
-  providerType: string,
-  ctx?: AuthResolveContext,
-): Promise<AuthReport> {
+function stripPrefixArgs(b: BinaryStatus & { prefixArgs: string[] }): BinaryStatus {
+  const { prefixArgs: _prefixArgs, ...rest } = b;
+  return rest;
+}
+
+// ---------------------------------------------------------------------------
+// Dispatcher + 60s cache
+// ---------------------------------------------------------------------------
+
+const CACHE_TTL_MS = 60_000;
+const cache = new Map<string, { report: AuthReport; ts: number }>();
+
+function cacheKey(providerType: string, ctx?: AuthResolveContext): string {
+  const envKey = ctx?.env ? JSON.stringify(ctx.env) : "";
+  const cmdKey = ctx?.command ?? "";
+  return `${providerType}|${envKey}|${cmdKey}`;
+}
+
+async function resolveInternal(providerType: string, ctx?: AuthResolveContext): Promise<AuthReport> {
   switch (providerType) {
     case "codex":
       return resolveCodexAuth(ctx);
@@ -266,21 +514,53 @@ export async function resolveAuthForProvider(
     case "pi":
       return resolvePiAuth(ctx);
     default:
-      return { providerType, options: [] };
+      return {
+        providerType,
+        binary: { installed: false, error: `No auth resolver for provider "${providerType}"` },
+        options: [],
+        source: "filesystem",
+      };
   }
+}
+
+/**
+ * Resolve the auth report for a provider by type. Cached for 60s per
+ * (providerType, env, command). Pass `{ fresh: true }` to bypass the cache.
+ */
+export async function resolveAuthForProvider(
+  providerType: string,
+  ctx?: AuthResolveContext,
+): Promise<AuthReport> {
+  if (!ctx?.fresh) {
+    const key = cacheKey(providerType, ctx);
+    const hit = cache.get(key);
+    if (hit && Date.now() - hit.ts < CACHE_TTL_MS) {
+      return hit.report;
+    }
+  }
+
+  const report = await resolveInternal(providerType, ctx);
+
+  const key = cacheKey(providerType, ctx);
+  cache.set(key, { report, ts: Date.now() });
+  return report;
+}
+
+/** Clear the resolveAuth cache. Primarily for tests and explicit refresh. */
+export function clearAuthCache(): void {
+  cache.clear();
 }
 
 // ---------------------------------------------------------------------------
 // Sugar: method-specific presence checks. Each commits the caller to a
-// billing mode, making the choice visible at the call site. "unknown"
-// presence (e.g. macOS keychain) is NOT treated as present — safe default.
+// billing mode, making the choice visible at the call site.
 // ---------------------------------------------------------------------------
 
 function anyPresent(report: AuthReport, method: AuthOption["method"]): boolean {
   return report.options.some((o) => o.method === method && o.present === true);
 }
 
-/** True only if a subscription credential is confirmed present on disk. */
+/** True only if a subscription credential is confirmed present. */
 export async function hasSubscription(
   provider: ProviderModule,
   ctx?: AuthResolveContext,

@@ -7,7 +7,7 @@ describe("registry", () => {
     const provider = getProvider("claude");
     expect(provider.type).toBe("claude");
     expect(typeof provider.execute).toBe("function");
-    expect(typeof provider.testEnvironment).toBe("function");
+    expect(typeof provider.resolveAuth).toBe("function");
   });
 
   it("getProvider returns codex provider", () => {

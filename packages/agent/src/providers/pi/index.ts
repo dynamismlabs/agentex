@@ -1,6 +1,5 @@
 import type { ProviderModule, ProviderModel } from "../../types.js";
 import { executePiProvider } from "./execute.js";
-import { testPiEnvironment } from "./test.js";
 import { piSessionCodec } from "./codec.js";
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
@@ -64,7 +63,6 @@ export const piProvider: ProviderModule = {
     workspace: true,
   },
   execute: executePiProvider,
-  testEnvironment: testPiEnvironment,
   resolveAuth: (ctx) => resolveAuthForProvider("pi", ctx),
   sessionCodec: piSessionCodec,
   listModels,

@@ -165,65 +165,100 @@ await session.close();
 
 ## Auth
 
-`@agentex/agent` models three billing modes explicitly — API key, Bedrock, and subscription — and refuses to collapse them into a single "is it ready?" boolean. Callers must name the mode they want so billing choices stay visible at the call site.
+`provider.resolveAuth()` is the single entry point for "is this provider usable?" It returns binary status, every supported auth path with a definitive `present: boolean`, and (when the CLI exposes it) rich identity info like email and subscription tier.
+
+Under the hood it prefers the provider's own status subcommand — `claude auth status --json`, `codex login status` — falling back to filesystem heuristics if the binary is missing or too old.
 
 ```typescript
-import { getProvider, hasSubscription, hasApiKey, hasBedrock } from "@agentex/agent";
+import { getProvider, hasSubscription, hasApiKey } from "@agentex/agent";
 
-const codex = getProvider("codex");
+const claude = getProvider("claude");
+const auth = await claude.resolveAuth();
 
-await hasSubscription(codex);  // true — Codex authenticated via `codex login`
-await hasApiKey(codex);        // true — OPENAI_API_KEY is set (metered billing)
+// {
+//   providerType: "claude",
+//   binary: { installed: true, resolvedPath: "/Users/you/.local/bin/claude", version: "2.1.116" },
+//   options: [
+//     { method: "api_key",      source: { kind: "env", var: "ANTHROPIC_API_KEY" }, present: false },
+//     { method: "bedrock",      source: { kind: "env_combo", vars: [...] },        present: false },
+//     { method: "subscription", source: { kind: "cli", command: "claude auth status --json" }, present: true },
+//   ],
+//   identity: { email: "you@example.com", orgName: "Acme", subscriptionType: "max", authMethod: "claude.ai" },
+//   source: "cli",
+// }
 ```
 
-### Common cases
+### Sugar helpers (commit to a billing mode explicitly)
+
+There is deliberately no blanket `canRun()` / `isReady()` helper — conflating subscription and API-key auth is a billing footgun (e.g. Claude with `ANTHROPIC_API_KEY` set silently bills metered API even if the user's also subscribed). Callers name the mode they want:
 
 ```typescript
-// 1. Just a Codex subscription (ChatGPT login, no metered billing)
-const codex = getProvider("codex");
-if (await hasSubscription(codex) && !(await hasApiKey(codex))) {
-  /* safe to run — no API charges */
+await hasSubscription(claude);  // true only if a subscription credential is confirmed present
+await hasApiKey(claude);        // true only if an API env var is set
+await hasBedrock(claude);       // true only if Bedrock credentials are configured
+```
+
+For "any auth works," write it out explicitly at the call site:
+
+```typescript
+const anyReady = (await claude.resolveAuth()).options.some((o) => o.present);
+```
+
+### Welcome-flow pattern
+
+```typescript
+const auth = await claude.resolveAuth();
+
+if (!auth.binary.installed) {
+  return showInstallInstructions(auth.binary.error);
 }
 
-// 2. Just a Claude Code subscription
-const claude = getProvider("claude");
-if (await hasSubscription(claude) && !(await hasApiKey(claude))) {
-  /* subscription-only */
-}
+const sub = await hasSubscription(claude);
+const key = await hasApiKey(claude);
 
-// 3. API keys across providers
-for (const p of [claude, codex, getProvider("gemini")]) {
-  if (await hasApiKey(p)) console.log(`${p.type} has API-key auth available`);
-}
+if (sub && !key)  return showReady("subscription", auth.identity);
+if (key && !sub)  return showReady("api_key");
+if (sub && key)   return showReady("api_key", { warning: "api_key_wins" });
+return showLoginInstructions();
+```
 
-// 4. Full report when you need conflict detection, bedrock, or source paths
-const report = await claude.resolveAuth();
-// report.options = [
-//   { method: "api_key", source: { kind: "env", var: "ANTHROPIC_API_KEY" }, present: false },
-//   { method: "bedrock", source: { kind: "env_combo", vars: ["ANTHROPIC_BEDROCK_BASE_URL", "AWS_ACCESS_KEY_ID", "AWS_REGION"] }, present: false },
-//   { method: "subscription", source: { kind: "keychain", service: "Claude Code" }, present: "unknown" },
-// ]
+For end-to-end verification (is auth actually good enough to complete a round-trip?), just call `execute()` with a trivial prompt — no separate probe method:
+
+```typescript
+await claude.execute({ prompt: "Respond with 'hello'.", config: { timeoutSec: 15 } });
 ```
 
 ### What each provider reports
 
-| Provider  | API key source(s)                          | Other                                                                          | Subscription source                                                             |
-| --------- | ------------------------------------------ | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------- |
-| `codex`   | `OPENAI_API_KEY`                           | —                                                                              | `$CODEX_HOME/auth.json` (default `~/.codex/auth.json`)                          |
-| `claude`  | `ANTHROPIC_API_KEY`                        | Bedrock via `ANTHROPIC_BEDROCK_BASE_URL` or `AWS_ACCESS_KEY_ID`+`AWS_REGION`   | macOS: Keychain `Claude Code` · Linux/Win: `$CLAUDE_CONFIG_DIR/.credentials.json` |
-| `gemini`  | `GEMINI_API_KEY`, `GOOGLE_API_KEY`         | —                                                                              | `$GEMINI_CONFIG_DIR/oauth_creds.json` (default `~/.gemini/oauth_creds.json`)    |
-| `cursor`  | `CURSOR_API_KEY`, `OPENAI_API_KEY`         | —                                                                              | Detected at runtime                                                             |
-| `opencode`| `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`      | —                                                                              | —                                                                               |
-| `pi`      | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`      | —                                                                              | —                                                                               |
+| Provider  | Subscription source                                             | API key source(s)                          | Other                                                                        |
+| --------- | --------------------------------------------------------------- | ------------------------------------------ | ---------------------------------------------------------------------------- |
+| `claude`  | `claude auth status --json` · fallback: keychain/creds file     | `ANTHROPIC_API_KEY`                        | Bedrock via `ANTHROPIC_BEDROCK_BASE_URL` or `AWS_ACCESS_KEY_ID`+`AWS_REGION` |
+| `codex`   | `codex login status` · fallback: `$CODEX_HOME/auth.json`        | `OPENAI_API_KEY`                           | —                                                                            |
+| `gemini`  | `$GEMINI_CONFIG_DIR/oauth_creds.json`                           | `GEMINI_API_KEY`, `GOOGLE_API_KEY`         | —                                                                            |
+| `cursor`  | (detected at runtime by the CLI)                                | `CURSOR_API_KEY`, `OPENAI_API_KEY`         | —                                                                            |
+| `opencode`| —                                                               | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`      | —                                                                            |
+| `pi`      | —                                                               | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`      | —                                                                            |
 
-### Safety notes
+### Precedence (what actually gets used when both are present)
 
-- Each sugar helper returns `true` only when a source is **confirmed** present. `"unknown"` presence (macOS Keychain — can't be checked without triggering an OS prompt) is treated as not-present.
-- There is deliberately no blanket `canRun()` helper. If you want "any auth works," write it explicitly:
-  ```typescript
-  const anyReady = (await codex.resolveAuth()).options.some((o) => o.present === true);
-  ```
-- `provider.testEnvironment()` additionally surfaces conflict checks — e.g., Codex or Claude emit a `warn` when both an API key and subscription credentials are present, since the API key will win and cause metered billing.
+The library reflects real CLI behavior rather than imposing its own:
+
+| Provider  | Winner when both API key and subscription present                       |
+| --------- | ----------------------------------------------------------------------- |
+| Claude    | API key wins (documented). Set `hasApiKey` + show a billing warning.    |
+| Codex     | Subscription wins (current CLI; see openai/codex#2733, #3286).          |
+| Gemini    | API key wins in non-interactive mode.                                   |
+
+### Caching
+
+Results are cached for 60s per `(providerType, env, command)` to keep welcome-flow and badge-rendering calls effectively free. Pass `{ fresh: true }` to bypass:
+
+```typescript
+await claude.resolveAuth({ fresh: true });
+// Or globally:
+import { clearAuthCache } from "@agentex/agent";
+clearAuthCache();
+```
 
 ### Auth types
 
@@ -234,33 +269,37 @@ type AuthSource =
   | { kind: "env"; var: string }
   | { kind: "env_combo"; vars: string[] }
   | { kind: "file"; path: string }
-  | { kind: "keychain"; service: string; account?: string };
+  | { kind: "keychain"; service: string; account?: string }
+  | { kind: "cli"; command: string };
 
 interface AuthOption {
   method: AuthMethod;
   source: AuthSource;
-  present: boolean | "unknown";
+  present: boolean;
+}
+
+interface BinaryStatus {
+  installed: boolean;
+  resolvedPath?: string;
+  version?: string;
+  error?: string;
+}
+
+interface AuthIdentity {
+  email?: string;
+  orgName?: string;
+  subscriptionType?: string;   // "max", "pro", "team", "enterprise"
+  authMethod?: string;         // "claude.ai", "chatgpt", "api_key", ...
 }
 
 interface AuthReport {
   providerType: string;
+  binary: BinaryStatus;
   options: AuthOption[];
+  identity?: AuthIdentity;
+  source: "cli" | "filesystem";
 }
 ```
-
-## Environment Testing
-
-`provider.testEnvironment()` is the heavyweight probe — binary resolution, auth presence, optional hello probe. It returns the same `AuthReport` as `resolveAuth()` plus human-readable `checks` for UI.
-
-```typescript
-const result = await claude.testEnvironment({ providerType: "claude" });
-
-result.status        // "pass" | "warn" | "fail"
-result.auth          // AuthReport (same shape as provider.resolveAuth())
-result.checks        // [{ code, level: "info"|"warn"|"error", message, hint? }]
-```
-
-Use `resolveAuth()` for cheap yes/no auth checks; use `testEnvironment()` when you need end-to-end confidence (e.g., on a first-run setup screen).
 
 ## Workspaces (isolated git worktree)
 
@@ -377,17 +416,13 @@ const myProvider: ProviderModule = {
       billingType: null,
     };
   },
-  async testEnvironment(ctx) {
-    return {
-      providerType: ctx.providerType,
-      status: "pass",
-      auth: { providerType: ctx.providerType, options: [] },
-      checks: [],
-      testedAt: new Date().toISOString(),
-    };
-  },
   async resolveAuth() {
-    return { providerType: "my-agent", options: [] };
+    return {
+      providerType: "my-agent",
+      binary: { installed: true },
+      options: [],
+      source: "filesystem",
+    };
   },
 };
 
@@ -407,12 +442,15 @@ registerProvider(myProvider);
 - `executeAll(tasks, { cancelOnFailure?, signal? })` — run multiple executions concurrently.
 
 ### Auth
-- `provider.resolveAuth(ctx?)` — structured report of every auth path.
+- `provider.resolveAuth(ctx?)` — structured report: binary status, all auth paths, identity. Cached 60s; pass `{ fresh: true }` to bypass.
 - `hasSubscription(provider, ctx?)` / `hasApiKey(provider, ctx?)` / `hasBedrock(provider, ctx?)` — presence sugar.
-- `detectAuth(providerType, env)` — env-only auth classification used for billing hints.
+- `clearAuthCache()` — invalidate the resolveAuth cache globally (e.g. after a login).
+- `detectAuth(providerType, env)` — legacy env-only auth classification used internally for `ExecutionResult.billingType`.
 
-### Environment
-- `provider.testEnvironment(ctx)` — full probe: binary, auth, optional hello-probe.
+### Binary / runtime
+- `findBinary(name, configOverride?)` — resolve a provider CLI on disk.
+- `ensureCommandResolvable(command)` — like `findBinary` but accepts an absolute path too.
+- `clearBinaryCache()` — invalidate the binary-resolution cache.
 - `provider.checkQuota?(ctx)` — rate-limit / quota status (when `capabilities.quotaProbing`).
 - `provider.listModels?(opts?)` — enumerate models the binary can drive.
 

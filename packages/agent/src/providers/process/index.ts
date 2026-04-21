@@ -1,50 +1,32 @@
-import type { ProviderModule, EnvironmentTestContext, EnvironmentTestResult } from "../../types.js";
+import type { AuthResolveContext, AuthReport, ProviderModule } from "../../types.js";
 import { executeProcessProvider } from "./execute.js";
 import { ensureCommandResolvable } from "../../utils/binary.js";
 
-async function testProcessEnvironment(ctx: EnvironmentTestContext): Promise<EnvironmentTestResult> {
-  const config = (ctx.config ?? {}) as Record<string, unknown>;
-  const command = typeof config["command"] === "string" ? config["command"] : null;
-  const auth = { providerType: ctx.providerType, options: [] };
-
-  if (!command) {
+async function resolveProcessAuth(ctx?: AuthResolveContext): Promise<AuthReport> {
+  // Process is a generic runner — the "binary" is user-supplied via config.command.
+  // If a command is passed via ctx.command, probe it; otherwise report "unknown".
+  if (!ctx?.command) {
     return {
-      providerType: ctx.providerType,
-      status: "fail",
-      checks: [{
-        code: "process_command_missing",
-        level: "error",
-        message: "Process provider requires config.command to be set.",
-      }],
-      auth,
-      testedAt: new Date().toISOString(),
+      providerType: "process",
+      binary: { installed: false, error: "No command specified (process provider requires config.command)" },
+      options: [],
+      source: "filesystem",
     };
   }
-
   try {
-    await ensureCommandResolvable(command);
+    const resolved = await ensureCommandResolvable(ctx.command);
     return {
-      providerType: ctx.providerType,
-      status: "pass",
-      checks: [{
-        code: "process_command_resolvable",
-        level: "info",
-        message: `Command is resolvable: ${command}`,
-      }],
-      auth,
-      testedAt: new Date().toISOString(),
+      providerType: "process",
+      binary: { installed: true, resolvedPath: resolved.bin },
+      options: [],
+      source: "filesystem",
     };
   } catch (err) {
     return {
-      providerType: ctx.providerType,
-      status: "fail",
-      checks: [{
-        code: "process_command_unresolvable",
-        level: "error",
-        message: err instanceof Error ? err.message : "Command not found",
-      }],
-      auth,
-      testedAt: new Date().toISOString(),
+      providerType: "process",
+      binary: { installed: false, error: err instanceof Error ? err.message : String(err) },
+      options: [],
+      source: "filesystem",
     };
   }
 }
@@ -61,6 +43,5 @@ export const processProvider: ProviderModule = {
     workspace: true,
   },
   execute: executeProcessProvider,
-  testEnvironment: testProcessEnvironment,
-  resolveAuth: async () => ({ providerType: "process", options: [] }),
+  resolveAuth: resolveProcessAuth,
 };
