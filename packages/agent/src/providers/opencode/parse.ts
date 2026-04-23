@@ -1,4 +1,19 @@
-import type { StreamEvent } from "../../types.js";
+import type { BaseStreamEventFields, StreamEvent } from "../../types.js";
+
+const PROVIDER_TYPE = "opencode";
+
+function stubBase(event: Record<string, unknown>, sessionId: string | null = null): BaseStreamEventFields {
+  return {
+    timestamp: new Date().toISOString(),
+    providerType: PROVIDER_TYPE,
+    sessionId,
+    messageId: null,
+    eventId: null,
+    turnId: null,
+    parentToolCallId: null,
+    raw: event,
+  };
+}
 
 export interface OpenCodeParsedResult {
   sessionId: string | null;
@@ -109,12 +124,13 @@ export function parseOpenCodeStreamLine(line: string): StreamEvent | null {
   if (!event) return null;
 
   const type = asString(event["type"], "");
-  const timestamp = new Date().toISOString();
+  const sessionId = asString(event["sessionID"], "").trim() || null;
+  const base = stubBase(event, sessionId);
 
   if (type === "text") {
     const part = parseObject(event["part"]);
     const text = asString(part["text"], "");
-    if (text) return { type: "assistant", text, timestamp };
+    if (text) return { type: "assistant", text, ...base };
   }
 
   if (type === "tool_use") {
@@ -122,26 +138,36 @@ export function parseOpenCodeStreamLine(line: string): StreamEvent | null {
     const name = asString(part["name"], "");
     const state = parseObject(part["state"]);
     const status = asString(state["status"], "");
-    // If the tool has completed with a result/error, emit tool_result instead
     if (status === "error" || status === "completed") {
       return {
         type: "tool_result",
-        toolCallId: asString(part["id"], "") || asString(part["tool_use_id"], ""),
+        toolCallId: asString(part["id"], "") || asString(part["tool_use_id"], "") || null,
         content: status === "error" ? asString(state["error"], "") : asString(state["result"], ""),
         isError: status === "error",
-        timestamp,
+        exitCode: null,
+        ...base,
       };
     }
-    return { type: "tool_call", callId: asString(part["id"], "") || asString(part["tool_use_id"], "") || undefined, name, input: part["input"], timestamp };
+    return {
+      type: "tool_call",
+      toolCallId: asString(part["id"], "") || asString(part["tool_use_id"], "") || null,
+      name,
+      input: part["input"],
+      ...base,
+    };
   }
 
   if (type === "step_finish") {
     return {
       type: "result",
       text: "",
-      cost: null,
+      costUsd: null,
       isError: false,
-      timestamp,
+      stopReason: null,
+      terminalReason: null,
+      numTurns: null,
+      durationMs: null,
+      ...base,
     };
   }
 
@@ -149,13 +175,18 @@ export function parseOpenCodeStreamLine(line: string): StreamEvent | null {
     return {
       type: "result",
       text: asString(event["message"], ""),
-      cost: null,
+      costUsd: null,
       isError: true,
-      timestamp,
+      stopReason: null,
+      terminalReason: null,
+      numTurns: null,
+      durationMs: null,
+      ...base,
     };
   }
 
-  return null;
+  // Forward-compat: surface unknown wire events rather than dropping them.
+  return { type: "unknown", subtype: type, ...base };
 }
 
 const OPENCODE_UNKNOWN_SESSION_RE = /unknown\s+session|session\b.*\bnot\s+found|no session/i;

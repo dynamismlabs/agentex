@@ -124,7 +124,7 @@ describe("parseGeminiStreamLine", () => {
     expect(events[1]!.type).toBe("tool_call");
     if (events[1]!.type === "tool_call") {
       expect(events[1]!.name).toBe("Read");
-      expect(events[1]!.callId).toBe("gem-tu-001");
+      expect(events[1]!.toolCallId).toBe("gem-tu-001");
     }
   });
 
@@ -140,11 +140,11 @@ describe("parseGeminiStreamLine", () => {
     const events = parseGeminiStreamLine(line);
     expect(events).toHaveLength(1);
     if (events[0]!.type === "tool_call") {
-      expect(events[0]!.callId).toBe("gem-tuid-002");
+      expect(events[0]!.toolCallId).toBe("gem-tuid-002");
     }
   });
 
-  it("callId is undefined when tool_use has no id fields", () => {
+  it("callId is null when tool_use has no id fields", () => {
     const line = JSON.stringify({
       type: "assistant",
       message: {
@@ -156,7 +156,7 @@ describe("parseGeminiStreamLine", () => {
     const events = parseGeminiStreamLine(line);
     expect(events).toHaveLength(1);
     if (events[0]!.type === "tool_call") {
-      expect(events[0]!.callId).toBeUndefined();
+      expect(events[0]!.toolCallId).toBeNull();
     }
   });
 
@@ -180,9 +180,11 @@ describe("parseGeminiStreamLine", () => {
     expect(parseGeminiStreamLine("not json")).toHaveLength(0);
   });
 
-  it("returns empty array for non-init system events", () => {
+  it("returns an `unknown` variant for non-init system events (forward-compat)", () => {
     const line = JSON.stringify({ type: "system", subtype: "other" });
-    expect(parseGeminiStreamLine(line)).toHaveLength(0);
+    const events = parseGeminiStreamLine(line);
+    expect(events).toHaveLength(1);
+    expect(events[0]!.type).toBe("unknown");
   });
 });
 

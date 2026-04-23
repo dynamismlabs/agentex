@@ -1,4 +1,19 @@
-import type { StreamEvent } from "../../types.js";
+import type { BaseStreamEventFields, StreamEvent } from "../../types.js";
+
+const PROVIDER_TYPE = "cursor";
+
+function stubBase(event: Record<string, unknown>, sessionId: string | null = null): BaseStreamEventFields {
+  return {
+    timestamp: new Date().toISOString(),
+    providerType: PROVIDER_TYPE,
+    sessionId,
+    messageId: null,
+    eventId: null,
+    turnId: null,
+    parentToolCallId: null,
+    raw: event,
+  };
+}
 
 export interface CursorParsedResult {
   sessionId: string | null;
@@ -193,20 +208,22 @@ export function parseCursorStreamLine(line: string): StreamEvent | null {
   if (!event) return null;
 
   const type = asString(event["type"], "").trim();
-  const timestamp = new Date().toISOString();
+  const sessionId = readSessionId(event);
+  const base = stubBase(event, sessionId);
 
   if (type === "system" && asString(event["subtype"], "").trim() === "init") {
     return {
       type: "system",
       subtype: "init",
-      sessionId: readSessionId(event),
       model: asString(event["model"], "") || null,
-      timestamp,
+      cwd: null,
+      tools: null,
+      permissionMode: null,
+      ...base,
     };
   }
 
   if (type === "assistant") {
-    // Check for tool_use / tool_result blocks in the content
     const message = parseObject(event["message"]);
     const content = Array.isArray(message["content"]) ? message["content"] : [];
     for (const partRaw of content) {
@@ -215,26 +232,27 @@ export function parseCursorStreamLine(line: string): StreamEvent | null {
       if (blockType === "tool_use") {
         return {
           type: "tool_call",
-          callId: asString(part["id"], "") || undefined,
+          toolCallId: asString(part["id"], "") || null,
           name: asString(part["name"], ""),
           input: part["input"],
-          timestamp,
+          ...base,
         };
       }
       if (blockType === "tool_result") {
         return {
           type: "tool_result",
-          toolCallId: asString(part["tool_use_id"], ""),
+          toolCallId: asString(part["tool_use_id"], "") || null,
           content: asString(part["content"], ""),
           isError: part["is_error"] === true,
-          timestamp,
+          exitCode: null,
+          ...base,
         };
       }
     }
 
     const texts = collectAssistantText(event["message"]);
     if (texts.length > 0) {
-      return { type: "assistant", text: texts.join("\n"), timestamp };
+      return { type: "assistant", text: texts.join("\n"), ...base };
     }
   }
 
@@ -242,13 +260,18 @@ export function parseCursorStreamLine(line: string): StreamEvent | null {
     return {
       type: "result",
       text: asString(event["result"], ""),
-      cost: typeof event["total_cost_usd"] === "number" ? event["total_cost_usd"] : null,
+      costUsd: typeof event["total_cost_usd"] === "number" ? event["total_cost_usd"] : null,
       isError: event["is_error"] === true,
-      timestamp,
+      stopReason: null,
+      terminalReason: null,
+      numTurns: null,
+      durationMs: null,
+      ...base,
     };
   }
 
-  return null;
+  // Forward-compat: surface unknown wire events rather than dropping them.
+  return { type: "unknown", subtype: type, ...base };
 }
 
 const CURSOR_UNKNOWN_SESSION_RE = /unknown\s+(session|chat)|session\s+.*\s+not\s+found|chat\s+.*\s+not\s+found|resume\s+.*\s+not\s+found|could\s+not\s+resume/i;

@@ -1,13 +1,33 @@
-import type { StreamEvent } from "../../types.js";
+import type {
+  BaseStreamEventFields,
+  ModelUsage,
+  RateLimitInfo,
+  StreamEvent,
+} from "../../types.js";
+
+const PROVIDER_TYPE = "claude";
 
 export interface ClaudeParsedResult {
   sessionId: string | null;
   model: string | null;
-  usage: { inputTokens: number; outputTokens: number; cachedInputTokens: number } | null;
+  /**
+   * Per-model usage from Claude's `modelUsage` result payload (rich) or
+   * synthesized from the final `result.usage` when `modelUsage` is absent.
+   */
+  modelUsage: Record<string, ModelUsage> | null;
   costUsd: number | null;
   summary: string | null;
   isError: boolean;
   errorCode: string | null;
+  /** Populated when the final result event carries these fields. */
+  stopReason: string | null;
+  terminalReason: string | null;
+  numTurns: number | null;
+  durationApiMs: number | null;
+  permissionDenials: unknown[] | null;
+  rateLimits: RateLimitInfo[];
+  /** The final `result` event verbatim, or null if none was seen. */
+  finalEvent: Record<string, unknown> | null;
 }
 
 function parseJson(line: string): Record<string, unknown> | null {
@@ -26,8 +46,16 @@ function asString(value: unknown, fallback: string): string {
   return typeof value === "string" ? value : fallback;
 }
 
+function asNullableString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
 function asNumber(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function asNullableNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 function parseObject(value: unknown): Record<string, unknown> {
@@ -37,11 +65,93 @@ function parseObject(value: unknown): Record<string, unknown> {
   return {};
 }
 
+function baseFieldsFromEvent(
+  event: Record<string, unknown>,
+  messageId: string | null,
+): BaseStreamEventFields {
+  return {
+    timestamp: new Date().toISOString(),
+    providerType: PROVIDER_TYPE,
+    sessionId: asNullableString(event["session_id"]),
+    messageId,
+    eventId: asNullableString(event["uuid"]),
+    turnId: null, // Claude doesn't model turns explicitly
+    parentToolCallId: asNullableString(event["parent_tool_use_id"]),
+    raw: event,
+  };
+}
+
+function rateLimitFromEvent(event: Record<string, unknown>): RateLimitInfo | null {
+  const info = parseObject(event["rate_limit_info"]);
+  if (Object.keys(info).length === 0) return null;
+  const resetsAt = info["resetsAt"];
+  const overageResetsAt = info["overageResetsAt"];
+  const resetEpoch =
+    typeof resetsAt === "number" && Number.isFinite(resetsAt) ? resetsAt :
+    typeof overageResetsAt === "number" && Number.isFinite(overageResetsAt) ? overageResetsAt :
+    null;
+  return {
+    status: asString(info["status"], "unknown"),
+    limitType: asNullableString(info["rateLimitType"]),
+    resetAt: resetEpoch !== null ? new Date(resetEpoch * 1000).toISOString() : null,
+    overageStatus: asNullableString(info["overageStatus"]),
+    isUsingOverage: typeof info["isUsingOverage"] === "boolean" ? info["isUsingOverage"] : null,
+  };
+}
+
+function modelUsageFromResult(
+  result: Record<string, unknown>,
+  fallbackModel: string | null,
+): Record<string, ModelUsage> | null {
+  const perModel = parseObject(result["modelUsage"]);
+  const modelKeys = Object.keys(perModel);
+  if (modelKeys.length > 0) {
+    const out: Record<string, ModelUsage> = {};
+    for (const key of modelKeys) {
+      const entry = parseObject(perModel[key]);
+      const usage: ModelUsage = {
+        inputTokens: asNumber(entry["inputTokens"], 0),
+        outputTokens: asNumber(entry["outputTokens"], 0),
+      };
+      const cacheRead = asNumber(entry["cacheReadInputTokens"], 0);
+      if (cacheRead > 0) usage.cachedInputTokens = cacheRead;
+      const cacheCreation = asNumber(entry["cacheCreationInputTokens"], 0);
+      if (cacheCreation > 0) usage.cacheCreationInputTokens = cacheCreation;
+      const cost = asNullableNumber(entry["costUSD"]);
+      if (cost !== null) usage.costUsd = cost;
+      const webSearch = asNumber(entry["webSearchRequests"], 0);
+      if (webSearch > 0) usage.webSearchRequests = webSearch;
+      const ctxWindow = asNullableNumber(entry["contextWindow"]);
+      if (ctxWindow !== null) usage.contextWindow = ctxWindow;
+      const maxOut = asNullableNumber(entry["maxOutputTokens"]);
+      if (maxOut !== null) usage.maxOutputTokens = maxOut;
+      out[key] = usage;
+    }
+    return out;
+  }
+
+  // Fallback: synthesize single-model usage from `result.usage` if present.
+  const usageObj = parseObject(result["usage"]);
+  if (Object.keys(usageObj).length === 0) return null;
+  const model = asNullableString(result["model"]) ?? fallbackModel;
+  if (!model) return null;
+  const usage: ModelUsage = {
+    inputTokens: asNumber(usageObj["input_tokens"], 0),
+    outputTokens: asNumber(usageObj["output_tokens"], 0),
+  };
+  const cacheRead = asNumber(usageObj["cache_read_input_tokens"], 0);
+  if (cacheRead > 0) usage.cachedInputTokens = cacheRead;
+  const cacheCreation = asNumber(usageObj["cache_creation_input_tokens"], 0);
+  if (cacheCreation > 0) usage.cacheCreationInputTokens = cacheCreation;
+  return { [model]: usage };
+}
+
 export function parseClaudeStreamJson(stdout: string): ClaudeParsedResult {
   let sessionId: string | null = null;
   let model: string | null = null;
   let finalResult: Record<string, unknown> | null = null;
   const assistantTexts: string[] = [];
+  const rateLimits: RateLimitInfo[] = [];
 
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
@@ -52,13 +162,19 @@ export function parseClaudeStreamJson(stdout: string): ClaudeParsedResult {
     const type = asString(event["type"], "");
 
     if (type === "system" && asString(event["subtype"], "") === "init") {
-      sessionId = asString(event["session_id"], "") || sessionId;
-      model = asString(event["model"], "") || model;
+      sessionId = asNullableString(event["session_id"]) ?? sessionId;
+      model = asNullableString(event["model"]) ?? model;
+      continue;
+    }
+
+    if (type === "rate_limit_event") {
+      const info = rateLimitFromEvent(event);
+      if (info) rateLimits.push(info);
       continue;
     }
 
     if (type === "assistant") {
-      sessionId = asString(event["session_id"], "") || sessionId;
+      sessionId = asNullableString(event["session_id"]) ?? sessionId;
       const message = parseObject(event["message"]);
       const content = Array.isArray(message["content"]) ? message["content"] : [];
       for (const entry of content) {
@@ -74,7 +190,7 @@ export function parseClaudeStreamJson(stdout: string): ClaudeParsedResult {
 
     if (type === "result") {
       finalResult = event;
-      sessionId = asString(event["session_id"], "") || sessionId;
+      sessionId = asNullableString(event["session_id"]) ?? sessionId;
     }
   }
 
@@ -83,20 +199,21 @@ export function parseClaudeStreamJson(stdout: string): ClaudeParsedResult {
       sessionId,
       model,
       costUsd: null,
-      usage: null,
+      modelUsage: null,
       summary: assistantTexts.join("\n\n").trim() || null,
       isError: false,
       errorCode: null,
+      stopReason: null,
+      terminalReason: null,
+      numTurns: null,
+      durationApiMs: null,
+      permissionDenials: null,
+      rateLimits,
+      finalEvent: null,
     };
   }
 
-  const usageObj = parseObject(finalResult["usage"]);
-  const usage = {
-    inputTokens: asNumber(usageObj["input_tokens"], 0),
-    outputTokens: asNumber(usageObj["output_tokens"], 0),
-    cachedInputTokens: asNumber(usageObj["cache_read_input_tokens"], 0),
-  };
-
+  const modelUsage = modelUsageFromResult(finalResult, model);
   const costRaw = finalResult["total_cost_usd"];
   const costUsd = typeof costRaw === "number" && Number.isFinite(costRaw) ? costRaw : null;
   const summary = asString(finalResult["result"], assistantTexts.join("\n\n")).trim() || null;
@@ -107,14 +224,24 @@ export function parseClaudeStreamJson(stdout: string): ClaudeParsedResult {
     errorCode = "max_turns";
   }
 
+  const denials = finalResult["permission_denials"];
+  const permissionDenials = Array.isArray(denials) && denials.length > 0 ? denials : null;
+
   return {
     sessionId,
     model,
     costUsd,
-    usage,
+    modelUsage,
     summary,
     isError,
     errorCode,
+    stopReason: asNullableString(finalResult["stop_reason"]),
+    terminalReason: asNullableString(finalResult["terminal_reason"]),
+    numTurns: asNullableNumber(finalResult["num_turns"]),
+    durationApiMs: asNullableNumber(finalResult["duration_api_ms"]),
+    permissionDenials,
+    rateLimits,
+    finalEvent: finalResult,
   };
 }
 
@@ -123,58 +250,7 @@ export function toStreamEvents(stdout: string): StreamEvent[] {
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line) continue;
-    const event = parseJson(line);
-    if (!event) continue;
-
-    const type = asString(event["type"], "");
-    const timestamp = new Date().toISOString();
-
-    if (type === "system" && asString(event["subtype"], "") === "init") {
-      events.push({
-        type: "system",
-        subtype: "init",
-        sessionId: asString(event["session_id"], "") || null,
-        model: asString(event["model"], "") || null,
-        timestamp,
-      });
-    } else if (type === "assistant") {
-      const message = parseObject(event["message"]);
-      const content = Array.isArray(message["content"]) ? message["content"] : [];
-      for (const entry of content) {
-        if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
-        const block = entry as Record<string, unknown>;
-        const blockType = asString(block["type"], "");
-        if (blockType === "text") {
-          events.push({ type: "assistant", text: asString(block["text"], ""), timestamp });
-        } else if (blockType === "thinking") {
-          events.push({ type: "thinking", text: asString(block["thinking"], ""), timestamp });
-        } else if (blockType === "tool_use") {
-          events.push({
-            type: "tool_call",
-            callId: asString(block["id"], "") || undefined,
-            name: asString(block["name"], ""),
-            input: block["input"],
-            timestamp,
-          });
-        } else if (blockType === "tool_result") {
-          events.push({
-            type: "tool_result",
-            toolCallId: asString(block["tool_use_id"], ""),
-            content: asString(block["content"], ""),
-            isError: block["is_error"] === true,
-            timestamp,
-          });
-        }
-      }
-    } else if (type === "result") {
-      events.push({
-        type: "result",
-        text: asString(event["result"], ""),
-        cost: typeof event["total_cost_usd"] === "number" ? event["total_cost_usd"] : null,
-        isError: event["is_error"] === true,
-        timestamp,
-      });
-    }
+    events.push(...parseStreamLine(line));
   }
   return events;
 }
@@ -184,56 +260,114 @@ export function parseStreamLine(line: string): StreamEvent[] {
   if (!event) return [];
 
   const type = asString(event["type"], "");
-  const timestamp = new Date().toISOString();
 
   if (type === "system" && asString(event["subtype"], "") === "init") {
     return [{
       type: "system",
       subtype: "init",
-      sessionId: asString(event["session_id"], "") || null,
-      model: asString(event["model"], "") || null,
-      timestamp,
+      model: asNullableString(event["model"]),
+      cwd: asNullableString(event["cwd"]),
+      tools: Array.isArray(event["tools"]) ? event["tools"] as string[] : null,
+      permissionMode: asNullableString(event["permissionMode"]),
+      ...baseFieldsFromEvent(event, null),
+    }];
+  }
+
+  if (type === "rate_limit_event") {
+    const info = rateLimitFromEvent(event);
+    if (!info) return [];
+    return [{
+      type: "rate_limit",
+      status: info.status,
+      limitType: info.limitType,
+      resetAt: info.resetAt,
+      overageStatus: info.overageStatus,
+      isUsingOverage: info.isUsingOverage,
+      ...baseFieldsFromEvent(event, null),
     }];
   }
 
   if (type === "assistant") {
-    const events: StreamEvent[] = [];
     const message = parseObject(event["message"]);
+    const messageId = asNullableString(message["id"]);
+    const base = baseFieldsFromEvent(event, messageId);
+    const out: StreamEvent[] = [];
     const content = Array.isArray(message["content"]) ? message["content"] : [];
     for (const entry of content) {
       if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
       const block = entry as Record<string, unknown>;
       const blockType = asString(block["type"], "");
       if (blockType === "text") {
-        events.push({ type: "assistant", text: asString(block["text"], ""), timestamp });
+        out.push({ type: "assistant", text: asString(block["text"], ""), ...base });
       } else if (blockType === "thinking") {
-        events.push({ type: "thinking", text: asString(block["thinking"], ""), timestamp });
+        out.push({ type: "thinking", text: asString(block["thinking"], ""), ...base });
       } else if (blockType === "tool_use") {
-        events.push({ type: "tool_call", callId: asString(block["id"], "") || undefined, name: asString(block["name"], ""), input: block["input"], timestamp });
+        out.push({
+          type: "tool_call",
+          toolCallId: asNullableString(block["id"]),
+          name: asString(block["name"], ""),
+          input: block["input"],
+          ...base,
+        });
       } else if (blockType === "tool_result") {
-        events.push({
+        out.push({
           type: "tool_result",
-          toolCallId: asString(block["tool_use_id"], ""),
+          toolCallId: asNullableString(block["tool_use_id"]),
           content: asString(block["content"], ""),
           isError: block["is_error"] === true,
-          timestamp,
+          exitCode: null,
+          ...base,
         });
       }
     }
-    return events;
+    return out;
+  }
+
+  if (type === "user") {
+    // Claude encodes tool results as a `user` event carrying tool_result blocks.
+    const message = parseObject(event["message"]);
+    const messageId = asNullableString(message["id"]);
+    const base = baseFieldsFromEvent(event, messageId);
+    const out: StreamEvent[] = [];
+    const content = Array.isArray(message["content"]) ? message["content"] : [];
+    for (const entry of content) {
+      if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
+      const block = entry as Record<string, unknown>;
+      if (asString(block["type"], "") === "tool_result") {
+        out.push({
+          type: "tool_result",
+          toolCallId: asNullableString(block["tool_use_id"]),
+          content: asString(block["content"], ""),
+          isError: block["is_error"] === true,
+          exitCode: null,
+          ...base,
+        });
+      }
+    }
+    return out;
   }
 
   if (type === "result") {
     return [{
       type: "result",
       text: asString(event["result"], ""),
-      cost: typeof event["total_cost_usd"] === "number" ? event["total_cost_usd"] : null,
+      costUsd: asNullableNumber(event["total_cost_usd"]),
       isError: event["is_error"] === true,
-      timestamp,
+      stopReason: asNullableString(event["stop_reason"]),
+      terminalReason: asNullableString(event["terminal_reason"]),
+      numTurns: asNullableNumber(event["num_turns"]),
+      durationMs: asNullableNumber(event["duration_ms"]),
+      ...baseFieldsFromEvent(event, null),
     }];
   }
 
-  return [];
+  // Forward-compat: surface any unrecognized event type with full base fields
+  // + raw. Lets consumers see new CLI event types without a library bump.
+  return [{
+    type: "unknown",
+    subtype: type,
+    ...baseFieldsFromEvent(event, null),
+  }];
 }
 
 const CLAUDE_AUTH_REQUIRED_RE = /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+`?claude\s+login`?|login\s+required|requires\s+login|unauthorized|authentication\s+required)/i;

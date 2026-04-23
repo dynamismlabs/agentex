@@ -1,4 +1,19 @@
-import type { StreamEvent } from "../../types.js";
+import type { BaseStreamEventFields, StreamEvent } from "../../types.js";
+
+const PROVIDER_TYPE = "pi";
+
+function stubBase(event: Record<string, unknown>): BaseStreamEventFields {
+  return {
+    timestamp: new Date().toISOString(),
+    providerType: PROVIDER_TYPE,
+    sessionId: null,
+    messageId: null,
+    eventId: null,
+    turnId: null,
+    parentToolCallId: null,
+    raw: event,
+  };
+}
 
 export interface PiParsedResult {
   sessionId: string | null;
@@ -158,23 +173,23 @@ export function parsePiStreamLine(line: string): StreamEvent | null {
   if (!event) return null;
 
   const eventType = asString(event["type"], "");
-  const timestamp = new Date().toISOString();
+  const base = stubBase(event);
 
   if (eventType === "message_update") {
     const assistantEvent = asRecord(event["assistantMessageEvent"]);
     if (assistantEvent && asString(assistantEvent["type"], "") === "text_delta") {
       const delta = asString(assistantEvent["delta"], "");
-      if (delta) return { type: "assistant", text: delta, timestamp };
+      if (delta) return { type: "assistant", text: delta, ...base };
     }
   }
 
   if (eventType === "tool_execution_start") {
     return {
       type: "tool_call",
-      callId: asString(event["toolCallId"], "") || undefined,
+      toolCallId: asString(event["toolCallId"], "") || null,
       name: asString(event["toolName"], ""),
       input: event["args"],
-      timestamp,
+      ...base,
     };
   }
 
@@ -182,10 +197,11 @@ export function parsePiStreamLine(line: string): StreamEvent | null {
     const result = event["result"];
     return {
       type: "tool_result",
-      toolCallId: asString(event["toolCallId"], ""),
+      toolCallId: asString(event["toolCallId"], "") || null,
       content: typeof result === "string" ? result : JSON.stringify(result),
       isError: event["isError"] === true,
-      timestamp,
+      exitCode: null,
+      ...base,
     };
   }
 
@@ -193,13 +209,18 @@ export function parsePiStreamLine(line: string): StreamEvent | null {
     return {
       type: "result",
       text: "",
-      cost: null,
+      costUsd: null,
       isError: false,
-      timestamp,
+      stopReason: null,
+      terminalReason: null,
+      numTurns: null,
+      durationMs: null,
+      ...base,
     };
   }
 
-  return null;
+  // Forward-compat: surface unknown wire events rather than dropping them.
+  return { type: "unknown", subtype: eventType, ...base };
 }
 
 const PI_UNKNOWN_SESSION_RE = /unknown\s+session|session\s+not\s+found|session\s+.*\s+not\s+found|no\s+session/i;

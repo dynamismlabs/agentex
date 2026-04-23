@@ -22,10 +22,12 @@ describe("parseClaudeStreamJson", () => {
     expect(result.sessionId).toBe("sess-abc-123");
     expect(result.model).toBe("claude-sonnet-4-20250514");
     expect(result.costUsd).toBe(0.0042);
-    expect(result.usage).toEqual({
-      inputTokens: 150,
-      outputTokens: 50,
-      cachedInputTokens: 10,
+    expect(result.modelUsage).toEqual({
+      "claude-sonnet-4-20250514": {
+        inputTokens: 150,
+        outputTokens: 50,
+        cachedInputTokens: 10,
+      },
     });
     expect(result.summary).toBe("Task completed successfully.");
     expect(result.isError).toBe(false);
@@ -47,7 +49,7 @@ describe("parseClaudeStreamJson", () => {
 
   it("returns null fields when no result event", () => {
     const result = parseClaudeStreamJson('{"type":"system","subtype":"init","session_id":"s1","model":"m1"}');
-    expect(result.usage).toBeNull();
+    expect(result.modelUsage).toBeNull();
     expect(result.costUsd).toBeNull();
     expect(result.sessionId).toBe("s1");
     expect(result.model).toBe("m1");
@@ -58,6 +60,61 @@ describe("parseClaudeStreamJson", () => {
     expect(result.sessionId).toBeNull();
     expect(result.model).toBeNull();
     expect(result.summary).toBeNull();
+  });
+
+  it("extracts provider-reported run metadata (stopReason, terminalReason, numTurns, durationApiMs, permissionDenials)", () => {
+    const stdout = [
+      JSON.stringify({ type: "system", subtype: "init", session_id: "s1", model: "m1" }),
+      JSON.stringify({
+        type: "result",
+        session_id: "s1",
+        result: "ok",
+        is_error: false,
+        stop_reason: "end_turn",
+        terminal_reason: "completed",
+        num_turns: 3,
+        duration_ms: 1200,
+        duration_api_ms: 900,
+        permission_denials: [{ tool: "Write", reason: "user denied" }],
+        usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 },
+      }),
+    ].join("\n");
+    const result = parseClaudeStreamJson(stdout);
+    expect(result.stopReason).toBe("end_turn");
+    expect(result.terminalReason).toBe("completed");
+    expect(result.numTurns).toBe(3);
+    expect(result.durationApiMs).toBe(900);
+    expect(result.permissionDenials).toEqual([{ tool: "Write", reason: "user denied" }]);
+    expect(result.finalEvent).toBeDefined();
+    expect(result.finalEvent!["result"]).toBe("ok");
+  });
+
+  it("collects rate_limit_event signals onto rateLimits", () => {
+    const stdout = [
+      JSON.stringify({ type: "system", subtype: "init", session_id: "s1", model: "m1" }),
+      JSON.stringify({
+        type: "rate_limit_event",
+        session_id: "s1",
+        uuid: "rl-1",
+        rate_limit_info: {
+          status: "rejected",
+          resetsAt: 1776805200,
+          rateLimitType: "five_hour",
+          overageStatus: "allowed",
+          isUsingOverage: true,
+        },
+      }),
+      JSON.stringify({ type: "result", session_id: "s1", result: "ok", is_error: false }),
+    ].join("\n");
+    const result = parseClaudeStreamJson(stdout);
+    expect(result.rateLimits).toHaveLength(1);
+    expect(result.rateLimits[0]).toEqual({
+      status: "rejected",
+      limitType: "five_hour",
+      resetAt: "2026-04-21T21:00:00.000Z",
+      overageStatus: "allowed",
+      isUsingOverage: true,
+    });
   });
 });
 
@@ -80,9 +137,35 @@ describe("parseStreamLine", () => {
     }
   });
 
-  it("returns empty array for non-init system events", () => {
+  it("returns an `unknown` event for non-init system events (forward-compat)", () => {
     const line = JSON.stringify({ type: "system", subtype: "other" });
-    expect(parseStreamLine(line)).toHaveLength(0);
+    const events = parseStreamLine(line);
+    expect(events).toHaveLength(1);
+    expect(events[0]!.type).toBe("unknown");
+    if (events[0]!.type === "unknown") {
+      expect(events[0]!.subtype).toBe("system");
+      expect(events[0]!.raw).toEqual({ type: "system", subtype: "other" });
+    }
+  });
+
+  it("unknown variant preserves sessionId, eventId, and raw verbatim", () => {
+    const rawEvent = {
+      type: "compaction_event",
+      session_id: "sess-xyz",
+      uuid: "event-uuid-999",
+      parent_tool_use_id: null,
+      some_future_field: { nested: "value" },
+    };
+    const events = parseStreamLine(JSON.stringify(rawEvent));
+    expect(events).toHaveLength(1);
+    expect(events[0]!.type).toBe("unknown");
+    if (events[0]!.type === "unknown") {
+      expect(events[0]!.subtype).toBe("compaction_event");
+      expect(events[0]!.sessionId).toBe("sess-xyz");
+      expect(events[0]!.eventId).toBe("event-uuid-999");
+      expect(events[0]!.providerType).toBe("claude");
+      expect(events[0]!.raw).toEqual(rawEvent);
+    }
   });
 
   it("returns empty array for malformed JSON", () => {
@@ -105,7 +188,7 @@ describe("parseStreamLine", () => {
     expect(events[1]!.type).toBe("tool_call");
     if (events[1]!.type === "tool_call") {
       expect(events[1]!.name).toBe("write_file");
-      expect(events[1]!.callId).toBe("toolu_write_01");
+      expect(events[1]!.toolCallId).toBe("toolu_write_01");
     }
   });
 
@@ -122,12 +205,12 @@ describe("parseStreamLine", () => {
     expect(events).toHaveLength(1);
     expect(events[0]!.type).toBe("tool_call");
     if (events[0]!.type === "tool_call") {
-      expect(events[0]!.callId).toBe("toolu_abc_999");
+      expect(events[0]!.toolCallId).toBe("toolu_abc_999");
       expect(events[0]!.name).toBe("Bash");
     }
   });
 
-  it("callId is undefined when tool_use block has no id", () => {
+  it("callId is null when tool_use block has no id", () => {
     const line = JSON.stringify({
       type: "assistant",
       message: {
@@ -139,7 +222,7 @@ describe("parseStreamLine", () => {
     const events = parseStreamLine(line);
     expect(events).toHaveLength(1);
     if (events[0]!.type === "tool_call") {
-      expect(events[0]!.callId).toBeUndefined();
+      expect(events[0]!.toolCallId).toBeNull();
     }
   });
 });
@@ -170,7 +253,7 @@ describe("toStreamEvents", () => {
     expect(toolCall).toBeDefined();
     if (toolCall?.type === "tool_call") {
       expect(toolCall.name).toBe("Read");
-      expect(toolCall.callId).toBe("toolu_01ABC123");
+      expect(toolCall.toolCallId).toBe("toolu_01ABC123");
     }
   });
 

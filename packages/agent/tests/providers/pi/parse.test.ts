@@ -128,12 +128,12 @@ describe("parsePiStreamLine", () => {
     const event = parsePiStreamLine(line);
     expect(event).not.toBeNull();
     if (event?.type === "tool_call") {
-      expect(event.callId).toBe("pi-tc-001");
+      expect(event.toolCallId).toBe("pi-tc-001");
       expect(event.name).toBe("bash");
     }
   });
 
-  it("callId is undefined when toolCallId is absent on tool_execution_start", () => {
+  it("callId is null when toolCallId is absent on tool_execution_start", () => {
     const line = JSON.stringify({
       type: "tool_execution_start",
       toolName: "grep",
@@ -142,7 +142,7 @@ describe("parsePiStreamLine", () => {
     const event = parsePiStreamLine(line);
     expect(event).not.toBeNull();
     if (event?.type === "tool_call") {
-      expect(event.callId).toBeUndefined();
+      expect(event.toolCallId).toBeNull();
     }
   });
 
@@ -173,8 +173,13 @@ describe("parsePiStreamLine", () => {
     }
   });
 
-  it("returns null for unknown types", () => {
-    expect(parsePiStreamLine(JSON.stringify({ type: "unknown" }))).toBeNull();
+  it("returns an `unknown` variant for unrecognized types; null for unparseable lines", () => {
+    const unknown = parsePiStreamLine(JSON.stringify({ type: "some_new_event" }));
+    expect(unknown).not.toBeNull();
+    expect(unknown!.type).toBe("unknown");
+    if (unknown?.type === "unknown") {
+      expect(unknown.subtype).toBe("some_new_event");
+    }
     expect(parsePiStreamLine("not json")).toBeNull();
   });
 });

@@ -134,6 +134,26 @@ export async function executeCodexProvider(ctx: ExecutionContext): Promise<Execu
   const runAttempt = async (resumeSessionId: string | null) => {
     const args = buildArgs(resumeSessionId);
     let lineBuffer = "";
+    // Track thread_id across lines — Codex only emits it once (thread.started)
+    // but downstream events need it attached for DB correlation.
+    let streamThreadId: string | null = resumeSessionId;
+
+    const handleLine = async (trimmed: string) => {
+      if (!trimmed) return;
+      if (streamThreadId === null) {
+        try {
+          const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+          if (parsed && parsed["type"] === "thread.started" && typeof parsed["thread_id"] === "string") {
+            streamThreadId = parsed["thread_id"];
+          }
+        } catch { /* ignore */ }
+      }
+      if (!ctx.onEvent) return;
+      const event = parseCodexStreamLine(trimmed, streamThreadId);
+      if (event) {
+        try { await ctx.onEvent(event); } catch { /* swallow */ }
+      }
+    };
 
     ctx.onLifecycle?.({ phase: "spawning" });
     const proc = await runChildProcess({
@@ -163,28 +183,18 @@ export async function executeCodexProvider(ctx: ExecutionContext): Promise<Execu
           }
 
           // Parse stdout lines for stream events
-          if (ctx.onEvent) {
-            lineBuffer += chunk;
-            const lines = lineBuffer.split("\n");
-            lineBuffer = lines.pop() ?? "";
-            for (const line of lines) {
-              const trimmed = line.trim();
-              if (!trimmed) continue;
-              const event = parseCodexStreamLine(trimmed);
-              if (event) {
-                try { await ctx.onEvent(event); } catch { /* swallow */ }
-              }
-            }
+          lineBuffer += chunk;
+          const lines = lineBuffer.split("\n");
+          lineBuffer = lines.pop() ?? "";
+          for (const line of lines) {
+            await handleLine(line.trim());
           }
         }
       },
     });
 
-    if (lineBuffer.trim() && ctx.onEvent) {
-      const event = parseCodexStreamLine(lineBuffer.trim());
-      if (event) {
-        try { await ctx.onEvent(event); } catch { /* swallow */ }
-      }
+    if (lineBuffer.trim()) {
+      await handleLine(lineBuffer.trim());
     }
 
     return proc;
@@ -254,7 +264,11 @@ export async function executeCodexProvider(ctx: ExecutionContext): Promise<Execu
     errorMessage,
     errorCode,
     usage: parsed.usage && resolvedModel
-      ? { [resolvedModel]: { inputTokens: parsed.usage.inputTokens, outputTokens: parsed.usage.outputTokens } }
+      ? { [resolvedModel]: {
+          inputTokens: parsed.usage.inputTokens,
+          outputTokens: parsed.usage.outputTokens,
+          ...(parsed.usage.cachedInputTokens !== undefined ? { cachedInputTokens: parsed.usage.cachedInputTokens } : {}),
+        } }
       : await scanCodexSessionUsage({
           startedAfter: new Date(startedAt),
           threadId: resolvedSessionId ?? undefined,
@@ -266,7 +280,7 @@ export async function executeCodexProvider(ctx: ExecutionContext): Promise<Execu
     sessionDisplayId: resolvedSessionId,
     clearSession,
     billingType,
-    raw: null,
+    raw: parsed.finalEvent,
     workspace,
   };
 }

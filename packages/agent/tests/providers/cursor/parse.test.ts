@@ -166,7 +166,7 @@ describe("parseCursorStreamLine", () => {
     expect(event).not.toBeNull();
     expect(event!.type).toBe("tool_call");
     if (event?.type === "tool_call") {
-      expect(event.callId).toBe("cur-tu-001");
+      expect(event.toolCallId).toBe("cur-tu-001");
       expect(event.name).toBe("Edit");
     }
   });
@@ -202,7 +202,7 @@ describe("parseCursorStreamLine", () => {
     const event = parseCursorStreamLine(line);
     expect(event).not.toBeNull();
     if (event?.type === "tool_call") {
-      expect(event.callId).toBeUndefined();
+      expect(event.toolCallId).toBeNull();
     }
   });
 

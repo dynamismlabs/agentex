@@ -1,4 +1,19 @@
-import type { StreamEvent } from "../../types.js";
+import type { BaseStreamEventFields, StreamEvent } from "../../types.js";
+
+const PROVIDER_TYPE = "gemini";
+
+function stubBase(event: Record<string, unknown>, sessionId: string | null = null): BaseStreamEventFields {
+  return {
+    timestamp: new Date().toISOString(),
+    providerType: PROVIDER_TYPE,
+    sessionId,
+    messageId: null,
+    eventId: null,
+    turnId: null,
+    parentToolCallId: null,
+    raw: event,
+  };
+}
 
 export interface GeminiParsedResult {
   sessionId: string | null;
@@ -185,15 +200,18 @@ export function parseGeminiStreamLine(line: string): StreamEvent[] {
   if (!event) return [];
 
   const type = asString(event["type"], "").trim();
-  const timestamp = new Date().toISOString();
+  const sessionId = readSessionId(event);
+  const base = stubBase(event, sessionId);
 
   if (type === "system" && asString(event["subtype"], "").trim() === "init") {
     return [{
       type: "system",
       subtype: "init",
-      sessionId: readSessionId(event),
       model: asString(event["model"], "") || null,
-      timestamp,
+      cwd: null,
+      tools: null,
+      permissionMode: null,
+      ...base,
     }];
   }
 
@@ -206,16 +224,23 @@ export function parseGeminiStreamLine(line: string): StreamEvent[] {
       const block = entry as Record<string, unknown>;
       const blockType = asString(block["type"], "");
       if (blockType === "text") {
-        events.push({ type: "assistant", text: asString(block["text"], ""), timestamp });
+        events.push({ type: "assistant", text: asString(block["text"], ""), ...base });
       } else if (blockType === "tool_use") {
-        events.push({ type: "tool_call", callId: asString(block["id"], "") || asString(block["tool_use_id"], "") || undefined, name: asString(block["name"], ""), input: block["input"], timestamp });
+        events.push({
+          type: "tool_call",
+          toolCallId: asString(block["id"], "") || asString(block["tool_use_id"], "") || null,
+          name: asString(block["name"], ""),
+          input: block["input"],
+          ...base,
+        });
       } else if (blockType === "tool_result") {
         events.push({
           type: "tool_result",
-          toolCallId: asString(block["tool_use_id"], ""),
+          toolCallId: asString(block["tool_use_id"], "") || null,
           content: asString(block["content"], ""),
           isError: block["is_error"] === true,
-          timestamp,
+          exitCode: null,
+          ...base,
         });
       }
     }
@@ -226,13 +251,18 @@ export function parseGeminiStreamLine(line: string): StreamEvent[] {
     return [{
       type: "result",
       text: asString(event["result"], ""),
-      cost: typeof event["total_cost_usd"] === "number" ? event["total_cost_usd"] : null,
+      costUsd: typeof event["total_cost_usd"] === "number" ? event["total_cost_usd"] : null,
       isError: event["is_error"] === true,
-      timestamp,
+      stopReason: null,
+      terminalReason: null,
+      numTurns: null,
+      durationMs: null,
+      ...base,
     }];
   }
 
-  return [];
+  // Forward-compat: surface unknown wire events rather than dropping them.
+  return [{ type: "unknown", subtype: type, ...base }];
 }
 
 const GEMINI_AUTH_RE = /(?:not\s+authenticated|api[_ ]?key\s+(?:required|missing|invalid)|authentication\s+required|unauthorized|not\s+logged\s+in|run\s+`?gemini\s+auth)/i;

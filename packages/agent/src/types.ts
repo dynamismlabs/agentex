@@ -127,12 +127,33 @@ export type SessionState =
 // Token usage
 // ---------------------------------------------------------------------------
 
-/** Token usage for a single model within a run. */
+/**
+ * Token usage for a single model within a run.
+ *
+ * `cachedInputTokens` normalizes across providers:
+ * - Claude: `cache_read_input_tokens`
+ * - Codex: `cached_input_tokens`
+ *
+ * `cacheCreationInputTokens` is Claude-specific (`cache_creation_input_tokens`).
+ */
 export interface TokenUsage {
   inputTokens: number;
   outputTokens: number;
   cachedInputTokens?: number;
   cacheCreationInputTokens?: number;
+}
+
+/**
+ * Per-model usage with optional cost + rate-limit-adjacent extras.
+ * Claude populates most fields via its `modelUsage` result payload;
+ * other providers populate only `TokenUsage` fields and leave the rest
+ * undefined.
+ */
+export interface ModelUsage extends TokenUsage {
+  costUsd?: number;
+  webSearchRequests?: number;
+  contextWindow?: number;
+  maxOutputTokens?: number;
 }
 
 /**
@@ -157,6 +178,24 @@ export function aggregateUsage(usage: Record<string, TokenUsage> | undefined): T
   return result;
 }
 
+/**
+ * Rate-limit signal reported by a provider (currently Claude's
+ * `rate_limit_event`). Surfaced both as a StreamEvent and aggregated onto
+ * `ExecutionResult.rateLimits` for consumers that want quota state.
+ */
+export interface RateLimitInfo {
+  /** Provider-reported status, e.g. "allowed" | "rejected". */
+  status: string;
+  /** Kind of limit, e.g. Claude's "five_hour" / "weekly". */
+  limitType: string | null;
+  /** ISO timestamp when the limit window resets, when known. */
+  resetAt: string | null;
+  /** Provider-reported overage state (Claude: "allowed" / null). */
+  overageStatus: string | null;
+  /** Whether the current run is consuming from overage capacity. */
+  isUsingOverage: boolean | null;
+}
+
 // Execution output
 export interface ExecutionResult {
   runId: string;
@@ -168,7 +207,7 @@ export interface ExecutionResult {
   durationMs: number;
   errorMessage: string | null;
   errorCode: string | null;
-  usage?: Record<string, TokenUsage>;
+  usage?: Record<string, ModelUsage>;
   costUsd: number | null;
   model: string | null;
   summary: string | null;
@@ -176,19 +215,147 @@ export interface ExecutionResult {
   sessionDisplayId: string | null;
   clearSession: boolean;
   billingType: "api" | "subscription" | "metered_api" | null;
+
+  // ---- Provider-reported run metadata (populated when the provider reports it) ----
+  /** Why the model stopped (e.g. "end_turn", "max_turns", "tool_use"). Claude only. */
+  stopReason?: string | null;
+  /** CLI's own terminal reason (Claude: "completed" | "error" | ...). Claude only. */
+  terminalReason?: string | null;
+  /** Total turns executed, when the provider reports it. Claude only. */
+  numTurns?: number | null;
+  /** Time spent in model API calls, separate from wall-clock `durationMs`. Claude only. */
+  durationApiMs?: number | null;
+  /** Claude's `permission_denials` array, verbatim. */
+  permissionDenials?: unknown[];
+  /** Every rate-limit signal observed during the run. Claude only. */
+  rateLimits?: RateLimitInfo[];
+
+  /**
+   * True escape hatch. Holds the final provider-native event object
+   * verbatim — Claude's `result` event, or Codex's `turn.completed` /
+   * `turn.failed` / `error`. Use for anything we haven't normalized.
+   */
   raw?: Record<string, unknown> | null;
   /** If the run used a workspace, this contains the workspace handle for diffing/cleanup */
   workspace?: import("./utils/workspace.js").PreparedWorkspace;
 }
 
+/**
+ * Fields present on every `StreamEvent`. Populated per-provider:
+ *
+ * | Field             | Claude                            | Codex                          |
+ * |-------------------|-----------------------------------|--------------------------------|
+ * | sessionId         | `session_id`                      | `thread_id`                    |
+ * | eventId           | top-level `uuid`                  | null (CLI doesn't emit)        |
+ * | messageId         | `message.id` (`msg_*`)            | `item.id` — **turn-local**, resets per turn, not globally unique |
+ * | parentToolCallId  | `parent_tool_use_id`              | null                           |
+ * | providerType      | "claude"                          | "codex"                        |
+ * | raw               | original event object verbatim    | original event object verbatim |
+ *
+ * Other providers (cursor, gemini, opencode, pi, openclaw) currently emit
+ * stubs (null IDs, partial raw). Enriching them is tracked in
+ * `internal-docs/stream-event-enrichment.md`.
+ */
+export interface BaseStreamEventFields {
+  timestamp: string;
+  /** Which provider emitted this event. */
+  providerType: string;
+  /** Stable session/thread ID across turns; null when not yet known. */
+  sessionId: string | null;
+  /**
+   * Provider-native message ID.
+   * - Claude: Anthropic API message ID like `msg_01...`.
+   * - Codex: `item_N` where N resets per turn — NOT globally unique.
+   *   Combine with (sessionId, turn index) if you need a stable key.
+   */
+  messageId: string | null;
+  /**
+   * Unique ID for this specific event line. Claude emits a top-level
+   * `uuid` on every line; Codex doesn't, so this is null for Codex.
+   */
+  eventId: string | null;
+  /**
+   * Native turn identifier for providers that emit one. Turn-scoped
+   * events (items, deltas, token usage, turn completion) share this value.
+   *
+   * - Codex v2 JSON-RPC app-server: native UUIDv7 from `params.turnId`
+   *   (or `params.turn.id` on turn/started + turn/completed notifications).
+   * - Codex legacy NDJSON (`codex exec --json`): null. Legacy emits bare
+   *   `{"type":"turn.started"}` with no turn id.
+   * - Claude: null. `messageId` (`msg_*`) is globally unique so turn
+   *   scope isn't needed to disambiguate rows.
+   *
+   * For Codex v2, `(sessionId, turnId, messageId)` is a stable composite
+   * key. For legacy Codex, `messageId` (`item_N`) is turn-local and will
+   * collide across turns — scope by event insertion order instead.
+   */
+  turnId: string | null;
+  /**
+   * Lineage: the `toolCallId` of the ancestor Task tool_call that spawned
+   * this sub-agent. Same ID namespace as `tool_call.toolCallId`. Null
+   * when the event isn't inside a sub-agent. Claude only.
+   */
+  parentToolCallId: string | null;
+  /** Original provider event object verbatim, for fields we don't normalize. */
+  raw: Record<string, unknown>;
+}
+
 // Stream events — discriminated union
 export type StreamEvent =
-  | { type: "system"; subtype: string; sessionId: string | null; model: string | null; timestamp: string }
-  | { type: "assistant"; text: string; timestamp: string }
-  | { type: "thinking"; text: string; timestamp: string }
-  | { type: "tool_call"; callId?: string; name: string; input: unknown; timestamp: string }
-  | { type: "tool_result"; toolCallId: string; content: string; isError: boolean; timestamp: string }
-  | { type: "result"; text: string; cost: number | null; isError: boolean; timestamp: string };
+  | ({
+      type: "system";
+      subtype: string;
+      model: string | null;
+      cwd: string | null;
+      tools: string[] | null;
+      permissionMode: string | null;
+    } & BaseStreamEventFields)
+  | ({ type: "assistant"; text: string } & BaseStreamEventFields)
+  | ({ type: "thinking"; text: string } & BaseStreamEventFields)
+  | ({
+      type: "tool_call";
+      /** This tool invocation's own ID. Matched later by tool_result.toolCallId. */
+      toolCallId: string | null;
+      name: string;
+      input: unknown;
+    } & BaseStreamEventFields)
+  | ({
+      type: "tool_result";
+      /** FK back to the tool_call.toolCallId this responds to. */
+      toolCallId: string | null;
+      content: string;
+      isError: boolean;
+      /** Exit code for command-execution tools (Codex); null otherwise. */
+      exitCode: number | null;
+    } & BaseStreamEventFields)
+  | ({
+      type: "rate_limit";
+      status: string;
+      limitType: string | null;
+      resetAt: string | null;
+      overageStatus: string | null;
+      isUsingOverage: boolean | null;
+    } & BaseStreamEventFields)
+  | ({
+      type: "result";
+      text: string;
+      costUsd: number | null;
+      isError: boolean;
+      stopReason: string | null;
+      terminalReason: string | null;
+      numTurns: number | null;
+      durationMs: number | null;
+    } & BaseStreamEventFields)
+  /**
+   * Emitted when the parser sees a wire event type it doesn't have a
+   * first-class variant for. Gives consumers forward-compat access to
+   * new provider events via `raw` without requiring a library update.
+   * `subtype` carries the provider's `type` field value.
+   */
+  | ({
+      type: "unknown";
+      subtype: string;
+    } & BaseStreamEventFields);
 
 // Lifecycle events — execution phase tracking
 export type LifecycleEvent =

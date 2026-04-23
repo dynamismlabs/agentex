@@ -83,9 +83,20 @@ export async function executeOpenclawProvider(ctx: ExecutionContext): Promise<Ex
         await ctx.onEvent({
           type: "result",
           text: summary,
-          cost: null,
+          costUsd: null,
           isError: false,
+          stopReason: null,
+          terminalReason: null,
+          numTurns: null,
+          durationMs: null,
           timestamp: new Date().toISOString(),
+          providerType: "openclaw",
+          sessionId: newSessionKey ?? null,
+          messageId: null,
+          eventId: null,
+          turnId: null,
+          parentToolCallId: null,
+          raw: result,
         });
       } catch { /* swallow */ }
     }

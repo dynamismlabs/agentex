@@ -26,7 +26,8 @@ const result = await claude.execute({
   },
   onEvent: (event) => {
     if (event.type === "assistant") process.stdout.write(event.text);
-    if (event.type === "tool_call") console.log(`Tool: ${event.name}`);
+    if (event.type === "tool_call") console.log(`Tool ${event.name} (toolCallId=${event.toolCallId})`);
+    // event.sessionId, event.messageId, event.eventId are populated per-provider
   },
 });
 
@@ -34,7 +35,11 @@ console.log(result.status);     // "completed"
 console.log(result.summary);    // "Added try/catch to all route handlers..."
 console.log(result.durationMs); // 12340
 console.log(result.costUsd);    // 0.0342
-console.log(result.usage);      // { "claude-sonnet-4-6": { inputTokens: 1200, outputTokens: 350, ... } }
+console.log(result.usage);      // { "claude-sonnet-4-6": { inputTokens: 1200, outputTokens: 350, costUsd: 0.0342, ... } }
+console.log(result.stopReason); // "end_turn"
+console.log(result.numTurns);   // 3
+console.log(result.rateLimits); // [{ status: "allowed", ... }]
+console.log(result.raw);        // the final provider-native event, verbatim (escape hatch)
 ```
 
 ## Built-in Providers
@@ -109,7 +114,7 @@ interface ExecutionResult {
   durationMs: number;
   errorMessage: string | null;
   errorCode: string | null;
-  usage?: Record<string, TokenUsage>;  // keyed by model ID
+  usage?: Record<string, ModelUsage>;  // keyed by model ID
   costUsd: number | null;
   model: string | null;
   summary: string | null;
@@ -117,8 +122,40 @@ interface ExecutionResult {
   sessionDisplayId: string | null;
   clearSession: boolean;
   billingType: "api" | "subscription" | "metered_api" | null;
-  raw?: Record<string, unknown> | null;
-  workspace?: PreparedWorkspace;    // Present if config.workspace was set
+
+  // Provider-reported run metadata — populated when the provider emits it.
+  // Claude populates all of these; Codex leaves them undefined/null.
+  stopReason?: string | null;         // "end_turn" | "max_turns" | "tool_use" | ...
+  terminalReason?: string | null;     // CLI's own terminal reason ("completed" | "error" | ...)
+  numTurns?: number | null;
+  durationApiMs?: number | null;      // Time in model API calls, separate from wall clock
+  permissionDenials?: unknown[];      // Claude permission_denials array, verbatim
+  rateLimits?: RateLimitInfo[];       // Rate-limit signals observed during the run
+
+  raw?: Record<string, unknown> | null; // True escape hatch: final provider-native event verbatim
+  workspace?: PreparedWorkspace;       // Present if config.workspace was set
+}
+
+interface TokenUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cachedInputTokens?: number;         // Claude cache_read ∪ Codex cached_input_tokens
+  cacheCreationInputTokens?: number;  // Claude only
+}
+
+interface ModelUsage extends TokenUsage {
+  costUsd?: number;                   // Per-model cost (Claude's modelUsage)
+  webSearchRequests?: number;
+  contextWindow?: number;
+  maxOutputTokens?: number;
+}
+
+interface RateLimitInfo {
+  status: string;                     // "allowed" | "rejected" | ...
+  limitType: string | null;           // "five_hour" | "weekly" | ...
+  resetAt: string | null;             // ISO timestamp when the window resets
+  overageStatus: string | null;
+  isUsingOverage: boolean | null;
 }
 ```
 
@@ -126,16 +163,76 @@ Use `aggregateUsage(result.usage)` to collapse per-model usage into a single tot
 
 ## Stream Events
 
-Emitted during execution via `onEvent`. All events include `timestamp`.
+Emitted during execution via `onEvent`. Every event carries the same normalized ID set on top of its variant-specific fields:
 
-- `system` — Session init (`sessionId`, `model`, `subtype`)
+```typescript
+interface BaseStreamEventFields {
+  timestamp: string;
+  providerType: string;               // "claude" | "codex" | "cursor" | ...
+  sessionId: string | null;           // Stable session/thread ID across turns
+  messageId: string | null;           // Provider-native message ID
+  eventId: string | null;             // Per-event-line ID (Claude only — Codex = null)
+  turnId: string | null;              // Native turn ID (Codex v2 app-server only; NDJSON & Claude = null)
+  parentToolCallId: string | null;    // Sub-agent origin — same namespace as tool_call.toolCallId (Claude only)
+  raw: Record<string, unknown>;       // Original provider event verbatim
+}
+```
+
+Variants:
+
+- `system` — Session init (`subtype`, `model`, `cwd`, `tools`, `permissionMode`)
 - `assistant` — Text output from the agent (`text`)
 - `thinking` — Agent's internal reasoning (`text`)
-- `tool_call` — Agent invoked a tool (`name`, `input`, `callId?`)
-- `tool_result` — Tool returned a result (`toolCallId`, `content`, `isError`)
-- `result` — Final result (`text`, `cost`, `isError`)
+- `tool_call` — Agent invoked a tool (`toolCallId: string | null`, `name`, `input`)
+- `unknown` — Fallback for unrecognized wire events (`subtype` = the provider's `type` field). Forward-compat access to new CLI events via `raw` without a library update.
+- `tool_result` — Tool returned a result (`toolCallId: string | null`, `content`, `isError`, `exitCode: number | null`)
+- `rate_limit` — Provider reported rate-limit state (`status`, `limitType`, `resetAt`, `overageStatus`, `isUsingOverage`)
+- `result` — Final result (`text`, `costUsd`, `isError`, `stopReason`, `terminalReason`, `numTurns`, `durationMs`)
 
 Lifecycle events (via `onLifecycle`) report phases: `preparing`, `spawning`, `running`, `waiting_for_input`, `completed`, `cancelled`, `error`.
+
+### What each provider surfaces on stream events
+
+Verified live against `claude 2.1.116` and `codex-cli 0.122.0` (2026-04-21). Other providers emit stubs — see precedence table at the end of this section.
+
+| Field on `StreamEvent` | Claude source                                      | Codex source                                     |
+| ---------------------- | -------------------------------------------------- | ------------------------------------------------ |
+| `sessionId`            | `session_id` (UUID, stable across turns + resume)  | `thread_id` (UUIDv7, emitted once on `thread.started`, tracked across lines) |
+| `messageId`            | `message.id` (Anthropic API message, e.g. `msg_*`) | v2 app-server: globally unique (`msg_*`, `rs_*`, `call_*`). NDJSON: `item_N` — **turn-local, not globally unique** |
+| `eventId`              | Top-level per-line `uuid`                          | **null** — Codex doesn't emit a per-event ID     |
+| `turnId`               | **null** — Claude doesn't model turns              | v2 app-server: native UUIDv7 from `params.turnId`. NDJSON: **null** — no turn id in legacy format |
+| `parentToolCallId`     | `parent_tool_use_id` (set for sub-agent messages)  | **null** — not emitted                           |
+| Tool correlation       | `tool_use.id` (`toolu_*`) ↔ `tool_result.tool_use_id` | `item.id` reappears on the same item's `item.completed` |
+| `tool_result.exitCode` | **null** (Claude doesn't expose shell exit codes)  | `item.exit_code` for `command_execution`         |
+| Assistant message span | One `message.id` may span multiple event lines (thinking + tool_use emitted separately with distinct `uuid`s) | One `item.completed` per agent message |
+
+On `ExecutionResult`:
+
+| Field              | Claude                                                         | Codex                                                                |
+| ------------------ | -------------------------------------------------------------- | -------------------------------------------------------------------- |
+| `costUsd`          | ✓ `total_cost_usd`                                             | **always null** — Codex JSONL doesn't report cost                    |
+| `usage.*.costUsd`  | ✓ per-model from `modelUsage` payload                          | — not available                                                      |
+| `usage` cache keys | ✓ `cachedInputTokens` + `cacheCreationInputTokens`             | ✓ `cachedInputTokens` only (maps from `cached_input_tokens`)         |
+| `model`            | ✓ from `system.init` / `message.model`                         | **null from stdout** — falls back to the requested model            |
+| `raw.stopReason`   | ✓ `result.stop_reason`                                         | — not emitted                                                        |
+| `raw.terminalReason` | ✓ `result.terminal_reason`                                   | — not emitted                                                        |
+| `raw.numTurns`     | ✓                                                              | — not emitted                                                        |
+| `raw.rateLimits`   | ✓ parsed from `rate_limit_event` events                        | — not emitted                                                        |
+| `raw.permissionDenials` | ✓ `result.permission_denials`                             | — not emitted                                                        |
+| `raw.finalEvent`   | ✓ the `result` event verbatim                                  | ✓ the `turn.completed` / `turn.failed` / `error` event verbatim     |
+| Per-model breakdown | ✓ multiple models can appear — Claude quietly calls haiku alongside the main model for summarization | single requested model only |
+
+### Storing events in a database
+
+For Claude, `eventId` is a safe unique key for a per-event row. `messageId` is a safe key for "one logical assistant message" — multiple event lines can share it when the message contains both thinking and tool_use blocks.
+
+For Codex, `item.id` values like `item_0`, `item_1` **reset every turn** (including on `codex exec resume`). Do not use them as unique keys on their own. Use `(sessionId, turn_index, messageId)` or mint your own UUID at insert time. There is no `eventId` — Codex doesn't emit one.
+
+When in doubt, `raw` is the verbatim provider event — parse it yourself for anything the normalized fields don't cover.
+
+### Other providers
+
+`cursor`, `gemini`, `opencode`, `pi`, `openclaw` emit the same `StreamEvent` shape but currently stub most IDs to `null`. Their `raw` field is populated; enrichment to match the Claude/Codex level of fidelity is tracked separately and has not been audited against live CLI output.
 
 ## Sessions (multi-turn)
 

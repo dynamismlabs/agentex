@@ -1,14 +1,26 @@
-import type { StreamEvent } from "../../types.js";
+import type {
+  BaseStreamEventFields,
+  StreamEvent,
+  TokenUsage,
+} from "../../types.js";
+
+const PROVIDER_TYPE = "codex";
 
 export interface CodexParsedResult {
   sessionId: string | null;
+  /**
+   * Codex doesn't emit `model` in its NDJSON output — always null from
+   * stdout. Executors should fall back to the requested model.
+   */
   model: string | null;
-  usage: { inputTokens: number; outputTokens: number } | null;
+  usage: TokenUsage | null;
   costUsd: number | null;
   summary: string | null;
   isError: boolean;
   errorCode: string | null;
   errorMessage: string | null;
+  /** Final `turn.completed` / `turn.failed` / `error` event verbatim. */
+  finalEvent: Record<string, unknown> | null;
 }
 
 function parseJson(line: string): Record<string, unknown> | null {
@@ -27,8 +39,16 @@ function asString(value: unknown, fallback: string): string {
   return typeof value === "string" ? value : fallback;
 }
 
+function asNullableString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
 function asNumber(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function asNullableNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 function parseObject(value: unknown): Record<string, unknown> {
@@ -38,16 +58,45 @@ function parseObject(value: unknown): Record<string, unknown> {
   return {};
 }
 
+/**
+ * Build base fields. For Codex, `eventId` is always null (neither wire
+ * format emits a per-line UUID). `sessionId` and `turnId` come from the
+ * caller — the v2 parser extracts them from the event's `params`; the
+ * NDJSON parser tracks sessionId across lines and leaves turnId null.
+ */
+function baseFields(
+  event: Record<string, unknown>,
+  sessionId: string | null,
+  messageId: string | null,
+  turnId: string | null,
+): BaseStreamEventFields {
+  return {
+    timestamp: new Date().toISOString(),
+    providerType: PROVIDER_TYPE,
+    sessionId,
+    messageId,
+    eventId: null,
+    turnId,
+    parentToolCallId: null,
+    raw: event,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Run-level parser used by executeCodexProvider to summarize a full stdout.
+// Operates on NDJSON only (executor uses `codex exec --json`).
+// ---------------------------------------------------------------------------
+
 export function parseCodexJsonl(stdout: string): CodexParsedResult {
   let sessionId: string | null = null;
-  let model: string | null = null;
   let totalInputTokens = 0;
   let totalOutputTokens = 0;
+  let totalCachedInputTokens = 0;
   let hasUsage = false;
   let summary: string | null = null;
   let isError = false;
-  let errorCode: string | null = null;
   let errorMessage: string | null = null;
+  let finalEvent: Record<string, unknown> | null = null;
 
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
@@ -58,19 +107,17 @@ export function parseCodexJsonl(stdout: string): CodexParsedResult {
     const type = asString(event["type"], "");
 
     if (type === "thread.started") {
-      sessionId = asString(event["thread_id"], "") || sessionId;
+      sessionId = asNullableString(event["thread_id"]) ?? sessionId;
       continue;
     }
 
     if (type === "item.completed") {
       const item = parseObject(event["item"]);
       if (asString(item["type"], "") === "agent_message") {
-        // Direct text field (Codex 0.30+)
         const directText = asString(item["text"], "");
         if (directText) {
           summary = directText;
         } else {
-          // Fallback: content array with output_text blocks
           const content = Array.isArray(item["content"]) ? item["content"] : [];
           for (const entry of content) {
             if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
@@ -89,76 +136,353 @@ export function parseCodexJsonl(stdout: string): CodexParsedResult {
       const usage = parseObject(event["usage"]);
       const inputTokens = asNumber(usage["input_tokens"], 0);
       const outputTokens = asNumber(usage["output_tokens"], 0);
-      if (inputTokens > 0 || outputTokens > 0) {
+      const cachedInputTokens = asNumber(usage["cached_input_tokens"], 0);
+      if (inputTokens > 0 || outputTokens > 0 || cachedInputTokens > 0) {
         totalInputTokens += inputTokens;
         totalOutputTokens += outputTokens;
+        totalCachedInputTokens += cachedInputTokens;
         hasUsage = true;
       }
-      model = asString(event["model"], "") || model;
+      finalEvent = event;
       continue;
     }
 
     if (type === "turn.failed") {
       isError = true;
-      errorMessage = asString(event["message"], "") || asString(event["error"], "") || null;
+      errorMessage = asNullableString(event["message"]) ?? asNullableString(event["error"]);
+      finalEvent = event;
       continue;
     }
 
     if (type === "error") {
       isError = true;
-      errorMessage = asString(event["message"], "") || null;
+      errorMessage = asNullableString(event["message"]);
+      finalEvent = event;
       continue;
     }
   }
 
+  const usage: TokenUsage | null = hasUsage ? {
+    inputTokens: totalInputTokens,
+    outputTokens: totalOutputTokens,
+    ...(totalCachedInputTokens > 0 ? { cachedInputTokens: totalCachedInputTokens } : {}),
+  } : null;
+
   return {
     sessionId,
-    model,
-    usage: hasUsage ? { inputTokens: totalInputTokens, outputTokens: totalOutputTokens } : null,
-    costUsd: null, // Codex JSONL doesn't report cost
+    model: null,
+    usage,
+    costUsd: null, // Codex doesn't report cost
     summary,
     isError,
-    errorCode,
+    errorCode: null,
     errorMessage,
+    finalEvent,
   };
 }
 
-export function parseCodexStreamLine(line: string): StreamEvent | null {
+// ---------------------------------------------------------------------------
+// Stream-line parser. Auto-detects wire format:
+//  - `codex exec --json` NDJSON: `{"type":"...","...": ...}`
+//  - `codex --json` v2 JSON-RPC: `{"jsonrpc":"2.0","method":"...","params":{...}}`
+// Both shapes produce the same StreamEvent variants so downstream
+// consumers don't branch on format.
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse a single Codex line into a StreamEvent.
+ *
+ * @param line   Raw JSON text.
+ * @param sessionId  Caller-tracked thread id (NDJSON emits it once on
+ *                   `thread.started` and the executor threads it through).
+ *                   v2 parses it from `params.threadId` directly and
+ *                   ignores this arg.
+ */
+export function parseCodexStreamLine(
+  line: string,
+  sessionId: string | null = null,
+): StreamEvent | null {
   const event = parseJson(line);
   if (!event) return null;
 
-  const type = asString(event["type"], "");
-  const timestamp = new Date().toISOString();
+  // v2 JSON-RPC notification: has `method` + `params`.
+  if (typeof event["method"] === "string") {
+    return parseV2Notification(event);
+  }
 
-  if (type === "thread.started") {
+  // NDJSON legacy format: has `type`.
+  return parseNdjsonEvent(event, sessionId);
+}
+
+// ---------------------------------------------------------------------------
+// v2 JSON-RPC notifications (codex --json app-server mode)
+// ---------------------------------------------------------------------------
+
+function parseV2Notification(event: Record<string, unknown>): StreamEvent | null {
+  const method = asString(event["method"], "");
+  const params = parseObject(event["params"]);
+
+  // Extract thread + turn scope. Most notifications carry threadId at the
+  // top of params; thread/started nests it under thread.id.
+  const thread = parseObject(params["thread"]);
+  const threadId =
+    asNullableString(params["threadId"]) ??
+    asNullableString(thread["id"]);
+
+  // turn/started + turn/completed nest the turn object; everything else
+  // puts turnId at the top of params.
+  const turn = parseObject(params["turn"]);
+  const turnId =
+    asNullableString(params["turnId"]) ??
+    asNullableString(turn["id"]);
+
+  const makeBase = (messageId: string | null) =>
+    baseFields(event, threadId, messageId, turnId);
+
+  // ---- Thread lifecycle ----
+
+  if (method === "thread/started") {
     return {
       type: "system",
       subtype: "init",
-      sessionId: asString(event["thread_id"], "") || null,
       model: null,
-      timestamp,
+      cwd: asNullableString(thread["cwd"]),
+      tools: null,
+      permissionMode: null,
+      ...makeBase(null),
+    };
+  }
+
+  // ---- Turn lifecycle ----
+
+  if (method === "turn/started") {
+    // Lifecycle marker; items will follow. Skip to reduce noise.
+    return null;
+  }
+
+  if (method === "turn/completed") {
+    return {
+      type: "result",
+      text: "",
+      costUsd: null,
+      isError: false,
+      stopReason: null,
+      terminalReason: asNullableString(turn["status"]),
+      numTurns: null,
+      durationMs: asNullableNumber(turn["durationMs"]),
+      ...makeBase(null),
+    };
+  }
+
+  if (method === "turn/failed") {
+    return {
+      type: "result",
+      text: asString(params["message"], ""),
+      costUsd: null,
+      isError: true,
+      stopReason: null,
+      terminalReason: asNullableString(turn["status"]),
+      numTurns: null,
+      durationMs: asNullableNumber(turn["durationMs"]),
+      ...makeBase(null),
+    };
+  }
+
+  // ---- Item lifecycle ----
+
+  if (method === "item/started" || method === "item/completed") {
+    const item = parseObject(params["item"]);
+    const itemType = asString(item["type"], "");
+    const itemId =
+      asNullableString(item["id"]) ??
+      asNullableString(item["call_id"]);
+    const base = makeBase(itemId);
+
+    // Tool starts — emit tool_call on item/started only.
+    if (method === "item/started") {
+      if (itemType === "command_execution") {
+        return {
+          type: "tool_call",
+          toolCallId: itemId,
+          name: "command_execution",
+          input: asString(item["command"], ""),
+          ...base,
+        };
+      }
+      if (itemType === "function_call") {
+        return {
+          type: "tool_call",
+          toolCallId: itemId,
+          name: asString(item["name"], "function_call"),
+          input: item["arguments"] ?? item["input"] ?? "",
+          ...base,
+        };
+      }
+      // reasoning, agentMessage, userMessage — wait for item/completed.
+      return null;
+    }
+
+    // item/completed — emit the terminal event for each item type.
+    if (itemType === "command_execution") {
+      const exitCode = asNullableNumber(item["exit_code"]);
+      return {
+        type: "tool_result",
+        toolCallId: itemId,
+        content: asString(item["aggregated_output"], ""),
+        isError: exitCode !== null && exitCode !== 0,
+        exitCode,
+        ...base,
+      };
+    }
+    if (itemType === "function_call") {
+      const output = item["output"] ?? item["result"] ?? "";
+      return {
+        type: "tool_result",
+        toolCallId: itemId,
+        content: typeof output === "string" ? output : JSON.stringify(output),
+        isError: item["status"] === "failed",
+        exitCode: null,
+        ...base,
+      };
+    }
+    if (itemType === "agentMessage") {
+      const directText = asString(item["text"], "");
+      if (directText || directText === "") {
+        return {
+          type: "assistant",
+          text: directText,
+          ...base,
+        };
+      }
+    }
+    if (itemType === "reasoning") {
+      // Reasoning content may be empty / encrypted out-of-band — consumers
+      // that need the raw payload read it from `raw`.
+      const text =
+        asString(item["text"], "") ||
+        extractReasoningText(item);
+      return {
+        type: "thinking",
+        text,
+        ...base,
+      };
+    }
+    if (itemType === "userMessage") {
+      // Consumer persists user input on the write path before calling send().
+      // We don't re-emit it here to keep a single source of truth.
+      return null;
+    }
+    // Unknown item type — surface as unknown.
+    return {
+      type: "unknown",
+      subtype: `item/completed:${itemType}`,
+      ...base,
+    };
+  }
+
+  // ---- Streaming deltas: block-level only for v1; skip token deltas. ----
+
+  if (method === "item/agentMessage/delta" || method === "item/reasoning/delta") {
+    return null;
+  }
+
+  // ---- Rate limits ----
+
+  if (method === "account/rateLimits/updated") {
+    const rateLimits = parseObject(params["rateLimits"]);
+    const primary = parseObject(rateLimits["primary"]);
+    const usedPercent = asNullableNumber(primary["usedPercent"]);
+    return {
+      type: "rate_limit",
+      status: usedPercent !== null && usedPercent >= 100 ? "rejected" : "allowed",
+      limitType: asNullableString(rateLimits["limitId"]),
+      resetAt: null,
+      overageStatus: null,
+      isUsingOverage: null,
+      ...makeBase(null),
+    };
+  }
+
+  // ---- Pure telemetry / status ----
+
+  if (
+    method === "thread/tokenUsage/updated" ||
+    method === "thread/status/changed" ||
+    method === "mcpServer/startupStatus/updated"
+  ) {
+    return null;
+  }
+
+  // ---- Forward-compat: unknown method ----
+
+  return {
+    type: "unknown",
+    subtype: method,
+    ...makeBase(null),
+  };
+}
+
+function extractReasoningText(item: Record<string, unknown>): string {
+  // Codex reasoning items carry summary and content arrays. Concatenate
+  // any visible text fragments for display; fall back to "" if all empty
+  // or encrypted.
+  const parts: string[] = [];
+  for (const key of ["summary", "content"]) {
+    const arr = Array.isArray(item[key]) ? (item[key] as unknown[]) : [];
+    for (const entry of arr) {
+      if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
+      const block = entry as Record<string, unknown>;
+      const text = asString(block["text"], "");
+      if (text) parts.push(text);
+    }
+  }
+  return parts.join("\n").trim();
+}
+
+// ---------------------------------------------------------------------------
+// NDJSON format (codex exec --json)
+// ---------------------------------------------------------------------------
+
+function parseNdjsonEvent(
+  event: Record<string, unknown>,
+  sessionId: string | null,
+): StreamEvent | null {
+  const type = asString(event["type"], "");
+
+  if (type === "thread.started") {
+    const threadId = asNullableString(event["thread_id"]);
+    return {
+      type: "system",
+      subtype: "init",
+      model: null,
+      cwd: null,
+      tools: null,
+      permissionMode: null,
+      ...baseFields(event, threadId, null, null),
     };
   }
 
   if (type === "item.started") {
     const item = parseObject(event["item"]);
     const itemType = asString(item["type"], "");
+    const itemId = asNullableString(item["id"]) ?? asNullableString(item["call_id"]);
+    const base = baseFields(event, sessionId, itemId, null);
     if (itemType === "command_execution") {
       return {
         type: "tool_call",
-        callId: asString(item["id"], "") || undefined,
+        toolCallId: itemId,
         name: "command_execution",
         input: asString(item["command"], ""),
-        timestamp,
+        ...base,
       };
     }
     if (itemType === "function_call") {
       return {
         type: "tool_call",
-        callId: asString(item["id"], "") || asString(item["call_id"], "") || undefined,
+        toolCallId: itemId,
         name: asString(item["name"], "function_call"),
         input: item["arguments"] ?? item["input"] ?? "",
-        timestamp,
+        ...base,
       };
     }
   }
@@ -166,41 +490,59 @@ export function parseCodexStreamLine(line: string): StreamEvent | null {
   if (type === "item.completed") {
     const item = parseObject(event["item"]);
     const itemType = asString(item["type"], "");
+    const itemId = asNullableString(item["id"]) ?? asNullableString(item["call_id"]);
+    const base = baseFields(event, sessionId, itemId, null);
     if (itemType === "command_execution") {
-      const exitCode = typeof item["exit_code"] === "number" ? item["exit_code"] : null;
+      const exitCode = asNullableNumber(item["exit_code"]);
       return {
         type: "tool_result",
-        toolCallId: asString(item["id"], ""),
+        toolCallId: itemId,
         content: asString(item["aggregated_output"], ""),
         isError: exitCode !== null && exitCode !== 0,
-        timestamp,
+        exitCode,
+        ...base,
       };
     }
     if (itemType === "function_call") {
       const output = item["output"] ?? item["result"] ?? "";
       return {
         type: "tool_result",
-        toolCallId: asString(item["id"], "") || asString(item["call_id"], ""),
+        toolCallId: itemId,
         content: typeof output === "string" ? output : JSON.stringify(output),
         isError: item["status"] === "failed",
-        timestamp,
+        exitCode: null,
+        ...base,
       };
     }
     if (itemType === "agent_message") {
-      // Direct text field (Codex 0.30+)
       const directText = asString(item["text"], "");
       if (directText) {
-        return { type: "assistant", text: directText, timestamp };
+        return {
+          type: "assistant",
+          text: directText,
+          ...base,
+        };
       }
-      // Fallback: content array with output_text blocks
       const content = Array.isArray(item["content"]) ? item["content"] : [];
       for (const entry of content) {
         if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
         const block = entry as Record<string, unknown>;
         if (asString(block["type"], "") === "output_text") {
-          return { type: "assistant", text: asString(block["text"], ""), timestamp };
+          return {
+            type: "assistant",
+            text: asString(block["text"], ""),
+            ...base,
+          };
         }
       }
+    }
+    if (itemType === "reasoning") {
+      const text = asString(item["text"], "") || extractReasoningText(item);
+      return {
+        type: "thinking",
+        text,
+        ...base,
+      };
     }
   }
 
@@ -208,9 +550,13 @@ export function parseCodexStreamLine(line: string): StreamEvent | null {
     return {
       type: "result",
       text: "",
-      cost: null,
+      costUsd: null,
       isError: false,
-      timestamp,
+      stopReason: null,
+      terminalReason: null,
+      numTurns: null,
+      durationMs: null,
+      ...baseFields(event, sessionId, null, null),
     };
   }
 
@@ -218,14 +564,27 @@ export function parseCodexStreamLine(line: string): StreamEvent | null {
     return {
       type: "result",
       text: asString(event["message"], ""),
-      cost: null,
+      costUsd: null,
       isError: true,
-      timestamp,
+      stopReason: null,
+      terminalReason: null,
+      numTurns: null,
+      durationMs: null,
+      ...baseFields(event, sessionId, null, null),
     };
   }
 
-  return null;
+  // Forward-compat: surface unknown event types.
+  return {
+    type: "unknown",
+    subtype: type,
+    ...baseFields(event, sessionId, null, null),
+  };
 }
+
+// ---------------------------------------------------------------------------
+// Error detection utilities (unchanged)
+// ---------------------------------------------------------------------------
 
 const CODEX_ROLLOUT_NOISE_RE =
   /^\d{4}-\d{2}-\d{2}T\S+\s+ERROR\s+codex_core::rollout::list:/i;

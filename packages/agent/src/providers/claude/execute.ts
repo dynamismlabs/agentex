@@ -227,13 +227,7 @@ export async function executeClaudeProvider(ctx: ExecutionContext): Promise<Exec
       durationMs: new Date(completedAt).getTime() - new Date(startedAt).getTime(),
       errorMessage,
       errorCode,
-      usage: parsed.usage && resolvedModel
-        ? { [resolvedModel]: {
-            inputTokens: parsed.usage.inputTokens,
-            outputTokens: parsed.usage.outputTokens,
-            cachedInputTokens: parsed.usage.cachedInputTokens,
-          } }
-        : undefined,
+      usage: parsed.modelUsage ?? undefined,
       costUsd: parsed.costUsd,
       model: resolvedModel,
       summary: parsed.summary,
@@ -241,7 +235,13 @@ export async function executeClaudeProvider(ctx: ExecutionContext): Promise<Exec
       sessionDisplayId: resolvedSessionId,
       clearSession,
       billingType,
-      raw: null,
+      stopReason: parsed.stopReason,
+      terminalReason: parsed.terminalReason,
+      numTurns: parsed.numTurns,
+      durationApiMs: parsed.durationApiMs,
+      permissionDenials: parsed.permissionDenials ?? undefined,
+      rateLimits: parsed.rateLimits.length > 0 ? parsed.rateLimits : undefined,
+      raw: parsed.finalEvent,
       workspace,
     };
   } finally {

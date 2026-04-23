@@ -562,9 +562,20 @@ class CodexSessionImpl implements AgentSession {
         void this.ctx.onEvent({
           type: "result",
           text: this._turnSummary ?? "",
-          cost: null,
+          costUsd: null,
           isError: this._turnIsError,
+          stopReason: null,
+          terminalReason: null,
+          numTurns: null,
+          durationMs: null,
           timestamp: new Date().toISOString(),
+          providerType: "codex",
+          sessionId: this._threadId,
+          messageId: null,
+          eventId: null,
+          turnId: null,
+          parentToolCallId: null,
+          raw: params,
         });
       } catch { /* swallow */ }
     }
@@ -615,7 +626,10 @@ class CodexSessionImpl implements AgentSession {
 
   private emitStreamEvent(rawLine: string): void {
     if (!this.ctx.onEvent) return;
-    const event = parseCodexStreamLine(rawLine);
+    // Pass current threadId so NDJSON-shaped events (via codex/event wrapper)
+    // carry sessionId. v2 notifications parse threadId from params directly
+    // and ignore this arg.
+    const event = parseCodexStreamLine(rawLine, this._threadId);
     if (event) {
       try { void this.ctx.onEvent(event); } catch { /* swallow */ }
     }

@@ -110,7 +110,7 @@ describe("parseOpenCodeStreamLine", () => {
     const event = parseOpenCodeStreamLine(line);
     expect(event).not.toBeNull();
     if (event?.type === "tool_call") {
-      expect(event.callId).toBe("oc-tu-001");
+      expect(event.toolCallId).toBe("oc-tu-001");
       expect(event.name).toBe("bash");
     }
   });
@@ -128,7 +128,7 @@ describe("parseOpenCodeStreamLine", () => {
     const event = parseOpenCodeStreamLine(line);
     expect(event).not.toBeNull();
     if (event?.type === "tool_call") {
-      expect(event.callId).toBe("oc-tuid-002");
+      expect(event.toolCallId).toBe("oc-tuid-002");
     }
   });
 
@@ -193,9 +193,14 @@ describe("parseOpenCodeStreamLine", () => {
     }
   });
 
-  it("returns null for unknown/malformed", () => {
+  it("returns null for malformed; `unknown` variant for unrecognized types", () => {
     expect(parseOpenCodeStreamLine("not json")).toBeNull();
-    expect(parseOpenCodeStreamLine(JSON.stringify({ type: "unknown_event" }))).toBeNull();
+    const unknown = parseOpenCodeStreamLine(JSON.stringify({ type: "unknown_event" }));
+    expect(unknown).not.toBeNull();
+    expect(unknown!.type).toBe("unknown");
+    if (unknown?.type === "unknown") {
+      expect(unknown.subtype).toBe("unknown_event");
+    }
   });
 });
 
