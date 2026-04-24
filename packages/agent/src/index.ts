@@ -23,6 +23,7 @@ export { withTempConfig } from "./utils/runtime-config.js";
 export type { TempConfigResult, TempConfigOptions } from "./utils/runtime-config.js";
 export { executeAll } from "./utils/execute-all.js";
 export type { ExecuteAllOptions, ExecuteAllTask } from "./utils/execute-all.js";
+export { getClaudeUnknownDetails } from "./providers/claude/parse.js";
 
 // Skills
 export {

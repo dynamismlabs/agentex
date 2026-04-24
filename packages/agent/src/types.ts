@@ -350,7 +350,21 @@ export type StreamEvent =
    * Emitted when the parser sees a wire event type it doesn't have a
    * first-class variant for. Gives consumers forward-compat access to
    * new provider events via `raw` without requiring a library update.
-   * `subtype` carries the provider's `type` field value.
+   * `subtype` carries the provider's outer `type` field value.
+   *
+   * Provider-native discriminators and payloads remain in `raw` — the
+   * event shape is intentionally minimal here because we do not model
+   * these events. Known locations:
+   * - Claude: `raw.subtype` (inner discriminator, e.g. `away_summary`,
+   *   `compact_boundary`, `turn_duration`), `raw.content` (payload text
+   *   when present).
+   * - Codex: `raw.method` (JSON-RPC method), or nested `raw.item.type`
+   *   for `item/completed` events whose item type is unrecognized.
+   * - Cursor / Gemini / OpenCode / Pi: `raw.type` mirrors `subtype`;
+   *   payload fields vary per wire event.
+   *
+   * For Claude specifically, see `getClaudeUnknownDetails` in
+   * `providers/claude/parse.ts` for an ergonomic accessor.
    */
   | ({
       type: "unknown";

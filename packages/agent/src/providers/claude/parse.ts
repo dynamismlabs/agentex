@@ -381,6 +381,31 @@ export function isClaudeAuthRequired(stdout: string, stderr: string): boolean {
   return CLAUDE_AUTH_REQUIRED_RE.test(stdout) || CLAUDE_AUTH_REQUIRED_RE.test(stderr);
 }
 
+/**
+ * Pulls Claude's inner discriminator and payload out of an `unknown`
+ * StreamEvent's `raw`. Returns null for non-Claude events, non-unknown
+ * events, or events whose `raw` is not an object.
+ *
+ * This is opt-in ergonomics — consumers who want to dispatch on Claude's
+ * `system` subtypes (`away_summary`, `compact_boundary`, `turn_duration`,
+ * `api_error`, `bridge_status`, etc.) can use this instead of reaching
+ * into `event.raw` directly. `content` is returned as `unknown` to avoid
+ * silently coercing non-string or object payloads.
+ */
+export function getClaudeUnknownDetails(
+  event: StreamEvent,
+): { subtype: string | null; content: unknown } | null {
+  if (event.type !== "unknown") return null;
+  if (event.providerType !== "claude") return null;
+  const raw = event.raw;
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  return {
+    subtype: asNullableString(r["subtype"]),
+    content: r["content"],
+  };
+}
+
 export function isClaudeMaxTurns(stdout: string): boolean {
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
