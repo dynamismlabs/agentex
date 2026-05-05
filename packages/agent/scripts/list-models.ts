@@ -1,7 +1,7 @@
 /**
  * Probe each provider CLI for a non-interactive model-listing subcommand.
  *
- * None of the Claude / Codex / Gemini CLIs currently expose one, so agex
+ * None of the Claude / Codex / Gemini CLIs currently expose one, so agentex
  * does NOT implement listModels() for any provider — the library refuses
  * to return curated fake data. This script re-runs the probes so we know
  * when a CLI ships a real subcommand and we can wire it up.
@@ -26,7 +26,7 @@ const PROBES: Record<string, { bin: string; args: string[] }[]> = {
     { bin: "gemini", args: ["--list-models"] },
   ],
   cursor: [
-    { bin: "agent", args: ["models"] },
+    { bin: "agentex", args: ["models"] },
   ],
   opencode: [
     { bin: "opencode", args: ["models"] },
@@ -82,7 +82,7 @@ async function main() {
 
   console.log(
     "Probing provider CLIs for model-listing subcommands.\n" +
-      "agex does not ship listModels() anywhere, because none of these commands work today.\n",
+      "agentex does not ship listModels() anywhere, because none of these commands work today.\n",
   );
 
   for (const name of targets) {

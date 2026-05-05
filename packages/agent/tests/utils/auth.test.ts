@@ -108,7 +108,7 @@ describe("resolveAuthForProvider", () => {
 
   beforeEach(async () => {
     clearAuthCache();
-    tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "agex-auth-test-"));
+    tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "agentex-auth-test-"));
     // Point each provider's home override at a clean empty dir so filesystem
     // fallback checks start from a known state.
     process.env.CODEX_HOME = path.join(tmpHome, "codex");

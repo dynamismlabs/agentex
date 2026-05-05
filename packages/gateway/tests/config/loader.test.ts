@@ -125,14 +125,14 @@ stateDir: /var/agentex
 
     beforeEach(() => {
       savedEnv = { ...process.env };
-      process.env["AGEX_GATEWAY_TOKEN"] = "test-token-123";
-      process.env["AGEX_PROVIDER"] = "claude";
-      process.env["AGEX_CWD"] = "/env/project";
+      process.env["AGENTEX_GATEWAY_TOKEN"] = "test-token-123";
+      process.env["AGENTEX_PROVIDER"] = "claude";
+      process.env["AGENTEX_CWD"] = "/env/project";
     });
 
     afterEach(() => {
       // Restore original env
-      for (const key of ["AGEX_GATEWAY_TOKEN", "AGEX_PROVIDER", "AGEX_CWD"]) {
+      for (const key of ["AGENTEX_GATEWAY_TOKEN", "AGENTEX_PROVIDER", "AGENTEX_CWD"]) {
         if (savedEnv[key] === undefined) {
           delete process.env[key];
         } else {
@@ -147,10 +147,10 @@ stateDir: /var/agentex
         `
 gateway:
   auth:
-    token: $AGEX_GATEWAY_TOKEN
+    token: $AGENTEX_GATEWAY_TOKEN
 agent:
-  provider: $AGEX_PROVIDER
-  cwd: $AGEX_CWD
+  provider: $AGENTEX_PROVIDER
+  cwd: $AGENTEX_CWD
 `,
       );
 
@@ -166,7 +166,7 @@ agent:
         `
 gateway:
   auth:
-    token: "\${AGEX_GATEWAY_TOKEN}"
+    token: "\${AGENTEX_GATEWAY_TOKEN}"
 agent:
   provider: claude
   cwd: /tmp

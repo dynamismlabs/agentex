@@ -29,7 +29,7 @@ describe("resolveInstructions", () => {
   });
 
   it("returns file content when file exists", async () => {
-    const tmpFile = path.join(os.tmpdir(), `agex-test-instructions-${Date.now()}.txt`);
+    const tmpFile = path.join(os.tmpdir(), `agentex-test-instructions-${Date.now()}.txt`);
     tempFiles.push(tmpFile);
     await fs.writeFile(tmpFile, "You are a helpful assistant.", "utf-8");
 
@@ -38,7 +38,7 @@ describe("resolveInstructions", () => {
   });
 
   it("throws a clear error when file does not exist (ENOENT)", async () => {
-    const missing = path.join(os.tmpdir(), `agex-nonexistent-${Date.now()}.txt`);
+    const missing = path.join(os.tmpdir(), `agentex-nonexistent-${Date.now()}.txt`);
     await expect(resolveInstructions(missing)).rejects.toThrow(
       `Instructions file not found: ${missing}`,
     );
@@ -46,7 +46,7 @@ describe("resolveInstructions", () => {
 
   it("re-throws non-ENOENT errors", async () => {
     // Reading a directory as a file triggers EISDIR on most platforms
-    const tmpDir = path.join(os.tmpdir(), `agex-test-dir-${Date.now()}`);
+    const tmpDir = path.join(os.tmpdir(), `agentex-test-dir-${Date.now()}`);
     await fs.mkdir(tmpDir, { recursive: true });
     tempFiles.push(tmpDir); // cleanup won't unlink a dir, but that's fine
 

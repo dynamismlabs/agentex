@@ -22,7 +22,7 @@ mkdirSync(workspaceDir, { recursive: true });
 const provider = getProvider("claude");
 
 if (!provider.createSession) {
-  console.error("Claude provider does not support createSession — update your agex version.");
+  console.error("Claude provider does not support createSession — update your agentex version.");
   process.exit(1);
 }
 
@@ -62,7 +62,7 @@ try {
   // Turn 1: Create a file
   console.log("[Turn 1] Creating a file...\n");
   const r1 = await session.send(
-    "Create a file called hello.ts with a function that returns 'Hello from agex!'"
+    "Create a file called hello.ts with a function that returns 'Hello from agentex!'"
   );
   logTurn("Create file", r1);
 

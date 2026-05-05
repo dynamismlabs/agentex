@@ -318,7 +318,7 @@ class ClaudeSessionImpl implements AgentSession {
       return;
     }
 
-    // Stream events — forward via onEvent and parse for agex StreamEvent
+    // Stream events — forward via onEvent and parse for agentex StreamEvent
     this.handleStreamMessage(msg, line);
   }
 

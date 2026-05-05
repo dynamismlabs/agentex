@@ -507,7 +507,7 @@ export type { QuotaStatus, QuotaContext } from "./types.js";
 A worktree creates a second checkout of a repo in a separate directory, on its own branch, sharing the same `.git` database. Files are independent (agents can edit without conflicts), but git history is shared (you can diff, merge, create PRs).
 
 ```
-/Users/trey/myrepo/              ← main worktree (branch: main)
+/Users/you/myrepo/               ← main worktree (branch: main)
   .git/                           ← THE git database
   src/
 
@@ -727,7 +727,7 @@ This is needed for SessionState tracking (section O) — correlating results to 
 **Context — How Multica does it:**
 
 ```
-# Current agex approach (limited)
+# Current agentex approach (limited)
 codex exec --json --dangerously-bypass-approvals-and-sandbox <prompt>
 
 # Multica approach (full bidirectional)
@@ -858,7 +858,7 @@ await session.close();
 
 ## M. Codex Token Usage from Session Logs
 
-**Problem:** Codex execution frequently returns no token usage data through its primary protocol. Multica falls back to scanning Codex session log files on disk. Agex always returns `costUsd: null` for Codex.
+**Problem:** Codex execution frequently returns no token usage data through its primary protocol. Multica falls back to scanning Codex session log files on disk. Agentex always returns `costUsd: null` for Codex.
 
 ### New File
 
