@@ -13,6 +13,7 @@ export const piProvider: ProviderModule = {
     skills: true,
     instructions: true,
     workspace: true,
+    planMode: false,
   },
   execute: executePiProvider,
   resolveAuth: (ctx) => resolveAuthForProvider("pi", ctx),

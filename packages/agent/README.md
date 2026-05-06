@@ -96,7 +96,8 @@ interface ProviderConfig {
   search?: boolean;
   sandbox?: boolean;
   thinking?: string;
-  mode?: string;
+  mode?: string;                    // cursor: --mode <mode>; not for plan mode
+  planMode?: boolean;               // read-only "plan" mode (claude/codex)
   workspace?: { strategy: "worktree"; baseBranch?: string; branchName?: string };
 }
 ```
@@ -187,6 +188,7 @@ Variants:
 - `unknown` — Fallback for unrecognized wire events (`subtype` = the provider's `type` field). Forward-compat access to new CLI events via `raw` without a library update.
 - `tool_result` — Tool returned a result (`toolCallId: string | null`, `content`, `isError`, `exitCode: number | null`)
 - `rate_limit` — Provider reported rate-limit state (`status`, `limitType`, `resetAt`, `overageStatus`, `isUsingOverage`)
+- `permission_mode` — Permission mode change mid-session (`permissionMode: string`). Claude only, e.g., when the user accepts a plan and the session leaves `plan` mode.
 - `result` — Final result (`text`, `costUsd`, `isError`, `stopReason`, `terminalReason`, `numTurns`, `durationMs`)
 
 Lifecycle events (via `onLifecycle`) report phases: `preparing`, `spawning`, `running`, `waiting_for_input`, `completed`, `cancelled`, `error`.
@@ -259,6 +261,70 @@ await session.close();
 ```
 
 `session.send()` returns a `TurnResult` with `summary`, `usage`, `costUsd`, and a `status` of `completed | failed | max_turns | max_budget | aborted`. Handle elicitations (MCP forms), hook callbacks, and interrupts through the corresponding `SessionContext` callbacks.
+
+## Plan Mode
+
+Run an agent in read-only "plan" mode — it investigates and proposes a plan but cannot edit files or run mutating commands. Same goal in both providers, **different mechanism** in each. Check `provider.capabilities.planMode` before relying on it.
+
+```typescript
+import { getProvider, parseExitPlanMode } from "@agentex/agent";
+
+const claude = getProvider("claude");
+
+// 1. Plan run — agent investigates and proposes a plan
+const planRun = await claude.execute({
+  prompt: "Plan how to add OAuth to the auth middleware.",
+  config: { planMode: true },
+});
+
+// 2. Resume in execute mode after the user approves the plan
+const executeRun = await claude.execute({
+  prompt: "Approved. Implement the plan.",
+  sessionParams: planRun.sessionParams,   // resume the same session
+  config: { planMode: false },             // now allowed to mutate
+});
+```
+
+### How each provider implements plan mode
+
+| Provider | What we wire                                                         | Where the plan shows up                                                                                       |
+| -------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `claude` | `--permission-mode plan` (CLI-native plan UX)                        | Agent calls the `ExitPlanMode` tool with the plan as a permission request. Host extracts via `parseExitPlanMode(req)` from `onUserInputRequest`. The plan is **not** in the persisted transcript — capture it live. |
+| `codex`  | `--sandbox read-only` **plus** an injected planning system preamble  | Plain text in the agent's final assistant message (i.e. `result.summary`). |
+
+The mechanism difference matters:
+
+- **Claude** has a deliberate plan-mode UX baked into the CLI: `--permission-mode plan` activates a planning system prompt and wires up the `ExitPlanMode` tool that the host can gate on via `onUserInputRequest`. We pass the flag through and surface the structured plan via `parseExitPlanMode(req)`.
+
+- **Codex** *does* have a native plan mode (one of three collaboration modes — Plan, Pair, Execute — toggled with `/plan` or **Shift+Tab** in the TUI; in plan mode the agent emits a structured plan with steps, files, and acceptance criteria, streamed via `item/plan/delta` and finalized via a `ConsolidateProposedPlan` action). **But Codex's native plan mode is TUI-only as of v0.122.** `codex exec` exposes no `--mode` / `--plan` flag; the official non-interactive reference and config reference document only `plan_mode_reasoning_effort` (effort tuning), not a way to start in plan mode. The collaboration mode is a per-message runtime parameter inside Codex's app-server JSON-RPC protocol, not a CLI startup option.
+
+  So for `codex exec`, native plan mode isn't reachable. We approximate it by combining `--sandbox read-only` (permission boundary — writes are rejected) with a system-prompt preamble that tells the agent to investigate-and-propose rather than attempt-and-fail. The plan lands in the agent's final assistant message (`result.summary`). There's no in-protocol approval gate; the consumer drives the next step manually (typically by showing `result.summary` to the user and re-invoking with `planMode: false` on approval).
+
+  This is a workaround for a missing Codex CLI flag, not a deliberate design choice. If/when Codex exposes its native plan mode through `exec` (e.g. `-c collaboration_mode=plan` or `--mode plan`), we'll switch to that and surface real `item/plan/delta` events.
+
+### Session mode (Claude only — capturing the plan live)
+
+```typescript
+const session = await claude.createSession!({
+  config: { planMode: true },
+  onUserInputRequest: async (req) => {
+    const plan = parseExitPlanMode(req);
+    if (plan) {
+      const approved = await showPlanApprovalUI(plan.plan);
+      return { allow: approved };
+    }
+    return { allow: true };
+  },
+});
+```
+
+For Codex sessions, the plan-mode preamble is sent once via `developerInstructions` at session start and applies to every turn until the session is closed.
+
+### Caveats
+
+- `planMode` and `skipPermissions` are mutually exclusive — if both are set, `planMode` wins and `skipPermissions` is silently ignored.
+- Providers with `capabilities.planMode === false` (every provider other than claude/codex) ignore `config.planMode` entirely.
+- Codex's preamble is a heuristic, not a hard guarantee. The sandbox is the enforcement boundary — even if the agent ignored the prompt and tried to write, the sandbox would reject it. The preamble exists so the agent emits a usable plan instead of a sequence of failed write attempts.
 
 ## Auth
 
@@ -570,6 +636,7 @@ registerProvider(myProvider);
 - `redactEnvForLogs(env)` — redact sensitive values before logging.
 - `resolveInstructions(path?)` — read an instructions file, or `null` if no path.
 - `parseAskUserQuestion(req)` — extract structured question/option data from a `UserInputRequest`.
+- `parseExitPlanMode(req)` — extract the proposed plan text from an `ExitPlanMode` permission request (Claude plan mode).
 
 ## Requirements
 

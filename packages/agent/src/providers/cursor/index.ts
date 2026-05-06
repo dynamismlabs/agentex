@@ -13,6 +13,7 @@ export const cursorProvider: ProviderModule = {
     skills: true,
     instructions: true,
     workspace: true,
+    planMode: false,
   },
   execute: executeCursorProvider,
   resolveAuth: (ctx) => resolveAuthForProvider("cursor", ctx),

@@ -18,6 +18,7 @@ import {
   isCodexAuthRequired,
   isCodexUnknownSessionError,
 } from "./parse.js";
+import { withPlanModePreamble } from "./plan-mode.js";
 import { scanCodexSessionUsage } from "./usage-scanner.js";
 
 export async function executeCodexProvider(ctx: ExecutionContext): Promise<ExecutionResult> {
@@ -68,8 +69,14 @@ export async function executeCodexProvider(ctx: ExecutionContext): Promise<Execu
   const env = buildEnv(ctx.env);
   ensurePathInEnv(env);
 
-  // 3. Resolve instructions
-  const instructions = await resolveInstructions(config.instructionsFile);
+  // 3. Resolve instructions. In plan mode, prepend a preamble that tells the
+  //    agent to investigate-and-propose rather than attempt-and-fail — Codex
+  //    has no native plan-mode UX, so the system prompt is what makes plan
+  //    mode actually work as a planning flow.
+  const baseInstructions = await resolveInstructions(config.instructionsFile);
+  const instructions = config.planMode
+    ? withPlanModePreamble(baseInstructions)
+    : baseInstructions;
   const fullPrompt = instructions ? `${instructions}\n\n${ctx.prompt}` : ctx.prompt;
 
   // 4. Inject skills into workspace
@@ -118,7 +125,12 @@ export async function executeCodexProvider(ctx: ExecutionContext): Promise<Execu
     const args = [...resolvedBinary.prefixArgs];
     if (config.search) args.push("--search");
     args.push("exec", "--json");
-    if (config.skipPermissions) args.push("--dangerously-bypass-approvals-and-sandbox");
+    // planMode and skipPermissions are mutually exclusive — planMode wins.
+    if (config.planMode) {
+      args.push("--sandbox", "read-only");
+    } else if (config.skipPermissions) {
+      args.push("--dangerously-bypass-approvals-and-sandbox");
+    }
     if (model) args.push("--model", model);
     if (config.effort) args.push("-c", `model_reasoning_effort=${JSON.stringify(config.effort)}`);
     if (config.extraArgs) args.push(...config.extraArgs);

@@ -76,7 +76,12 @@ export async function executeClaudeProvider(ctx: ExecutionContext): Promise<Exec
   const buildArgs = (resumeSessionId: string | null): string[] => {
     const args = [...resolvedBinary.prefixArgs, "--print", "-", "--output-format", "stream-json", "--verbose"];
     if (resumeSessionId) args.push("--resume", resumeSessionId);
-    if (config.skipPermissions) args.push("--dangerously-skip-permissions");
+    // planMode and skipPermissions are mutually exclusive — planMode wins.
+    if (config.planMode) {
+      args.push("--permission-mode", "plan");
+    } else if (config.skipPermissions) {
+      args.push("--dangerously-skip-permissions");
+    }
     if (model) args.push("--model", model);
     if (config.effort) args.push("--effort", config.effort);
     if (config.maxTurns && config.maxTurns > 0) args.push("--max-turns", String(config.maxTurns));

@@ -13,6 +13,7 @@ export const opencodeProvider: ProviderModule = {
     skills: true,
     instructions: true,
     workspace: true,
+    planMode: false,
   },
   execute: executeOpenCodeProvider,
   resolveAuth: (ctx) => resolveAuthForProvider("opencode", ctx),

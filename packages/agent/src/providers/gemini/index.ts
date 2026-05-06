@@ -13,6 +13,7 @@ export const geminiProvider: ProviderModule = {
     skills: true,
     instructions: true,
     workspace: true,
+    planMode: false,
   },
   execute: executeGeminiProvider,
   resolveAuth: (ctx) => resolveAuthForProvider("gemini", ctx),

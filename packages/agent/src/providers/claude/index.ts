@@ -26,6 +26,7 @@ export const claudeProvider: ProviderModule = {
     skills: true,
     instructions: true,
     workspace: true,
+    planMode: true,
   },
   execute: executeClaudeProvider,
   createSession: (ctx: SessionContext): Promise<AgentSession> => createClaudeSession(ctx),

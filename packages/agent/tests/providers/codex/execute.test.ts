@@ -99,4 +99,89 @@ describe("executeCodexProvider", () => {
 
     expect(result.errorCode).toBe("binary_not_found");
   });
+
+  it("passes --sandbox read-only when config.planMode is true", async () => {
+    const dumpFile = path.join(os.tmpdir(), `codex-args-${Date.now()}-${Math.random()}.txt`);
+    try {
+      await executeCodexProvider(makeCtx({
+        config: { command: MOCK_CODEX, planMode: true },
+        env: { MOCK_BEHAVIOR: "success", MOCK_DUMP_ARGS_TO: dumpFile },
+      }));
+      const content = await fs.readFile(dumpFile, "utf-8");
+      const args = content.split("\n").filter((l) => l.length > 0);
+      const idx = args.indexOf("--sandbox");
+      expect(idx).toBeGreaterThanOrEqual(0);
+      expect(args[idx + 1]).toBe("read-only");
+      expect(args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+    } finally {
+      await fs.rm(dumpFile, { force: true });
+    }
+  });
+
+  it("planMode wins over skipPermissions when both are set", async () => {
+    const dumpFile = path.join(os.tmpdir(), `codex-args-${Date.now()}-${Math.random()}.txt`);
+    try {
+      await executeCodexProvider(makeCtx({
+        config: { command: MOCK_CODEX, planMode: true, skipPermissions: true },
+        env: { MOCK_BEHAVIOR: "success", MOCK_DUMP_ARGS_TO: dumpFile },
+      }));
+      const content = await fs.readFile(dumpFile, "utf-8");
+      const args = content.split("\n").filter((l) => l.length > 0);
+      expect(args).toContain("--sandbox");
+      expect(args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+    } finally {
+      await fs.rm(dumpFile, { force: true });
+    }
+  });
+
+  it("does not pass --sandbox when planMode is unset", async () => {
+    const dumpFile = path.join(os.tmpdir(), `codex-args-${Date.now()}-${Math.random()}.txt`);
+    try {
+      await executeCodexProvider(makeCtx({
+        config: { command: MOCK_CODEX },
+        env: { MOCK_BEHAVIOR: "success", MOCK_DUMP_ARGS_TO: dumpFile },
+      }));
+      const content = await fs.readFile(dumpFile, "utf-8");
+      const args = content.split("\n").filter((l) => l.length > 0);
+      expect(args).not.toContain("--sandbox");
+    } finally {
+      await fs.rm(dumpFile, { force: true });
+    }
+  });
+
+  it("prepends the plan-mode preamble to the prompt when planMode is true", async () => {
+    const dumpFile = path.join(os.tmpdir(), `codex-stdin-${Date.now()}-${Math.random()}.txt`);
+    try {
+      await executeCodexProvider(makeCtx({
+        prompt: "Refactor login.ts",
+        config: { command: MOCK_CODEX, planMode: true },
+        env: { MOCK_BEHAVIOR: "success", MOCK_DUMP_STDIN_TO: dumpFile },
+      }));
+      const stdin = await fs.readFile(dumpFile, "utf-8");
+      expect(stdin).toContain("Plan Mode");
+      expect(stdin).toContain("read-only plan mode");
+      expect(stdin).toContain("Refactor login.ts");
+      // The user's prompt should still come last so it isn't masked by the preamble.
+      expect(stdin.lastIndexOf("Refactor login.ts")).toBeGreaterThan(
+        stdin.indexOf("Plan Mode"),
+      );
+    } finally {
+      await fs.rm(dumpFile, { force: true });
+    }
+  });
+
+  it("does not include the plan-mode preamble when planMode is unset", async () => {
+    const dumpFile = path.join(os.tmpdir(), `codex-stdin-${Date.now()}-${Math.random()}.txt`);
+    try {
+      await executeCodexProvider(makeCtx({
+        prompt: "Refactor login.ts",
+        config: { command: MOCK_CODEX },
+        env: { MOCK_BEHAVIOR: "success", MOCK_DUMP_STDIN_TO: dumpFile },
+      }));
+      const stdin = await fs.readFile(dumpFile, "utf-8");
+      expect(stdin).not.toContain("Plan Mode");
+    } finally {
+      await fs.rm(dumpFile, { force: true });
+    }
+  });
 });

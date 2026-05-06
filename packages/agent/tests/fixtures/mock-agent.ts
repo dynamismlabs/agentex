@@ -2,17 +2,24 @@
 // Mock agent script that mimics Claude/Codex CLI behavior for integration tests.
 // Behavior controlled by MOCK_BEHAVIOR env var: "success", "max_turns", "auth_required", "unknown_session", "timeout", "error"
 // Format controlled by MOCK_FORMAT env var: "claude" (default), "codex", "gemini", "cursor", "opencode", "pi"
+// When MOCK_DUMP_STDIN_TO is set, the received stdin is written to that path
+// before emitting the mock response — lets tests assert on the prompt.
 
+import * as fs from "node:fs";
 import process from "node:process";
 
 const behavior = process.env["MOCK_BEHAVIOR"] ?? "success";
 const format = process.env["MOCK_FORMAT"] ?? "claude";
+const dumpStdinTo = process.env["MOCK_DUMP_STDIN_TO"];
 
 // Read stdin (prompt)
 let stdin = "";
 process.stdin.setEncoding("utf-8");
 process.stdin.on("data", (chunk: string) => { stdin += chunk; });
 process.stdin.on("end", () => {
+  if (dumpStdinTo) {
+    try { fs.writeFileSync(dumpStdinTo, stdin); } catch { /* swallow */ }
+  }
   if (format === "codex") {
     emitCodex();
   } else if (format === "gemini") {

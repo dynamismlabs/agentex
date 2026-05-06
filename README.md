@@ -1,6 +1,6 @@
 # Agentex
 
-Open-source infrastructure for running AI coding agents. Four composable packages:
+Open-source infrastructure for running AI coding agents for local execution. Four composable packages:
 
 - **[@agentex/agent](./packages/agent)** — Execute Claude Code, Codex, OpenClaw, or any CLI agent programmatically with streaming, sessions, and a unified interface.
 - **[@agentex/gateway](./packages/gateway)** — Multi-channel communication gateway that connects agents to Telegram, Discord, Slack, WhatsApp, email, webhooks, and cron with a single YAML config.
@@ -195,7 +195,7 @@ cd packages/gateway && pnpm dev
 
 ## Requirements
 
-- Node.js >= 18
+- Node.js >= 20
 - pnpm >= 10
 - Agent CLIs on `$PATH` (e.g., `claude` for the Claude provider)
 

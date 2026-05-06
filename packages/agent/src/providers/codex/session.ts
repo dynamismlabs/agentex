@@ -11,6 +11,7 @@ import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { injectWorkspaceSkills } from "../../utils/skills.js";
 import { resolveInstructions } from "../../utils/instructions.js";
 import { parseCodexStreamLine } from "./parse.js";
+import { withPlanModePreamble } from "./plan-mode.js";
 import { scanCodexSessionUsage } from "./usage-scanner.js";
 
 // ---------------------------------------------------------------------------
@@ -108,12 +109,22 @@ export async function createCodexSession(ctx: SessionContext): Promise<AgentSess
     } catch { /* non-fatal */ }
   }
 
-  // Resolve instructions
-  const instructions = await resolveInstructions(config.instructionsFile);
+  // Resolve instructions. In plan mode, prepend a preamble so the agent
+  // investigates-and-proposes rather than attempting writes that the sandbox
+  // will reject. See ./plan-mode.ts for rationale.
+  const baseInstructions = await resolveInstructions(config.instructionsFile);
+  const instructions = config.planMode
+    ? withPlanModePreamble(baseInstructions)
+    : baseInstructions;
 
-  // Spawn Codex in interactive JSON-RPC mode
+  // Spawn Codex in interactive JSON-RPC mode.
+  // planMode and skipPermissions are mutually exclusive — planMode wins.
   const args = [...resolved.prefixArgs, "--json"];
-  if (config.skipPermissions) args.push("--dangerously-bypass-approvals-and-sandbox");
+  if (config.planMode) {
+    args.push("--sandbox", "read-only");
+  } else if (config.skipPermissions) {
+    args.push("--dangerously-bypass-approvals-and-sandbox");
+  }
   if (config.extraArgs) args.push(...config.extraArgs);
 
   const proc = spawn(resolved.bin, args, {

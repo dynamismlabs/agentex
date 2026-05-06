@@ -13,6 +13,7 @@ describe("ProviderCapabilities", () => {
       expect(typeof provider.capabilities.skills).toBe("boolean");
       expect(typeof provider.capabilities.instructions).toBe("boolean");
       expect(typeof provider.capabilities.workspace).toBe("boolean");
+      expect(typeof provider.capabilities.planMode).toBe("boolean");
     }
   });
 
@@ -26,7 +27,16 @@ describe("ProviderCapabilities", () => {
       skills: true,
       instructions: true,
       workspace: true,
+      planMode: true,
     });
+  });
+
+  it("only claude and codex advertise native plan mode", () => {
+    for (const name of listProviders()) {
+      const caps = getProvider(name).capabilities;
+      const expected = name === "claude" || name === "codex";
+      expect(caps.planMode).toBe(expected);
+    }
   });
 
   it("codex has sessions but no model discovery, mcp, or quota", () => {

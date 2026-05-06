@@ -7,6 +7,26 @@ export interface ProviderCapabilities {
   skills: boolean;
   instructions: boolean;
   workspace: boolean;
+  /**
+   * Read-only "plan" mode is honored by this provider. When `true`, the
+   * provider runs the agent so it can read and reason but cannot mutate.
+   *
+   * Mechanism differs per provider:
+   * - `claude`: `--permission-mode plan` — CLI-native plan UX. The agent
+   *   emits its plan through the `ExitPlanMode` tool as a permission
+   *   request; the host extracts it via `parseExitPlanMode(req)`.
+   * - `codex`: `--sandbox read-only` plus an injected planning system
+   *   preamble. Codex *does* have a native plan mode (one of three
+   *   collaboration modes — Plan, Pair, Execute — activated by `/plan` or
+   *   Shift+Tab in the TUI), but `codex exec` exposes no flag to start in
+   *   that mode and the JSON-RPC `collaboration_mode` parameter is per
+   *   message, not startup. So the plan ends up in `ExecutionResult.summary`
+   *   instead of streaming through `item/plan/delta` events. No in-protocol
+   *   approval gate; the consumer drives the next step.
+   *
+   * Providers with this set to `false` ignore `config.planMode` entirely.
+   */
+  planMode: boolean;
 }
 
 // Core provider interface — every provider must implement this
@@ -70,7 +90,26 @@ export interface ProviderConfig {
   search?: boolean;
   sandbox?: boolean;
   thinking?: string;
+  /**
+   * Provider-specific mode pass-through. Currently used by `cursor` for its
+   * `--mode <mode>` flag. Don't use this for plan mode — set `planMode: true`
+   * instead, which is the cross-provider abstraction.
+   */
   mode?: string;
+  /**
+   * Run the agent in read-only "plan" mode: it can read, search, and reason,
+   * but cannot edit files or run mutating commands. Honored by providers
+   * with `capabilities.planMode === true` (claude, codex). Ignored by
+   * providers that don't support it — check `provider.capabilities.planMode`
+   * before relying on it.
+   *
+   * Mutually exclusive with `skipPermissions`. If both are set, `planMode`
+   * wins (more conservative intent) and `skipPermissions` is ignored.
+   *
+   * To resume a planned session in normal (executing) mode, pass the
+   * returned `sessionParams` on the next call with `planMode: false`.
+   */
+  planMode?: boolean;
   /** Run the agent in an isolated workspace. The library creates a worktree
    *  before execution and uses it as the working directory. */
   workspace?: {
@@ -335,6 +374,19 @@ export type StreamEvent =
       resetAt: string | null;
       overageStatus: string | null;
       isUsingOverage: boolean | null;
+    } & BaseStreamEventFields)
+  /**
+   * Permission mode change. Claude emits a top-level `permission-mode` event
+   * when the agent transitions between modes (e.g., user accepts a plan and
+   * the session leaves `plan` mode). The `system.init` event also reports
+   * the initial `permissionMode`; this variant reports subsequent transitions.
+   *
+   * Claude's known values: `"default"`, `"plan"`, `"acceptEdits"`,
+   * `"bypassPermissions"`. Kept as `string` for forward compat.
+   */
+  | ({
+      type: "permission_mode";
+      permissionMode: string;
     } & BaseStreamEventFields)
   | ({
       type: "result";

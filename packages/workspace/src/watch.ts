@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import chokidar from "chokidar";
+import { watch as chokidarWatch } from "chokidar";
 import type {
   WatchEvent,
   WatchEventKind,
@@ -32,7 +32,7 @@ export function watchWorkspace(
 ): WatchSubscription {
   const onError = opts.onError ?? defaultOnError;
 
-  const watcher = chokidar.watch(workspacePath, {
+  const watcher = chokidarWatch(workspacePath, {
     ignored: (p: string) => {
       const rel = path.relative(workspacePath, p);
       if (rel === "" || rel.startsWith("..")) return false;

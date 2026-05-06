@@ -41,6 +41,7 @@ export const processProvider: ProviderModule = {
     skills: false,
     instructions: true,
     workspace: true,
+    planMode: false,
   },
   execute: executeProcessProvider,
   resolveAuth: resolveProcessAuth,

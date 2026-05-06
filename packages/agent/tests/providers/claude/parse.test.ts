@@ -137,6 +137,28 @@ describe("parseStreamLine", () => {
     }
   });
 
+  it("emits a permission_mode event from a permission-mode line", () => {
+    const line = JSON.stringify({
+      type: "permission-mode",
+      permissionMode: "plan",
+      session_id: "sess-plan-1",
+    });
+    const events = parseStreamLine(line);
+    expect(events).toHaveLength(1);
+    const event = events[0]!;
+    expect(event.type).toBe("permission_mode");
+    if (event.type === "permission_mode") {
+      expect(event.permissionMode).toBe("plan");
+      expect(event.sessionId).toBe("sess-plan-1");
+      expect(event.providerType).toBe("claude");
+    }
+  });
+
+  it("skips a permission-mode line with no permissionMode value", () => {
+    const line = JSON.stringify({ type: "permission-mode" });
+    expect(parseStreamLine(line)).toHaveLength(0);
+  });
+
   it("returns an `unknown` event for non-init system events (forward-compat)", () => {
     const line = JSON.stringify({ type: "system", subtype: "other" });
     const events = parseStreamLine(line);

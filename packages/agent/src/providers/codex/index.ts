@@ -14,6 +14,7 @@ export const codexProvider: ProviderModule = {
     skills: true,
     instructions: true,
     workspace: true,
+    planMode: true,
   },
   execute: executeCodexProvider,
   createSession: (ctx: SessionContext): Promise<AgentSession> => createCodexSession(ctx),

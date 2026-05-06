@@ -90,7 +90,14 @@ export async function createClaudeSession(ctx: SessionContext): Promise<AgentSes
     }
   }
 
-  if (config.skipPermissions) {
+  // planMode and skipPermissions are mutually exclusive — planMode wins.
+  // In plan mode the agent can't actually perform mutations anyway, but we
+  // still need stdio permission protocol so the host can inspect the
+  // ExitPlanMode permission request and capture the proposed plan.
+  if (config.planMode) {
+    args.push("--permission-mode", "plan");
+    args.push("--permission-prompt-tool", "stdio");
+  } else if (config.skipPermissions) {
     args.push("--dangerously-skip-permissions");
   } else {
     // Enable bidirectional permission protocol via control_request/control_response.

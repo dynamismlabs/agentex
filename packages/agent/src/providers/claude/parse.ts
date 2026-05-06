@@ -287,6 +287,16 @@ export function parseStreamLine(line: string): StreamEvent[] {
     }];
   }
 
+  if (type === "permission-mode") {
+    const mode = asNullableString(event["permissionMode"]);
+    if (!mode) return [];
+    return [{
+      type: "permission_mode",
+      permissionMode: mode,
+      ...baseFieldsFromEvent(event, null),
+    }];
+  }
+
   if (type === "assistant") {
     const message = parseObject(event["message"]);
     const messageId = asNullableString(message["id"]);
