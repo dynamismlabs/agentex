@@ -1,6 +1,6 @@
 {
   "name": "@agentex/github",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Thin typed wrapper over the gh CLI for PR / issue / status operations",
   "type": "module",
   "exports": {
