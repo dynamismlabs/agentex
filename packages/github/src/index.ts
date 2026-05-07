@@ -37,6 +37,8 @@ export type {
   PRReview,
   PRState,
   PRSummary,
+  RawOptions,
+  RawResult,
   RepoOps,
 } from "./types.js";
 

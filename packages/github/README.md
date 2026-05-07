@@ -115,7 +115,28 @@ await repo.getIssue(id)                                  // → IssueDetail
 await repo.createIssue({ title, body, labels?, assignees? })
                                                          // → IssueSummary
 await repo.commentOnIssue(id, body)
+
+// Escape hatch — any gh subcommand
+await repo.raw(args, { input? })
+  // → { stdout, stderr, exitCode }
 ```
+
+### Escape hatch: `repo.raw`
+
+The typed methods cover routine ops. For anything we haven't typed (`gh api`, `gh release`, custom flags) — or when an agent should drive `gh` directly — use `raw`:
+
+```ts
+// gh api passthrough
+const { stdout } = await repo.raw(["api", "user", "--jq", ".login"]);
+
+// long-body op via stdin (same E2BIG-safe pattern as createPR)
+await repo.raw(
+  ["pr", "edit", "42", "--body-file", "-"],
+  { input: agentWrittenLongBody },
+);
+```
+
+`raw` returns `{ stdout, stderr, exitCode }` so the caller decides how to parse and how to react to non-zero exits. It still throws `NotInstalledError` if `gh` is missing, but it does **not** map other failures to typed errors — that's the typed methods' job.
 
 ### Common patterns
 

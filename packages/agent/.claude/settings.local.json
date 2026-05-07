@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//Users/treyhuffine/dynamism/agentex/packages/github/**)",
+      "Read(//Users/treyhuffine/dynamism/ai-task-manager/**)"
+    ]
+  }
+}

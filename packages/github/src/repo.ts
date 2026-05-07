@@ -13,6 +13,8 @@ import type {
   PRDetail,
   PRId,
   PRSummary,
+  RawOptions,
+  RawResult,
   RepoOps,
 } from "./types.js";
 
@@ -249,6 +251,16 @@ export function makeRepoOps(repoPath: string): RepoOps {
     );
   }
 
+  async function raw(args: readonly string[], opts: RawOptions = {}): Promise<RawResult> {
+    if (!Array.isArray(args)) {
+      throw new Error("github.repo.raw: args must be an array of strings");
+    }
+    return ghExec(args, {
+      cwd: repoPath,
+      ...(opts.input !== undefined ? { input: opts.input } : {}),
+    });
+  }
+
   return {
     createPR,
     listPRs,
@@ -262,5 +274,6 @@ export function makeRepoOps(repoPath: string): RepoOps {
     getIssue,
     createIssue,
     commentOnIssue,
+    raw,
   };
 }

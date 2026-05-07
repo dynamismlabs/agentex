@@ -124,6 +124,43 @@ describe("ws.watch", () => {
     expect(total.length).toBe(3);
   });
 
+  it("fires events for files in newly-created nested subdirectories (recursive watch)", async () => {
+    // Exercises chokidar's recursive watching end-to-end: subscribe first,
+    // then create a fresh nested directory tree and a file inside it. Pins
+    // the behavior we depend on from `fs.watch({ recursive: true })`.
+    const { wsPath, ws } = await makeBareWorkspace("watch-nested");
+
+    const events: WatchEvent[] = [];
+    const sub = ws.watch((batch) => events.push(...batch));
+    subs.push(sub);
+    await sub.ready;
+
+    await fs.mkdir(path.join(wsPath, "sub", "deep"), { recursive: true });
+    await writeUtf8(path.join(wsPath, "sub", "deep", "nested.txt"), "x");
+
+    const evt = await waitForEvent(
+      events,
+      (e) => e.path.endsWith(`${path.sep}nested.txt`) && e.kind === "add",
+    );
+    expect(evt.kind).toBe("add");
+  });
+
+  it("routes addDir/unlinkDir to 'add'/'remove' for directory lifecycle", async () => {
+    const { wsPath, ws } = await makeBareWorkspace("watch-dir-events");
+
+    const events: WatchEvent[] = [];
+    const sub = ws.watch((batch) => events.push(...batch));
+    subs.push(sub);
+    await sub.ready;
+
+    const dir = path.join(wsPath, "newdir");
+    await fs.mkdir(dir);
+    await waitForEvent(events, (e) => e.path.endsWith(`${path.sep}newdir`) && e.kind === "add");
+
+    await fs.rmdir(dir);
+    await waitForEvent(events, (e) => e.path.endsWith(`${path.sep}newdir`) && e.kind === "remove");
+  });
+
   it("does not fire events for changes inside .git/", async () => {
     // Use a bare workspace + a synthetic .git/ directory to exercise the
     // watcher's ignore filter directly. (For real git worktrees, `.git` is

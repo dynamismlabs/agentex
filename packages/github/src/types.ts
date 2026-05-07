@@ -138,6 +138,18 @@ export interface ListIssueOptions {
   assignee?: string;
 }
 
+/**
+ * Result of a `repo.raw` invocation. Aliased to the internal executor type so
+ * the two stay in lockstep — if `gh-exec` ever surfaces additional fields
+ * (signal, timedOut), `raw` callers see them automatically.
+ */
+export type RawResult = import("./internal/gh-exec.js").GhExecResult;
+
+export interface RawOptions {
+  /** Body piped to `gh` on stdin. Use with `--body-file -` for long inputs. */
+  input?: string;
+}
+
 export interface RepoOps {
   // PRs
   createPR(opts: CreatePROptions): Promise<PRSummary>;
@@ -156,4 +168,17 @@ export interface RepoOps {
   getIssue(id: IssueId): Promise<IssueDetail>;
   createIssue(opts: CreateIssueOptions): Promise<IssueSummary>;
   commentOnIssue(id: IssueId, body: string): Promise<void>;
+
+  /**
+   * Escape hatch — invoke any `gh` subcommand against this repo's cwd. Returns
+   * the raw `{ stdout, stderr, exitCode }` so the caller decides how to parse
+   * and how to react to non-zero exits. Still throws `NotInstalledError` if
+   * `gh` is missing on `$PATH`.
+   *
+   * Use the typed methods for routine ops — they handle long-body stdin
+   * piping, JSON re-fetch, and error classification. Reach for `raw` when
+   * you need a flag we haven't typed (e.g. `gh api`, `gh release`, custom
+   * `gh pr edit` flags) or when an agent should drive `gh` directly.
+   */
+  raw(args: readonly string[], opts?: RawOptions): Promise<RawResult>;
 }
