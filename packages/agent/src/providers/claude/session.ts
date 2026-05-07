@@ -6,6 +6,7 @@ import type {
   SessionContext,
   SessionState,
   TurnResult,
+  UserInputResponse,
 } from "../../types.js";
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
@@ -40,6 +41,48 @@ function obj(parent: Record<string, unknown>, key: string): Record<string, unkno
   return typeof v === "object" && v !== null && !Array.isArray(v)
     ? v as Record<string, unknown>
     : {};
+}
+
+// ---------------------------------------------------------------------------
+// Permission response shaping
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the wire-shape control_response for a `can_use_tool` request.
+ *
+ * The CLI's `PermissionResultAllow` schema requires `updatedInput` on every
+ * allow response — it carries the (possibly host-modified) tool input back
+ * into the agent. If the host doesn't supply one, we echo the original input.
+ * `PermissionResultDeny` only requires `behavior` and `message`.
+ *
+ * Exported for unit testing — not part of the public API.
+ *
+ * @internal
+ */
+export function buildPermissionResponse(
+  toolUseId: string,
+  input: Record<string, unknown>,
+  resp: UserInputResponse | null,
+): Record<string, unknown> {
+  // Auto-allow when no host callback is registered.
+  if (resp === null) {
+    return { behavior: "allow", toolUseID: toolUseId, updatedInput: input };
+  }
+  if (resp.allow) {
+    const out: Record<string, unknown> = {
+      behavior: "allow",
+      toolUseID: toolUseId,
+      updatedInput: resp.updatedInput ?? input,
+    };
+    if (resp.message) out["message"] = resp.message;
+    return out;
+  }
+  const out: Record<string, unknown> = {
+    behavior: "deny",
+    toolUseID: toolUseId,
+  };
+  if (resp.message) out["message"] = resp.message;
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -380,10 +423,10 @@ class ClaudeSessionImpl implements AgentSession {
 
     // If no permission callback, auto-allow
     if (!this.ctx.onUserInputRequest) {
-      this.sendControlResponse(requestId, {
-        behavior: "allow",
-        toolUseID: toolUseId,
-      });
+      this.sendControlResponse(
+        requestId,
+        buildPermissionResponse(toolUseId, input, null),
+      );
       return;
     }
 
@@ -403,14 +446,10 @@ class ClaudeSessionImpl implements AgentSession {
       // If the request was cancelled while we were waiting, don't respond
       if (!this._pendingCallbacks.delete(requestId)) return;
 
-      const response: Record<string, unknown> = {
-        behavior: resp.allow ? "allow" : "deny",
-        toolUseID: toolUseId,
-      };
-      if (resp.message) response["message"] = resp.message;
-      if (resp.updatedInput) response["updatedInput"] = resp.updatedInput;
-
-      this.sendControlResponse(requestId, response);
+      this.sendControlResponse(
+        requestId,
+        buildPermissionResponse(toolUseId, input, resp),
+      );
       if (this._state === "waiting_for_approval") this._state = "thinking";
     } catch {
       if (!this._pendingCallbacks.delete(requestId)) return;
