@@ -233,6 +233,29 @@ export async function executeCodexProvider(ctx: ExecutionContext): Promise<Execu
   let errorCode = processErrorCode;
   if (!errorCode && isCodexAuthRequired(proc.stdout, proc.stderr)) {
     errorCode = "auth_required";
+    // Codex emits `type: "error"` / `type: "turn.failed"` events but those
+    // are generic — the auth-vs-rate-limit distinction lives in the text.
+    // Surface an auth_required stream event so consumers wired to onEvent
+    // get the same uniform signal as Claude.
+    if (ctx.onEvent) {
+      try {
+        await ctx.onEvent({
+          type: "auth_required",
+          httpStatus: null,
+          reason: parsed.errorMessage && /invalid.*api.*key/i.test(parsed.errorMessage) ? "invalid" : "missing",
+          loginCommand: "codex login",
+          message: parsed.errorMessage,
+          timestamp: new Date().toISOString(),
+          providerType: "codex",
+          sessionId: parsed.sessionId,
+          messageId: null,
+          eventId: null,
+          turnId: null,
+          parentToolCallId: null,
+          raw: parsed.finalEvent ?? {},
+        });
+      } catch { /* swallow */ }
+    }
   }
 
   const errorMessage = (() => {

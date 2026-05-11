@@ -16,6 +16,8 @@ export {
   hasSubscription,
   hasApiKey,
   hasBedrock,
+  isLoggedIn,
+  loginCommandFor,
 } from "./utils/auth.js";
 export type { ResolvedAuth } from "./utils/auth.js";
 export { prepareWorkspace } from "./utils/workspace.js";
@@ -24,7 +26,11 @@ export { withTempConfig } from "./utils/runtime-config.js";
 export type { TempConfigResult, TempConfigOptions } from "./utils/runtime-config.js";
 export { executeAll } from "./utils/execute-all.js";
 export type { ExecuteAllOptions, ExecuteAllTask } from "./utils/execute-all.js";
-export { getClaudeUnknownDetails } from "./providers/claude/parse.js";
+export {
+  getClaudeUnknownDetails,
+  classifyClaudeAuthFromResult,
+  CLAUDE_LOGIN_COMMAND,
+} from "./providers/claude/parse.js";
 
 // Skills
 export {
@@ -63,6 +69,7 @@ export type {
   AuthReport,
   AuthResolveContext,
   AuthIdentity,
+  AuthRequiredReason,
   BinaryStatus,
   ProviderModel,
   SessionContext,

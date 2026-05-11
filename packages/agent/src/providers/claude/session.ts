@@ -11,7 +11,7 @@ import type {
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { buildSkillsDir, cleanupSkillsDir } from "../../utils/skills.js";
-import { parseStreamLine } from "./parse.js";
+import { parseStreamLine, classifyClaudeAuthFromResult, CLAUDE_LOGIN_COMMAND } from "./parse.js";
 
 // ---------------------------------------------------------------------------
 // ndjson helpers
@@ -597,10 +597,14 @@ class ClaudeSessionImpl implements AgentSession {
       this._sessionId = msg["session_id"];
     }
 
-    // Detect error codes and derive status
+    // Detect error codes and derive status. Run the auth classifier
+    // before the generic `isError` branch so auth failures get the
+    // specific `auth_required` code and a recovery message instead of
+    // a vague `execution_error`.
     let errorCode: string | null = null;
     const subtype = str(msg, "subtype");
     let status: TurnResult["status"] = "completed";
+    const authClassification = classifyClaudeAuthFromResult(msg);
 
     if (subtype === "error_max_turns" || stopReason === "max_turns") {
       errorCode = "max_turns";
@@ -608,10 +612,46 @@ class ClaudeSessionImpl implements AgentSession {
     } else if (subtype === "error_max_budget_usd") {
       errorCode = "max_budget";
       status = "max_budget";
+    } else if (authClassification) {
+      errorCode = "auth_required";
+      status = "failed";
     } else if (subtype === "error_during_execution" || isError) {
       errorCode = errorCode ?? "execution_error";
       status = "failed";
     }
+
+    // The result event bypasses handleStreamMessage (handleLine routes it
+    // to handleResult), so parseStreamLine never runs against it in the
+    // streaming session. Emit auth_required here so consumers wired to
+    // onEvent see the same signal they would on the one-shot path.
+    if (authClassification && this.ctx.onEvent) {
+      try {
+        void this.ctx.onEvent({
+          type: "auth_required",
+          httpStatus: authClassification.httpStatus,
+          reason: authClassification.reason,
+          loginCommand: CLAUDE_LOGIN_COMMAND,
+          message: authClassification.message,
+          timestamp: new Date().toISOString(),
+          providerType: "claude",
+          sessionId: this._sessionId,
+          messageId: null,
+          eventId: null,
+          turnId: null,
+          parentToolCallId: null,
+          raw: msg,
+        });
+      } catch { /* swallow */ }
+    }
+
+    const errorMessage = (() => {
+      if (authClassification) {
+        return summary
+          ? `${summary} (run \`${CLAUDE_LOGIN_COMMAND}\`)`
+          : `Claude requires authentication. Run \`${CLAUDE_LOGIN_COMMAND}\`.`;
+      }
+      return isError ? summary : null;
+    })();
 
     const result: TurnResult = {
       summary,
@@ -619,7 +659,7 @@ class ClaudeSessionImpl implements AgentSession {
       costUsd,
       status,
       errorCode,
-      errorMessage: isError ? summary : null,
+      errorMessage,
     };
 
     this._state = "idle";

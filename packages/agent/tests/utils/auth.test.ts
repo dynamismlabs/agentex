@@ -9,6 +9,8 @@ import {
   hasApiKey,
   hasBedrock,
   hasSubscription,
+  isLoggedIn,
+  loginCommandFor,
 } from "../../src/utils/auth.js";
 import type { ProviderModule } from "../../src/types.js";
 
@@ -324,5 +326,39 @@ describe("sugar helpers", () => {
   it("hasBedrock returns true only when bedrock is confirmed present", async () => {
     expect(await hasBedrock(fakeProvider([{ method: "bedrock", present: true }]))).toBe(true);
     expect(await hasBedrock(fakeProvider([{ method: "bedrock", present: false }]))).toBe(false);
+  });
+});
+
+describe("loginCommandFor", () => {
+  it.each([
+    ["claude", "claude auth login"],
+    ["codex", "codex login"],
+    ["gemini", "gemini"],
+    ["cursor", "cursor-agent login"],
+    ["opencode", "opencode auth login"],
+  ])("returns %s → %s", (providerType, expected) => {
+    expect(loginCommandFor(providerType)).toBe(expected);
+  });
+
+  it("falls back to '<providerType> login' for unknown providers", () => {
+    expect(loginCommandFor("future-provider")).toBe("future-provider login");
+  });
+});
+
+describe("isLoggedIn", () => {
+  it("returns true when any auth option is present", async () => {
+    // Set ANTHROPIC_API_KEY in the caller env so resolveClaudeAuth flags
+    // api_key as present without any filesystem touches.
+    clearAuthCache();
+    const result = await isLoggedIn("claude", {
+      env: { ANTHROPIC_API_KEY: "sk-test-fake-not-real" },
+      fresh: true,
+    });
+    expect(result).toBe(true);
+  });
+
+  it("returns false for unknown provider with no auth resolver", async () => {
+    clearAuthCache();
+    expect(await isLoggedIn("nonexistent-provider", { fresh: true })).toBe(false);
   });
 });

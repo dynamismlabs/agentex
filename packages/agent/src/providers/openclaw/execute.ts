@@ -49,6 +49,26 @@ export async function executeOpenclawProvider(ctx: ExecutionContext): Promise<Ex
 
     if (!response.ok) {
       const errorText = await response.text().catch(() => "");
+      const isAuth = response.status === 401 || response.status === 403;
+      if (isAuth && ctx.onEvent) {
+        try {
+          await ctx.onEvent({
+            type: "auth_required",
+            httpStatus: response.status,
+            reason: "unknown",
+            loginCommand: "openclaw login",
+            message: errorText || null,
+            timestamp: new Date().toISOString(),
+            providerType: "openclaw",
+            sessionId: sessionKey ?? null,
+            messageId: null,
+            eventId: null,
+            turnId: null,
+            parentToolCallId: null,
+            raw: { status: response.status, body: errorText },
+          });
+        } catch { /* swallow */ }
+      }
       return {
         runId,
         exitCode: 1,
@@ -58,7 +78,7 @@ export async function executeOpenclawProvider(ctx: ExecutionContext): Promise<Ex
         completedAt: new Date().toISOString(),
         durationMs: Date.now() - startMs,
         errorMessage: `OpenClaw gateway returned ${response.status}: ${errorText}`,
-        errorCode: response.status === 401 ? "auth_required" : null,
+        errorCode: isAuth ? "auth_required" : null,
         costUsd: null,
         model: model ?? null,
         summary: null,

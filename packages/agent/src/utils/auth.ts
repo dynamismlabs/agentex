@@ -586,3 +586,76 @@ export async function hasBedrock(
   const report = await provider.resolveAuth(ctx);
   return anyPresent(report, "bedrock");
 }
+
+// ---------------------------------------------------------------------------
+// Top-level convenience: "is the user logged in?" + "what command should I
+// surface in a re-auth banner?". Pair these with the StreamEvent
+// `auth_required` to drive a complete login UX from a host application.
+// ---------------------------------------------------------------------------
+
+/**
+ * Shell command a host should surface when an `auth_required` event fires
+ * for `providerType`, or when `isLoggedIn` returns false. Values are the
+ * provider's canonical CLI subcommand for interactive login — they spawn
+ * a browser flow (Claude, Codex, Gemini, Cursor) or print API-key setup
+ * instructions (OpenCode, Pi).
+ *
+ * Unknown provider types fall back to `${providerType} login`, which is
+ * intentionally guess-y: if a new provider is added without updating this
+ * function, the host gets a plausible string instead of a thrown error.
+ */
+export function loginCommandFor(providerType: string): string {
+  switch (providerType) {
+    case "claude":
+      return "claude auth login";
+    case "codex":
+      return "codex login";
+    case "gemini":
+      // Gemini CLI uses `gemini` interactive mode for OAuth + `/auth` slash
+      // command; there's no top-level `gemini auth login` subcommand. The
+      // closest non-interactive path is launching `gemini` itself, which
+      // triggers an OAuth flow on first run.
+      return "gemini";
+    case "cursor":
+      return "cursor-agent login";
+    case "opencode":
+      return "opencode auth login";
+    case "pi":
+      // pi-coding-agent uses env-var auth (OPENAI_API_KEY / ANTHROPIC_API_KEY);
+      // there's no login subcommand. Tell the user to set the env var.
+      return "export OPENAI_API_KEY=... or ANTHROPIC_API_KEY=...";
+    default:
+      return `${providerType} login`;
+  }
+}
+
+/**
+ * Returns true when the provider has at least one credential confirmed
+ * present (any of api_key, bedrock, subscription). Wraps
+ * `resolveAuthForProvider` for callers that just want a yes/no.
+ *
+ * For Claude, this honors `claude auth status --json` (the authoritative
+ * source) via the existing `resolveAuth` path — the binary is consulted
+ * first and the keychain/file fallback is used only when the binary is
+ * missing or its status subcommand fails.
+ *
+ * Note: this is a snapshot of credential *presence*, not validity. A
+ * present but expired OAuth token still returns true here, because the
+ * status CLI itself reports `loggedIn: true` until the next refresh
+ * attempt fails. The definitive "is this credential actually accepted by
+ * the API?" check happens at request time and surfaces as an
+ * `auth_required` StreamEvent — pair the two:
+ *
+ * 1. Call `isLoggedIn` before starting a session to short-circuit
+ *    obvious "never logged in" cases.
+ * 2. Listen for `auth_required` events during the session to catch
+ *    tokens that were valid at presence-check time but expired/revoked
+ *    in flight.
+ */
+export async function isLoggedIn(
+  providerType: string,
+  ctx?: AuthResolveContext,
+): Promise<boolean> {
+  const report = await resolveAuthForProvider(providerType, ctx);
+  return report.options.some((o) => o.present);
+}

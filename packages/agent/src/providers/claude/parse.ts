@@ -1,4 +1,5 @@
 import type {
+  AuthRequiredReason,
   BaseStreamEventFields,
   ModelUsage,
   RateLimitInfo,
@@ -6,6 +7,13 @@ import type {
 } from "../../types.js";
 
 const PROVIDER_TYPE = "claude";
+
+/** Shell command users run outside an interactive Claude session to
+ * re-authenticate. Surfaced on `auth_required` events. The in-CLI slash
+ * command is `/login`; this is the equivalent for hosts that are spawning
+ * `claude` as a subprocess and need to prompt the user to log in
+ * externally. */
+export const CLAUDE_LOGIN_COMMAND = "claude auth login";
 
 export interface ClaudeParsedResult {
   sessionId: string | null;
@@ -222,6 +230,10 @@ export function parseClaudeStreamJson(stdout: string): ClaudeParsedResult {
   let errorCode: string | null = null;
   if (isClaudeMaxTurns(stdout)) {
     errorCode = "max_turns";
+  } else if (classifyClaudeAuthFromResult(finalResult)) {
+    // Structured signal beats regex — set the canonical errorCode so
+    // execute.ts doesn't need a separate regex pass for the same fact.
+    errorCode = "auth_required";
   }
 
   const denials = finalResult["permission_denials"];
@@ -299,6 +311,19 @@ export function parseStreamLine(line: string): StreamEvent[] {
 
   if (type === "assistant") {
     const message = parseObject(event["message"]);
+    // Claude emits a "synthetic" assistant message (model === "<synthetic>")
+    // with `error: "authentication_failed"` immediately before the failing
+    // `result` event when auth is broken. Its text duplicates the result
+    // text (e.g. "Invalid API key · Fix external API key") and confuses
+    // consumers that render assistant messages — drop it entirely. The
+    // auth_required signal is emitted from the result branch below where
+    // we also have `api_error_status` available.
+    if (
+      asString(event["error"], "") === "authentication_failed" &&
+      asString(message["model"], "") === "<synthetic>"
+    ) {
+      return [];
+    }
     const messageId = asNullableString(message["id"]);
     const base = baseFieldsFromEvent(event, messageId);
     const out: StreamEvent[] = [];
@@ -358,7 +383,19 @@ export function parseStreamLine(line: string): StreamEvent[] {
   }
 
   if (type === "result") {
-    return [{
+    const out: StreamEvent[] = [];
+    const auth = classifyClaudeAuthFromResult(event);
+    if (auth) {
+      out.push({
+        type: "auth_required",
+        httpStatus: auth.httpStatus,
+        reason: auth.reason,
+        loginCommand: CLAUDE_LOGIN_COMMAND,
+        message: auth.message,
+        ...baseFieldsFromEvent(event, null),
+      });
+    }
+    out.push({
       type: "result",
       text: asString(event["result"], ""),
       costUsd: asNullableNumber(event["total_cost_usd"]),
@@ -368,7 +405,8 @@ export function parseStreamLine(line: string): StreamEvent[] {
       numTurns: asNullableNumber(event["num_turns"]),
       durationMs: asNullableNumber(event["duration_ms"]),
       ...baseFieldsFromEvent(event, null),
-    }];
+    });
+    return out;
   }
 
   // Forward-compat: surface any unrecognized event type with full base fields
@@ -380,7 +418,17 @@ export function parseStreamLine(line: string): StreamEvent[] {
   }];
 }
 
-const CLAUDE_AUTH_REQUIRED_RE = /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+`?claude\s+login`?|login\s+required|requires\s+login|unauthorized|authentication\s+required)/i;
+/**
+ * Loose text-match fallback for `isClaudeAuthRequired` — used by execute.ts
+ * before the structured `api_error_status` check was added, and kept for
+ * forward-compat when Claude introduces new auth phrasings before we model
+ * them. Prefer `classifyClaudeAuthFromResult` for new code; it works off
+ * structured wire fields plus the documented user-facing strings.
+ *
+ * Source of strings: https://code.claude.com/docs/en/errors
+ */
+const CLAUDE_AUTH_REQUIRED_RE =
+  /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+`?(?:claude\s+(?:auth\s+)?login|\/login)`?|login\s+required|requires\s+login|unauthorized|authentication\s+required|authentication_failed|authentication_error|oauth\s+token\s+(?:has\s+expired|revoked)|does\s+not\s+meet\s+scope\s+requirement|invalid\s+api\s+key|invalid\s+bearer\s+token|disabled\s+organization|routines\s+are\s+disabled)/i;
 const CLAUDE_UNKNOWN_SESSION_RE = /no conversation found with session id|unknown session|session .* not found/i;
 
 export function isClaudeUnknownSessionError(stdout: string, stderr: string): boolean {
@@ -390,6 +438,68 @@ export function isClaudeUnknownSessionError(stdout: string, stderr: string): boo
 export function isClaudeAuthRequired(stdout: string, stderr: string): boolean {
   return CLAUDE_AUTH_REQUIRED_RE.test(stdout) || CLAUDE_AUTH_REQUIRED_RE.test(stderr);
 }
+
+/**
+ * Map Claude's user-facing auth error text to a stable `AuthRequiredReason`.
+ * Strings sourced from https://code.claude.com/docs/en/errors. Case
+ * insensitive; lenient substring match — the documented phrasings are
+ * stable, but treat unrecognized text as `"unknown"` rather than throwing
+ * so consumers still get an event with a usable httpStatus.
+ */
+function authReasonFromText(text: string): AuthRequiredReason {
+  const t = text.toLowerCase();
+  // Order matters: "OAuth token has expired" must beat the generic
+  // `disabled` substring below.
+  if (t.includes("oauth token has expired") || t.includes("token has expired")) return "expired";
+  if (t.includes("oauth token revoked") || t.includes("token revoked")) return "revoked";
+  if (t.includes("not logged in")) return "missing";
+  if (t.includes("does not meet scope requirement") || t.includes("scope requirement")) return "scope";
+  if (t.includes("disabled organization") || t.includes("organization has been disabled")) return "disabled_org";
+  if (t.includes("routines are disabled")) return "routines_disabled";
+  if (t.includes("invalid api key")) return "invalid";
+  // Bearer token / Bedrock security token fall under "invalid"
+  if (t.includes("invalid bearer token") || t.includes("security token") || t.includes("failed to authenticate")) {
+    return "invalid";
+  }
+  return "unknown";
+}
+
+/**
+ * Classify a Claude `result` event as an auth failure. Returns null when
+ * the event isn't an auth failure (success, max-turns, rate-limit, etc.).
+ *
+ * Detection priority:
+ * 1. `api_error_status` is 401 or 403 — definitive HTTP-level auth failure.
+ * 2. `is_error: true` AND the result text matches a documented auth string
+ *    (covers the CLI's short-circuit "Not logged in" path where
+ *    `api_error_status` is null because no HTTP call ever happened).
+ *
+ * Exported so the streaming session path (`session.ts`) can run the same
+ * classification — its `handleResult` consumes `result` events directly
+ * and never goes through `parseStreamLine`.
+ *
+ * @internal
+ */
+export function classifyClaudeAuthFromResult(event: Record<string, unknown>): {
+  httpStatus: number | null;
+  reason: AuthRequiredReason;
+  message: string | null;
+} | null {
+  if (event["is_error"] !== true) return null;
+  const text = asString(event["result"], "");
+  const apiStatus = event["api_error_status"];
+  if (apiStatus === 401 || apiStatus === 403) {
+    return { httpStatus: apiStatus, reason: authReasonFromText(text), message: text || null };
+  }
+  // Short-circuit path: no HTTP round trip happened (api_error_status is
+  // null), but the result text still carries the documented auth string.
+  const reason = authReasonFromText(text);
+  if (reason !== "unknown") {
+    return { httpStatus: null, reason, message: text || null };
+  }
+  return null;
+}
+
 
 /**
  * Pulls Claude's inner discriminator and payload out of an `unknown`

@@ -339,6 +339,37 @@ export interface BaseStreamEventFields {
   raw: Record<string, unknown>;
 }
 
+/**
+ * Categorical reason for an `auth_required` event. Derived from the
+ * provider's user-facing error text. Stable across providers — new
+ * provider integrations should map their auth strings into this set
+ * rather than introducing per-provider variants.
+ *
+ * Mappings for Claude (from https://code.claude.com/docs/en/errors):
+ * - `expired` — `OAuth token has expired · Please run /login`
+ * - `revoked` — `OAuth token revoked · Please run /login`
+ * - `missing` — `Not logged in · Please run /login`
+ * - `invalid` — `Invalid API key · Fix external API key`, `Failed to
+ *   authenticate. API Error: 401 Invalid bearer token`, Bedrock 403
+ *   "security token included in the request is invalid"
+ * - `scope` — `OAuth token does not meet scope requirement: <scope>`
+ * - `disabled_org` — `Your ANTHROPIC_API_KEY belongs to a disabled
+ *   organization · ...`
+ * - `routines_disabled` — `Routines are disabled by your organization's
+ *   policy.`
+ * - `unknown` — anything we couldn't classify (still emitted, but the
+ *   consumer can't branch on a specific recovery path).
+ */
+export type AuthRequiredReason =
+  | "expired"
+  | "revoked"
+  | "missing"
+  | "invalid"
+  | "scope"
+  | "disabled_org"
+  | "routines_disabled"
+  | "unknown";
+
 // Stream events — discriminated union
 export type StreamEvent =
   | ({
@@ -374,6 +405,36 @@ export type StreamEvent =
       resetAt: string | null;
       overageStatus: string | null;
       isUsingOverage: boolean | null;
+    } & BaseStreamEventFields)
+  /**
+   * Emitted when the provider's API rejected the request because the user
+   * is not authenticated. Distinct from `rate_limit` and from generic
+   * `result.isError` outcomes. Consumers should surface a login button or
+   * banner; the running session is unrecoverable until the user re-auths
+   * and (typically) the session handle is recycled.
+   *
+   * Driven by structured wire fields (Claude: `api_error_status` 401/403 on
+   * the `result` event and `error: "authentication_failed"` on the
+   * synthetic-assistant message). Falls back to text-match against the
+   * documented user-facing strings (see https://code.claude.com/docs/en/errors)
+   * for cases where the CLI short-circuits before any HTTP round-trip
+   * (`Not logged in · Please run /login`).
+   */
+  | ({
+      type: "auth_required";
+      /**
+       * Upstream HTTP status that triggered this. 401 or 403 when the CLI
+       * actually reached the API; null when the CLI short-circuited (e.g.
+       * `Not logged in` before any network call) or when derived from a
+       * text-only signal.
+       */
+      httpStatus: number | null;
+      /** Categorical reason. Stable across providers. */
+      reason: AuthRequiredReason;
+      /** Provider-recommended recovery command, e.g. `claude auth login`. */
+      loginCommand: string;
+      /** Provider's human-readable message for display. Not for branching. */
+      message: string | null;
     } & BaseStreamEventFields)
   /**
    * Permission mode change. Claude emits a top-level `permission-mode` event

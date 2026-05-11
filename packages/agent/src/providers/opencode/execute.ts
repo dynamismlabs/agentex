@@ -176,6 +176,25 @@ export async function executeOpenCodeProvider(ctx: ExecutionContext): Promise<Ex
   }
   if (!errorCode && isOpenCodeAuthRequired(proc.stdout, proc.stderr)) {
     errorCode = "auth_required";
+    if (ctx.onEvent) {
+      try {
+        await ctx.onEvent({
+          type: "auth_required",
+          httpStatus: null,
+          reason: "missing",
+          loginCommand: "opencode auth login",
+          message: parsed.errorMessage,
+          timestamp: new Date().toISOString(),
+          providerType: "opencode",
+          sessionId: parsed.sessionId,
+          messageId: null,
+          eventId: null,
+          turnId: null,
+          parentToolCallId: null,
+          raw: {},
+        });
+      } catch { /* swallow */ }
+    }
   }
 
   const errorMessage = (() => {

@@ -8,7 +8,7 @@ import { buildSkillsDir, cleanupSkillsDir } from "../../utils/skills.js";
 import { uuidv7 } from "../../utils/uuid.js";
 import { prepareWorkspace } from "../../utils/workspace.js";
 import type { PreparedWorkspace } from "../../utils/workspace.js";
-import { parseClaudeStreamJson, parseStreamLine, isClaudeUnknownSessionError, isClaudeAuthRequired } from "./parse.js";
+import { parseClaudeStreamJson, parseStreamLine, isClaudeUnknownSessionError, isClaudeAuthRequired, CLAUDE_LOGIN_COMMAND } from "./parse.js";
 
 export async function executeClaudeProvider(ctx: ExecutionContext): Promise<ExecutionResult> {
   const runId = ctx.runId ?? uuidv7();
@@ -182,7 +182,12 @@ export async function executeClaudeProvider(ctx: ExecutionContext): Promise<Exec
     const parsed = parseClaudeStreamJson(proc.stdout);
     const processErrorCode = deriveErrorCode(proc);
 
-    // Determine error code: process-level errors take precedence, then provider-specific
+    // Determine error code: process-level errors take precedence, then provider-specific.
+    // parsed.errorCode already covers `auth_required` when the structured
+    // signal (api_error_status 401/403 or documented auth text) fired in
+    // parseClaudeStreamJson. The regex fallback below catches edge cases
+    // where the CLI bailed before emitting a result event at all (binary
+    // failure, stderr-only error from a wrapper).
     let errorCode = processErrorCode;
     if (!errorCode && parsed.errorCode) {
       errorCode = parsed.errorCode;
@@ -193,7 +198,14 @@ export async function executeClaudeProvider(ctx: ExecutionContext): Promise<Exec
 
     const errorMessage = (() => {
       if (proc.timedOut) return `Timed out after ${config.timeoutSec ?? 0}s`;
-      if (errorCode === "auth_required") return "Claude requires authentication. Run `claude login`.";
+      if (errorCode === "auth_required") {
+        // Prefer the provider's user-facing string when we captured it,
+        // so callers can show "OAuth token has expired" rather than a
+        // generic banner. Fall back to a recovery hint otherwise.
+        return parsed.summary
+          ? `${parsed.summary} (run \`${CLAUDE_LOGIN_COMMAND}\`)`
+          : `Claude requires authentication. Run \`${CLAUDE_LOGIN_COMMAND}\`.`;
+      }
       if ((proc.exitCode ?? 0) !== 0 && !parsed.summary) {
         const stderrLine = proc.stderr.split(/\r?\n/).map((l) => l.trim()).find(Boolean);
         return stderrLine ?? `Claude exited with code ${proc.exitCode ?? -1}`;

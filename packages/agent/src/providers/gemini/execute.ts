@@ -183,6 +183,25 @@ export async function executeGeminiProvider(ctx: ExecutionContext): Promise<Exec
   let errorCode = processErrorCode;
   if (!errorCode && isGeminiAuthRequired(proc.stdout, proc.stderr)) {
     errorCode = "auth_required";
+    if (ctx.onEvent) {
+      try {
+        await ctx.onEvent({
+          type: "auth_required",
+          httpStatus: null,
+          reason: "missing",
+          loginCommand: "gemini",
+          message: parsed.errorMessage,
+          timestamp: new Date().toISOString(),
+          providerType: "gemini",
+          sessionId: parsed.sessionId,
+          messageId: null,
+          eventId: null,
+          turnId: null,
+          parentToolCallId: null,
+          raw: {},
+        });
+      } catch { /* swallow */ }
+    }
   }
   if (!errorCode && isGeminiTurnLimit(proc.exitCode)) {
     errorCode = "max_turns";

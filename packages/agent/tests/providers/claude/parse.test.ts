@@ -6,11 +6,17 @@ import {
   isClaudeUnknownSessionError,
   isClaudeAuthRequired,
   isClaudeMaxTurns,
+  classifyClaudeAuthFromResult,
+  CLAUDE_LOGIN_COMMAND,
 } from "../../../src/providers/claude/parse.js";
 import {
   CLAUDE_SUCCESS_OUTPUT,
   CLAUDE_MAX_TURNS_OUTPUT,
   CLAUDE_AUTH_REQUIRED_OUTPUT,
+  CLAUDE_AUTH_INVALID_API_KEY_OUTPUT,
+  CLAUDE_AUTH_NOT_LOGGED_IN_OUTPUT,
+  CLAUDE_AUTH_OAUTH_EXPIRED_OUTPUT,
+  CLAUDE_AUTH_BEDROCK_BAD_OUTPUT,
   CLAUDE_UNKNOWN_SESSION_OUTPUT,
   CLAUDE_MALFORMED_OUTPUT,
   CLAUDE_TOOL_USE_OUTPUT,
@@ -325,5 +331,195 @@ describe("isClaudeMaxTurns", () => {
 
   it("returns false for normal output", () => {
     expect(isClaudeMaxTurns(CLAUDE_SUCCESS_OUTPUT)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// auth_required emission — structured signal-driven, not text-match
+// ---------------------------------------------------------------------------
+
+describe("auth_required stream event", () => {
+  it("emits auth_required + result for invalid API key (api_error_status=401)", () => {
+    const events = toStreamEvents(CLAUDE_AUTH_INVALID_API_KEY_OUTPUT);
+    const authEvents = events.filter((e) => e.type === "auth_required");
+    expect(authEvents).toHaveLength(1);
+    const auth = authEvents[0]!;
+    if (auth.type !== "auth_required") throw new Error("type narrow");
+    expect(auth.httpStatus).toBe(401);
+    expect(auth.reason).toBe("invalid");
+    expect(auth.loginCommand).toBe(CLAUDE_LOGIN_COMMAND);
+    expect(auth.message).toBe("Invalid API key · Fix external API key");
+    expect(auth.providerType).toBe("claude");
+    expect(auth.sessionId).toBe("sess-bad-api-key");
+    // The result event still fires alongside.
+    expect(events.filter((e) => e.type === "result")).toHaveLength(1);
+  });
+
+  it("suppresses the synthetic-assistant message that duplicates the auth error text", () => {
+    const events = toStreamEvents(CLAUDE_AUTH_INVALID_API_KEY_OUTPUT);
+    expect(events.filter((e) => e.type === "assistant")).toHaveLength(0);
+  });
+
+  it("classifies short-circuited 'Not logged in' as reason=missing with httpStatus=null", () => {
+    const events = toStreamEvents(CLAUDE_AUTH_NOT_LOGGED_IN_OUTPUT);
+    const auth = events.find((e) => e.type === "auth_required");
+    expect(auth).toBeDefined();
+    if (auth?.type !== "auth_required") throw new Error("type narrow");
+    expect(auth.httpStatus).toBeNull();
+    expect(auth.reason).toBe("missing");
+    expect(auth.message).toBe("Not logged in · Please run /login");
+  });
+
+  it("classifies OAuth expired text", () => {
+    const events = toStreamEvents(CLAUDE_AUTH_OAUTH_EXPIRED_OUTPUT);
+    const auth = events.find((e) => e.type === "auth_required");
+    if (auth?.type !== "auth_required") throw new Error("expected auth_required");
+    expect(auth.reason).toBe("expired");
+    expect(auth.httpStatus).toBe(401);
+  });
+
+  it("classifies bedrock 403 as reason=invalid", () => {
+    const events = toStreamEvents(CLAUDE_AUTH_BEDROCK_BAD_OUTPUT);
+    const auth = events.find((e) => e.type === "auth_required");
+    if (auth?.type !== "auth_required") throw new Error("expected auth_required");
+    expect(auth.httpStatus).toBe(403);
+    expect(auth.reason).toBe("invalid");
+  });
+
+  it("does not emit auth_required for successful runs", () => {
+    const events = toStreamEvents(CLAUDE_SUCCESS_OUTPUT);
+    expect(events.filter((e) => e.type === "auth_required")).toHaveLength(0);
+  });
+
+  it("does not emit auth_required for max_turns errors", () => {
+    const events = toStreamEvents(CLAUDE_MAX_TURNS_OUTPUT);
+    expect(events.filter((e) => e.type === "auth_required")).toHaveLength(0);
+  });
+
+  it("does not emit auth_required for plain rate-limit results", () => {
+    // A 429 stream — is_error: true but no auth-shaped text, no
+    // api_error_status of 401/403.
+    const stdout = [
+      JSON.stringify({ type: "system", subtype: "init", session_id: "s-429", model: "m" }),
+      JSON.stringify({
+        type: "result",
+        is_error: true,
+        api_error_status: 429,
+        result: "API Error: Request rejected (429) · this may be a temporary capacity issue",
+        session_id: "s-429",
+      }),
+    ].join("\n");
+    const events = toStreamEvents(stdout);
+    expect(events.filter((e) => e.type === "auth_required")).toHaveLength(0);
+  });
+
+  it("does not emit auth_required for 500 server errors", () => {
+    const stdout = [
+      JSON.stringify({ type: "system", subtype: "init", session_id: "s-500", model: "m" }),
+      JSON.stringify({
+        type: "result",
+        is_error: true,
+        api_error_status: 500,
+        result: "API Error: 500 Internal server error",
+        session_id: "s-500",
+      }),
+    ].join("\n");
+    const events = toStreamEvents(stdout);
+    expect(events.filter((e) => e.type === "auth_required")).toHaveLength(0);
+    // The result event should still surface the error.
+    const result = events.find((e) => e.type === "result");
+    if (result?.type !== "result") throw new Error("expected result");
+    expect(result.isError).toBe(true);
+  });
+
+  it("preserves the synthetic-assistant suppression only for the authentication_failed variant", () => {
+    // Regular assistant events without the auth signal should still emit.
+    const line = JSON.stringify({
+      type: "assistant",
+      message: {
+        id: "msg-real",
+        model: "claude-opus-4-7",
+        content: [{ type: "text", text: "Hello!" }],
+      },
+      session_id: "s-real",
+    });
+    const events = parseStreamLine(line);
+    expect(events).toHaveLength(1);
+    expect(events[0]!.type).toBe("assistant");
+  });
+});
+
+describe("classifyClaudeAuthFromResult", () => {
+  it("returns null for non-error results", () => {
+    expect(classifyClaudeAuthFromResult({ is_error: false, result: "ok" })).toBeNull();
+  });
+
+  it("returns null for is_error results without auth indicators", () => {
+    expect(
+      classifyClaudeAuthFromResult({
+        is_error: true,
+        api_error_status: 429,
+        result: "rate limited",
+      }),
+    ).toBeNull();
+  });
+
+  it.each([
+    ["OAuth token has expired · Please run /login", "expired"],
+    ["OAuth token revoked · Please run /login", "revoked"],
+    ["Not logged in · Please run /login", "missing"],
+    ["Invalid API key · Fix external API key", "invalid"],
+    ["OAuth token does not meet scope requirement: user:profile", "scope"],
+    [
+      "Your ANTHROPIC_API_KEY belongs to a disabled organization · ...",
+      "disabled_org",
+    ],
+    ["Routines are disabled by your organization's policy.", "routines_disabled"],
+    ["Failed to authenticate. API Error: 401 Invalid bearer token", "invalid"],
+  ])("maps %s → reason=%s", (text, expectedReason) => {
+    const out = classifyClaudeAuthFromResult({
+      is_error: true,
+      api_error_status: 401,
+      result: text,
+    });
+    expect(out?.reason).toBe(expectedReason);
+  });
+
+  it("preserves httpStatus=null when api_error_status is absent (short-circuit path)", () => {
+    const out = classifyClaudeAuthFromResult({
+      is_error: true,
+      result: "Not logged in · Please run /login",
+    });
+    expect(out?.httpStatus).toBeNull();
+    expect(out?.reason).toBe("missing");
+  });
+
+  it("returns reason=unknown for an unrecognized 401 text but still emits", () => {
+    const out = classifyClaudeAuthFromResult({
+      is_error: true,
+      api_error_status: 401,
+      result: "Some new auth phrasing the docs haven't documented yet",
+    });
+    expect(out).not.toBeNull();
+    expect(out?.reason).toBe("unknown");
+    expect(out?.httpStatus).toBe(401);
+  });
+});
+
+describe("parseClaudeStreamJson errorCode", () => {
+  it("sets errorCode=auth_required from structured signal", () => {
+    const result = parseClaudeStreamJson(CLAUDE_AUTH_INVALID_API_KEY_OUTPUT);
+    expect(result.errorCode).toBe("auth_required");
+    expect(result.isError).toBe(true);
+  });
+
+  it("sets errorCode=auth_required from short-circuit 'Not logged in' text", () => {
+    const result = parseClaudeStreamJson(CLAUDE_AUTH_NOT_LOGGED_IN_OUTPUT);
+    expect(result.errorCode).toBe("auth_required");
+  });
+
+  it("still detects max_turns when both signals could fire", () => {
+    const result = parseClaudeStreamJson(CLAUDE_MAX_TURNS_OUTPUT);
+    expect(result.errorCode).toBe("max_turns");
   });
 });
