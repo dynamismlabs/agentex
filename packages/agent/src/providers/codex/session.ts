@@ -4,6 +4,7 @@ import type {
   AgentSession,
   SessionContext,
   SessionState,
+  StreamEvent,
   TurnResult,
 } from "../../types.js";
 import { findBinary } from "../../utils/binary.js";
@@ -158,7 +159,8 @@ export async function createCodexSession(ctx: SessionContext): Promise<AgentSess
 // Implementation
 // ---------------------------------------------------------------------------
 
-class CodexSessionImpl implements AgentSession {
+/** @internal Exported for unit testing — not part of the public API. */
+export class CodexSessionImpl implements AgentSession {
   private _state: SessionState = "idle";
   private _threadId: string | null = null;
   private _lineBuffer = "";
@@ -179,6 +181,14 @@ class CodexSessionImpl implements AgentSession {
   private _turnIsError = false;
   private _turnErrorMessage: string | null = null;
   private _turnStartedAt: Date | null = null;
+
+  /**
+   * Serial dispatch chain for `onEvent`. Each dispatched event appends a
+   * handler invocation; the chain enforces in-order delivery and lets
+   * `send()` await all handlers for the turn before resolving. Approval
+   * RPCs stay synchronous and are not gated on this chain.
+   */
+  private _eventChain: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly proc: ChildProcess,
@@ -471,8 +481,10 @@ class CodexSessionImpl implements AgentSession {
     if (method === "turn/failed") {
       this._turnIsError = true;
       this._turnErrorMessage = str(params, "message") || str(params, "error") || "Turn failed";
-      this.resolveTurn();
+      // Emit before resolve so the result event is queued onto _eventChain
+      // before resolveTurn awaits it.
       this.emitStreamEvent(rawLine);
+      this.resolveTurn();
       return;
     }
 
@@ -514,8 +526,10 @@ class CodexSessionImpl implements AgentSession {
     if (type === "turn.failed" || type === "error") {
       this._turnIsError = true;
       this._turnErrorMessage = str(event, "message") || str(event, "error") || "Turn failed";
-      this.resolveTurn();
+      // Emit before resolve so the result event is queued onto _eventChain
+      // before resolveTurn awaits it.
       this.emitStreamEvent(rawLine);
+      this.resolveTurn();
       return;
     }
 
@@ -566,30 +580,33 @@ class CodexSessionImpl implements AgentSession {
     const model = str(params, "model");
     if (model) this._turnModel = model;
 
+    // Dispatch the synthesized result event BEFORE resolving the turn, so it
+    // is queued onto _eventChain and resolveTurn → deliverTurnResult drains
+    // it before the awaiting send() returns. We synthesize here (rather than
+    // routing the raw turn/completed line through emitStreamEvent) because
+    // parseCodexStreamLine yields `text: ""` for turn.completed — the
+    // accumulated `_turnSummary` from item.completed events is the useful
+    // payload to carry on the result event.
+    this.dispatchEvent({
+      type: "result",
+      text: this._turnSummary ?? "",
+      costUsd: null,
+      isError: this._turnIsError,
+      stopReason: null,
+      terminalReason: null,
+      numTurns: null,
+      durationMs: null,
+      timestamp: new Date().toISOString(),
+      providerType: "codex",
+      sessionId: this._threadId,
+      messageId: null,
+      eventId: null,
+      turnId: null,
+      parentToolCallId: null,
+      raw: params,
+    });
+
     this.resolveTurn();
-    // Also emit as stream event for the raw line
-    if (this.ctx.onEvent) {
-      try {
-        void this.ctx.onEvent({
-          type: "result",
-          text: this._turnSummary ?? "",
-          costUsd: null,
-          isError: this._turnIsError,
-          stopReason: null,
-          terminalReason: null,
-          numTurns: null,
-          durationMs: null,
-          timestamp: new Date().toISOString(),
-          providerType: "codex",
-          sessionId: this._threadId,
-          messageId: null,
-          eventId: null,
-          turnId: null,
-          parentToolCallId: null,
-          raw: params,
-        });
-      } catch { /* swallow */ }
-    }
   }
 
   private resolveTurn(): void {
@@ -608,15 +625,15 @@ class CodexSessionImpl implements AgentSession {
       }).catch(() => {
         // Non-fatal — usage stays undefined
       }).finally(() => {
-        this.deliverTurnResult(usage);
+        void this.deliverTurnResult(usage);
       });
       return;
     }
 
-    this.deliverTurnResult(usage);
+    void this.deliverTurnResult(usage);
   }
 
-  private deliverTurnResult(usage: Record<string, import("../../types.js").TokenUsage> | undefined): void {
+  private async deliverTurnResult(usage: Record<string, import("../../types.js").TokenUsage> | undefined): Promise<void> {
     const result: TurnResult = {
       summary: this._turnSummary,
       usage,
@@ -625,6 +642,19 @@ class CodexSessionImpl implements AgentSession {
       errorCode: this._turnIsError ? "execution_error" : null,
       errorMessage: this._turnErrorMessage,
     };
+
+    // Drain pending onEvent handlers so callers awaiting send() see a settled
+    // DB / log / UI state by the time TurnResult resolves. The chain snapshot
+    // here covers every event queued up to and including the result event;
+    // later events extend the chain but aren't awaited.
+    await this._eventChain;
+
+    // The await above yields the event loop; the process may have exited
+    // (or the session closed) during that window, in which case the exit
+    // handler already rejected the turn and set state to "closed". Don't
+    // overwrite that with "idle" — it would falsely advertise a usable
+    // session whose stdin is dead.
+    if (this._state === "closed") return;
 
     this._state = "idle";
     if (this._turnResolve) {
@@ -641,8 +671,20 @@ class CodexSessionImpl implements AgentSession {
     // carry sessionId. v2 notifications parse threadId from params directly
     // and ignore this arg.
     const event = parseCodexStreamLine(rawLine, this._threadId);
-    if (event) {
-      try { void this.ctx.onEvent(event); } catch { /* swallow */ }
-    }
+    if (event) this.dispatchEvent(event);
+  }
+
+  /**
+   * Queue an event for in-order delivery to `onEvent`. Each call appends a
+   * `.then` to `_eventChain` so handler N+1 only starts after handler N's
+   * returned promise settles. Errors are swallowed inside the chain so a
+   * throwing handler does not break delivery of subsequent events.
+   */
+  private dispatchEvent(event: StreamEvent): void {
+    const cb = this.ctx.onEvent;
+    if (!cb) return;
+    this._eventChain = this._eventChain.then(async () => {
+      try { await cb(event); } catch { /* swallow */ }
+    });
   }
 }

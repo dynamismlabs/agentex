@@ -140,6 +140,15 @@ export interface ExecutionContext {
   sessionParams?: Record<string, unknown> | null;
   config?: ProviderConfig;
   onOutput?: (stream: "stdout" | "stderr", chunk: string) => void | Promise<void>;
+  /**
+   * Called for every stream event. Handlers are awaited in event order — the
+   * next handler does not start until the previous one's returned promise
+   * settles. `execute()` resolves only after every handler for events up to
+   * and including the run's terminal `result` event has settled.
+   *
+   * A handler that throws is swallowed; the chain continues with the next
+   * event.
+   */
   onEvent?: (event: StreamEvent) => void | Promise<void>;
   onStart?: (pid: number) => void;
   /** AbortSignal to cancel execution. When aborted, the process receives SIGTERM
@@ -705,7 +714,18 @@ export interface SessionContext {
    *  and the underlying process is terminated. */
   signal?: AbortSignal;
 
-  /** Called for every stream event across all turns. */
+  /**
+   * Called for every stream event across all turns. Handlers are awaited in
+   * event order — the next handler does not start until the previous one's
+   * returned promise settles. `send()` resolves only after every handler for
+   * events up to and including the turn's terminal `result` event has
+   * settled. Trailing events the provider may emit after the result event
+   * (rare: late `system`/`rate_limit` lines) are still dispatched in order
+   * but may run after `send()` resolves.
+   *
+   * A handler that throws is swallowed; the chain continues with the next
+   * event.
+   */
   onEvent?: (event: StreamEvent) => void | Promise<void>;
   /** Called for raw stdout/stderr output across all turns. */
   onOutput?: (stream: "stdout" | "stderr", chunk: string) => void | Promise<void>;

@@ -5,6 +5,7 @@ import type {
   AgentSession,
   SessionContext,
   SessionState,
+  StreamEvent,
   TurnResult,
   UserInputResponse,
 } from "../../types.js";
@@ -189,7 +190,8 @@ export async function createClaudeSession(ctx: SessionContext): Promise<AgentSes
 // Implementation
 // ---------------------------------------------------------------------------
 
-class ClaudeSessionImpl implements AgentSession {
+/** @internal Exported for unit testing — not part of the public API. */
+export class ClaudeSessionImpl implements AgentSession {
   private _state: SessionState = "idle";
   private _sessionId: string | null = null;
   private _lineBuffer = "";
@@ -205,6 +207,14 @@ class ClaudeSessionImpl implements AgentSession {
    * one of these, we remove it so the stale response is never sent back.
    */
   private _pendingCallbacks = new Set<string>();
+
+  /**
+   * Serial dispatch chain for `onEvent`. Each dispatched event appends a
+   * handler invocation; the chain enforces in-order delivery and lets
+   * `send()` await all handlers for the turn before resolving. Control
+   * requests stay synchronous and are not gated on this chain.
+   */
+  private _eventChain: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly proc: ChildProcess,
@@ -362,9 +372,14 @@ class ClaudeSessionImpl implements AgentSession {
       return;
     }
 
-    // Result event — turn is complete
+    // Result event — turn is complete. Forward to onEvent first (via
+    // handleStreamMessage / parseStreamLine) so the wire event flows through
+    // the same path as every other line; then resolve the TurnResult. The
+    // await inside handleResult drains the chain so handlers settle before
+    // the awaiting send() returns.
     if (type === "result") {
-      this.handleResult(msg);
+      this.handleStreamMessage(msg, line);
+      void this.handleResult(msg);
       return;
     }
 
@@ -569,7 +584,7 @@ class ClaudeSessionImpl implements AgentSession {
   // Result handling
   // -------------------------------------------------------------------------
 
-  private handleResult(msg: Record<string, unknown>): void {
+  private async handleResult(msg: Record<string, unknown>): Promise<void> {
     const summary = typeof msg["result"] === "string" ? msg["result"] : null;
     const isError = msg["is_error"] === true;
     const costUsd = typeof msg["total_cost_usd"] === "number" ? msg["total_cost_usd"] : null;
@@ -620,30 +635,6 @@ class ClaudeSessionImpl implements AgentSession {
       status = "failed";
     }
 
-    // The result event bypasses handleStreamMessage (handleLine routes it
-    // to handleResult), so parseStreamLine never runs against it in the
-    // streaming session. Emit auth_required here so consumers wired to
-    // onEvent see the same signal they would on the one-shot path.
-    if (authClassification && this.ctx.onEvent) {
-      try {
-        void this.ctx.onEvent({
-          type: "auth_required",
-          httpStatus: authClassification.httpStatus,
-          reason: authClassification.reason,
-          loginCommand: CLAUDE_LOGIN_COMMAND,
-          message: authClassification.message,
-          timestamp: new Date().toISOString(),
-          providerType: "claude",
-          sessionId: this._sessionId,
-          messageId: null,
-          eventId: null,
-          turnId: null,
-          parentToolCallId: null,
-          raw: msg,
-        });
-      } catch { /* swallow */ }
-    }
-
     const errorMessage = (() => {
       if (authClassification) {
         return summary
@@ -661,6 +652,19 @@ class ClaudeSessionImpl implements AgentSession {
       errorCode,
       errorMessage,
     };
+
+    // Drain pending onEvent handlers so callers awaiting send() see a
+    // settled DB / log / UI state by the time TurnResult resolves. The
+    // chain snapshot here covers every event queued up to and including
+    // the result event; later events extend the chain but aren't awaited.
+    await this._eventChain;
+
+    // The await above yields the event loop; the process may have exited
+    // (or the session closed) during that window, in which case the exit
+    // handler already rejected the turn and set state to "closed". Don't
+    // overwrite that with "idle" — it would falsely advertise a usable
+    // session whose stdin is dead.
+    if (this._state === "closed") return;
 
     this._state = "idle";
     if (this._turnResolve) {
@@ -691,12 +695,26 @@ class ClaudeSessionImpl implements AgentSession {
       this._state = "thinking";
     }
 
-    // Forward as StreamEvent via onEvent callback
+    // Forward as StreamEvent via the serial dispatch chain
     if (this.ctx.onEvent) {
       for (const event of parseStreamLine(rawLine)) {
-        try { void this.ctx.onEvent(event); } catch { /* swallow */ }
+        this.dispatchEvent(event);
       }
     }
+  }
+
+  /**
+   * Queue an event for in-order delivery to `onEvent`. Each call appends a
+   * `.then` to `_eventChain` so handler N+1 only starts after handler N's
+   * returned promise settles. Errors are swallowed inside the chain so a
+   * throwing handler does not break delivery of subsequent events.
+   */
+  private dispatchEvent(event: StreamEvent): void {
+    const cb = this.ctx.onEvent;
+    if (!cb) return;
+    this._eventChain = this._eventChain.then(async () => {
+      try { await cb(event); } catch { /* swallow */ }
+    });
   }
 
 }
