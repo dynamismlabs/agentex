@@ -1,6 +1,6 @@
 {
   "name": "@agentex/agent",
-  "version": "0.0.10",
+  "version": "0.0.11",
   "description": "Programmatic execution of AI coding agents (Claude Code, Codex, OpenClaw)",
   "type": "module",
   "exports": {

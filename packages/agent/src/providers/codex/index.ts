@@ -21,3 +21,19 @@ export const codexProvider: ProviderModule = {
   resolveAuth: (ctx) => resolveAuthForProvider("codex", ctx),
   sessionCodec: codexSessionCodec,
 };
+
+export {
+  getCodexTranscriptPath,
+  readCodexTranscript,
+  peekCodexTranscript,
+  parseCodexLine,
+  resolveCodexHome,
+} from "./transcript.js";
+export type {
+  GetCodexTranscriptPathOptions,
+  CodexTranscriptLocation,
+  ReadCodexTranscriptOptions,
+  CodexTranscriptYield,
+  CodexTranscriptLine,
+  CodexPeekResult,
+} from "./transcript.js";

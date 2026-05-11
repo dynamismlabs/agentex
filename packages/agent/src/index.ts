@@ -31,6 +31,37 @@ export {
   classifyClaudeAuthFromResult,
   CLAUDE_LOGIN_COMMAND,
 } from "./providers/claude/parse.js";
+export {
+  getClaudeTranscriptPath,
+  readClaudeTranscript,
+  peekClaudeTranscript,
+  sanitizeProjectPath,
+  resolveClaudeHome,
+  canonicalizeCwd,
+  MAX_SANITIZED_LENGTH,
+} from "./providers/claude/transcript.js";
+export type {
+  GetClaudeTranscriptPathOptions,
+  ClaudeTranscriptLocation,
+  ReadClaudeTranscriptOptions,
+  ClaudeTranscriptYield,
+  ClaudePeekResult,
+} from "./providers/claude/transcript.js";
+export {
+  getCodexTranscriptPath,
+  readCodexTranscript,
+  peekCodexTranscript,
+  parseCodexLine,
+  resolveCodexHome,
+} from "./providers/codex/transcript.js";
+export type {
+  GetCodexTranscriptPathOptions,
+  CodexTranscriptLocation,
+  ReadCodexTranscriptOptions,
+  CodexTranscriptYield,
+  CodexTranscriptLine,
+  CodexPeekResult,
+} from "./providers/codex/transcript.js";
 
 // Skills
 export {

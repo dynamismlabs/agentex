@@ -34,3 +34,20 @@ export const claudeProvider: ProviderModule = {
   sessionCodec: claudeSessionCodec,
   checkQuota,
 };
+
+export {
+  getClaudeTranscriptPath,
+  readClaudeTranscript,
+  peekClaudeTranscript,
+  sanitizeProjectPath,
+  resolveClaudeHome,
+  canonicalizeCwd,
+  MAX_SANITIZED_LENGTH,
+} from "./transcript.js";
+export type {
+  GetClaudeTranscriptPathOptions,
+  ClaudeTranscriptLocation,
+  ReadClaudeTranscriptOptions,
+  ClaudeTranscriptYield,
+  ClaudePeekResult,
+} from "./transcript.js";
