@@ -7,6 +7,7 @@ import {
   getCodexTranscriptPath,
   parseCodexLine,
   peekCodexTranscript,
+  readCodexCwd,
   readCodexTranscript,
   resolveCodexHome,
 } from "../../../src/providers/codex/transcript.js";
@@ -298,7 +299,7 @@ describe("readCodexTranscript", () => {
 
     const types: (string | null)[] = [];
     const offsets: number[] = [];
-    for await (const { line: parsed, offset } of readCodexTranscript({ filePath: file })) {
+    for await (const { event: parsed, offset } of readCodexTranscript({ filePath: file })) {
       types.push(parsed.type);
       offsets.push(offset);
     }
@@ -316,12 +317,12 @@ describe("readCodexTranscript", () => {
       [SESSION_META_LINE, EVENT_MSG_LINE, RESPONSE_ITEM_LINE].join("\n") + "\n",
     );
     const all: { type: string | null; offset: number }[] = [];
-    for await (const { line: parsed, offset } of readCodexTranscript({ filePath: file })) {
+    for await (const { event: parsed, offset } of readCodexTranscript({ filePath: file })) {
       all.push({ type: parsed.type, offset });
     }
     const after = all.find((a) => a.type === "event_msg")!.offset;
     const tail: string[] = [];
-    for await (const { line: parsed } of readCodexTranscript({
+    for await (const { event: parsed } of readCodexTranscript({
       filePath: file,
       fromOffset: after,
     })) {
@@ -334,7 +335,7 @@ describe("readCodexTranscript", () => {
     const file = path.join(dir, "bad.jsonl");
     await writeFile(file, [SESSION_META_LINE, "{bad", RESPONSE_ITEM_LINE].join("\n") + "\n");
     const types: (string | null)[] = [];
-    for await (const { line: parsed } of readCodexTranscript({ filePath: file })) {
+    for await (const { event: parsed } of readCodexTranscript({ filePath: file })) {
       types.push(parsed.type);
     }
     expect(types).toEqual(["session_meta", "response_item"]);
@@ -356,13 +357,13 @@ describe("peekCodexTranscript", () => {
 
   it("returns nulls for a missing file", async () => {
     const res = await peekCodexTranscript(path.join(dir, "missing.jsonl"));
-    expect(res).toEqual({ lastLine: null, size: null });
+    expect(res).toEqual({ lastEvent: null, size: null });
   });
 
   it("returns zero size for an empty file", async () => {
     const file = path.join(dir, "empty.jsonl");
     await writeFile(file, "");
-    expect(await peekCodexTranscript(file)).toEqual({ lastLine: null, size: 0 });
+    expect(await peekCodexTranscript(file)).toEqual({ lastEvent: null, size: 0 });
   });
 
   it("returns the last line for a normal file", async () => {
@@ -371,14 +372,14 @@ describe("peekCodexTranscript", () => {
     await writeFile(file, content);
     const res = await peekCodexTranscript(file);
     expect(res.size).toBe(content.length);
-    expect(res.lastLine?.type).toBe("response_item");
+    expect(res.lastEvent?.type).toBe("response_item");
   });
 
   it("walks past trailing garbage line", async () => {
     const file = path.join(dir, "trailing.jsonl");
     await writeFile(file, [RESPONSE_ITEM_LINE, "garbage{"].join("\n") + "\n");
     const res = await peekCodexTranscript(file);
-    expect(res.lastLine?.type).toBe("response_item");
+    expect(res.lastEvent?.type).toBe("response_item");
   });
 
   it("reads tail of a large file", async () => {
@@ -393,6 +394,74 @@ describe("peekCodexTranscript", () => {
     lines.push(RESPONSE_ITEM_LINE);
     await writeFile(file, lines.join("\n") + "\n");
     const res = await peekCodexTranscript(file);
-    expect(res.lastLine?.type).toBe("response_item");
+    expect(res.lastEvent?.type).toBe("response_item");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// readCodexCwd (resume-by-id case for codex)
+// ---------------------------------------------------------------------------
+
+describe("readCodexCwd", () => {
+  let dir: string;
+  beforeEach(async () => {
+    dir = await mkdtemp(path.join(os.tmpdir(), "agentex-codex-cwd-"));
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("extracts cwd from the wrapped session_meta line (≥0.10 format)", async () => {
+    const file = path.join(dir, "wrapped.jsonl");
+    await writeFile(file, [SESSION_META_LINE, EVENT_MSG_LINE].join("\n") + "\n");
+    expect(await readCodexCwd(file)).toBe("/Users/turing/test");
+  });
+
+  it("extracts cwd from the legacy XML environment_context message", async () => {
+    const file = path.join(dir, "legacy-xml.jsonl");
+    const envCtx = line({
+      type: "message",
+      role: "user",
+      content: [
+        {
+          type: "input_text",
+          text: "<environment_context>\n  <cwd>/Users/turing/old-project</cwd>\n  <sandbox>x</sandbox>\n</environment_context>",
+        },
+      ],
+    });
+    await writeFile(file, [UNWRAPPED_LEGACY_FIRST, envCtx].join("\n") + "\n");
+    expect(await readCodexCwd(file)).toBe("/Users/turing/old-project");
+  });
+
+  it("extracts cwd from the legacy plaintext environment_context message", async () => {
+    // Older codex (2025-Q3) used plain text labels rather than XML tags.
+    const file = path.join(dir, "legacy-plaintext.jsonl");
+    const envCtx = line({
+      type: "message",
+      role: "user",
+      content: [
+        {
+          type: "input_text",
+          text:
+            "<environment_context>\n" +
+            "Current working directory: /Users/turing/old-plaintext\n" +
+            "Approval policy: on-request\n" +
+            "Sandbox mode: workspace-write\n" +
+            "</environment_context>",
+        },
+      ],
+    });
+    await writeFile(file, [UNWRAPPED_LEGACY_FIRST, envCtx].join("\n") + "\n");
+    expect(await readCodexCwd(file)).toBe("/Users/turing/old-plaintext");
+  });
+
+  it("returns null when no cwd is recoverable", async () => {
+    const file = path.join(dir, "no-cwd.jsonl");
+    await writeFile(file, [EVENT_MSG_LINE, RESPONSE_ITEM_LINE].join("\n") + "\n");
+    expect(await readCodexCwd(file)).toBeNull();
+  });
+
+  it("returns null for a missing file", async () => {
+    expect(await readCodexCwd(path.join(dir, "missing.jsonl"))).toBeNull();
   });
 });

@@ -6,6 +6,7 @@ import * as path from "node:path";
 import {
   MAX_SANITIZED_LENGTH,
   canonicalizeCwd,
+  findClaudeTranscriptBySessionId,
   getClaudeTranscriptPath,
   peekClaudeTranscript,
   readClaudeTranscript,
@@ -276,6 +277,128 @@ describe("getClaudeTranscriptPath", () => {
     await expect(
       getClaudeTranscriptPath({ sessionId: "s", cwd: "", claudeHome: home }),
     ).rejects.toThrow(/cwd/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// findClaudeTranscriptBySessionId (resume-by-id case)
+// ---------------------------------------------------------------------------
+
+// Claude's on-disk lines carry `cwd` on the outer envelope of every event,
+// not via a separate `system.init` line. This mirrors the real shape:
+const SAMPLE_USER_WITH_ENVELOPE = line({
+  parentUuid: null,
+  isSidechain: false,
+  userType: "external",
+  cwd: "/Users/turing/code/widgets",
+  sessionId: "sess-resume",
+  version: "2.1.70",
+  gitBranch: "main",
+  type: "user",
+  message: { role: "user", content: "hi" },
+  uuid: "u-user-init-1",
+  timestamp: "2026-05-11T00:00:00.000Z",
+  permissionMode: "default",
+});
+
+describe("findClaudeTranscriptBySessionId", () => {
+  let home: string;
+  beforeEach(async () => {
+    home = await makeTempHome();
+  });
+  afterEach(async () => {
+    await rm(home, { recursive: true, force: true });
+  });
+
+  it("returns null when no transcript exists", async () => {
+    const res = await findClaudeTranscriptBySessionId({
+      sessionId: "missing",
+      claudeHome: home,
+    });
+    expect(res).toBeNull();
+  });
+
+  it("finds a transcript across project dirs and extracts cwd from the envelope", async () => {
+    const projectDir = "-Users-turing-code-widgets";
+    const dir = path.join(home, "projects", projectDir);
+    await mkdir(dir, { recursive: true });
+    const filePath = path.join(dir, "sess-resume.jsonl");
+    await writeFile(
+      filePath,
+      jsonlOf(SAMPLE_QUEUE_OPERATION, SAMPLE_USER_WITH_ENVELOPE, SAMPLE_RESULT),
+    );
+
+    const res = await findClaudeTranscriptBySessionId({
+      sessionId: "sess-resume",
+      claudeHome: home,
+    });
+    expect(res).not.toBeNull();
+    expect(res!.filePath).toBe(filePath);
+    expect(res!.projectDir).toBe(projectDir);
+    expect(res!.cwd).toBe("/Users/turing/code/widgets");
+  });
+
+  it("returns null cwd when no line carries a cwd field", async () => {
+    const projectDir = "-Users-turing-code-widgets";
+    const dir = path.join(home, "projects", projectDir);
+    await mkdir(dir, { recursive: true });
+    const filePath = path.join(dir, "no-cwd.jsonl");
+    // Only a `result` line which does not carry cwd on the envelope.
+    await writeFile(filePath, jsonlOf(SAMPLE_RESULT));
+
+    const res = await findClaudeTranscriptBySessionId({
+      sessionId: "no-cwd",
+      claudeHome: home,
+    });
+    expect(res).not.toBeNull();
+    expect(res!.cwd).toBeNull();
+  });
+
+  it("skips empty / non-project entries under projects/", async () => {
+    // Stray file at projects/ root: must not crash.
+    await writeFile(path.join(home, "projects", "stray.txt"), "");
+    // Wrong project dir without our session file.
+    await mkdir(path.join(home, "projects", "-some-other-project"), { recursive: true });
+    // The correct one.
+    const projectDir = "-Users-turing-code-widgets";
+    const dir = path.join(home, "projects", projectDir);
+    await mkdir(dir, { recursive: true });
+    const filePath = path.join(dir, "sess-resume.jsonl");
+    await writeFile(filePath, jsonlOf(SAMPLE_USER_WITH_ENVELOPE));
+
+    const res = await findClaudeTranscriptBySessionId({
+      sessionId: "sess-resume",
+      claudeHome: home,
+    });
+    expect(res!.filePath).toBe(filePath);
+    expect(res!.cwd).toBe("/Users/turing/code/widgets");
+  });
+
+  it("falls back to stream-style system.init events when present (forward-compat)", async () => {
+    const projectDir = "-Users-turing-code-widgets";
+    const dir = path.join(home, "projects", projectDir);
+    await mkdir(dir, { recursive: true });
+    const filePath = path.join(dir, "stream-style.jsonl");
+    const initLine = line({
+      type: "system",
+      subtype: "init",
+      session_id: "stream-style",
+      cwd: "/Users/turing/code/widgets",
+      uuid: "u-init",
+    });
+    await writeFile(filePath, jsonlOf(initLine));
+
+    const res = await findClaudeTranscriptBySessionId({
+      sessionId: "stream-style",
+      claudeHome: home,
+    });
+    expect(res!.cwd).toBe("/Users/turing/code/widgets");
+  });
+
+  it("throws when sessionId is empty", async () => {
+    await expect(
+      findClaudeTranscriptBySessionId({ sessionId: "", claudeHome: home }),
+    ).rejects.toThrow(/sessionId/);
   });
 });
 

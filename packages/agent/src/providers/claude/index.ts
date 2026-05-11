@@ -4,6 +4,7 @@ import { executeClaudeProvider } from "./execute.js";
 import { createClaudeSession } from "./session.js";
 import { claudeSessionCodec } from "./codec.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
+import { claudeTranscriptOps } from "./transcript.js";
 
 async function checkQuota(ctx: QuotaContext): Promise<QuotaStatus> {
   const env = buildEnv(ctx.env);
@@ -33,12 +34,15 @@ export const claudeProvider: ProviderModule = {
   resolveAuth: (ctx) => resolveAuthForProvider("claude", ctx),
   sessionCodec: claudeSessionCodec,
   checkQuota,
+  transcript: claudeTranscriptOps,
 };
 
 export {
   getClaudeTranscriptPath,
+  findClaudeTranscriptBySessionId,
   readClaudeTranscript,
   peekClaudeTranscript,
+  claudeTranscriptOps,
   sanitizeProjectPath,
   resolveClaudeHome,
   canonicalizeCwd,
@@ -47,6 +51,8 @@ export {
 export type {
   GetClaudeTranscriptPathOptions,
   ClaudeTranscriptLocation,
+  FindClaudeTranscriptOptions,
+  FoundClaudeTranscript,
   ReadClaudeTranscriptOptions,
   ClaudeTranscriptYield,
   ClaudePeekResult,

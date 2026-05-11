@@ -33,8 +33,10 @@ export {
 } from "./providers/claude/parse.js";
 export {
   getClaudeTranscriptPath,
+  findClaudeTranscriptBySessionId,
   readClaudeTranscript,
   peekClaudeTranscript,
+  claudeTranscriptOps,
   sanitizeProjectPath,
   resolveClaudeHome,
   canonicalizeCwd,
@@ -43,6 +45,8 @@ export {
 export type {
   GetClaudeTranscriptPathOptions,
   ClaudeTranscriptLocation,
+  FindClaudeTranscriptOptions,
+  FoundClaudeTranscript,
   ReadClaudeTranscriptOptions,
   ClaudeTranscriptYield,
   ClaudePeekResult,
@@ -51,6 +55,8 @@ export {
   getCodexTranscriptPath,
   readCodexTranscript,
   peekCodexTranscript,
+  readCodexCwd,
+  codexTranscriptOps,
   parseCodexLine,
   resolveCodexHome,
 } from "./providers/codex/transcript.js";
@@ -112,6 +118,10 @@ export type {
   ElicitationResponse,
   HookCallbackRequest,
   HookCallbackResponse,
+  TranscriptOps,
+  TranscriptYield,
+  TranscriptPeek,
+  FoundTranscript,
 } from "./types.js";
 
 export type {

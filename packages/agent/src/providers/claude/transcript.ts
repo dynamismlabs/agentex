@@ -26,7 +26,7 @@ import * as path from "node:path";
 import * as readline from "node:readline";
 
 import { getDefaultRuntimeHome, getRuntimeHomeEnvVar } from "../../utils/runtime-homes.js";
-import type { StreamEvent } from "../../types.js";
+import type { FoundTranscript, StreamEvent, TranscriptOps } from "../../types.js";
 import { parseStreamLine } from "./parse.js";
 
 /**
@@ -190,6 +190,123 @@ export async function getClaudeTranscriptPath(
   }
 
   return { filePath: exactPath, projectDir: sanitized, canonicalCwd, claudeHome };
+}
+
+// ---------------------------------------------------------------------------
+// Find-by-id (resume case: cwd unknown)
+// ---------------------------------------------------------------------------
+
+export interface FindClaudeTranscriptOptions {
+  /** Claude's session id (UUID). */
+  sessionId: string;
+  /** Override the Claude config home. */
+  claudeHome?: string;
+}
+
+export interface FoundClaudeTranscript {
+  /** Absolute path to the JSONL file. */
+  filePath: string;
+  /** The project-directory name (sanitized cwd) under `<claudeHome>/projects/`. */
+  projectDir: string;
+  /**
+   * The literal cwd Claude was launched with, recovered from the first
+   * `system.init` event in the transcript. `null` if the file has no init
+   * event (e.g., truncated transcript) or it never recorded a cwd.
+   *
+   * This is the only way to recover the original cwd — `projectDir` is the
+   * sanitized form, which is one-way (multiple cwds can collide on the same
+   * sanitized name, though it's rare).
+   */
+  cwd: string | null;
+}
+
+/**
+ * Scan `<claudeHome>/projects/*` looking for `<sessionId>.jsonl`. Use this
+ * when you have a session ID but don't know which cwd Claude was launched
+ * in — typical for resume-by-id flows.
+ *
+ * Session IDs are unique across project directories, so the first match is
+ * authoritative. The original cwd is recovered from the transcript's first
+ * `system.init` event (Claude writes one at session start carrying `cwd`).
+ *
+ * Returns `null` if no project directory contains the session file.
+ */
+export async function findClaudeTranscriptBySessionId(
+  opts: FindClaudeTranscriptOptions,
+): Promise<FoundClaudeTranscript | null> {
+  if (!opts.sessionId) {
+    throw new Error("findClaudeTranscriptBySessionId: sessionId is required");
+  }
+  const claudeHome = resolveClaudeHome(opts.claudeHome);
+  const projectsRoot = path.join(claudeHome, "projects");
+  const fileName = `${opts.sessionId}.jsonl`;
+
+  let entries;
+  try {
+    entries = await readdir(projectsRoot, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const candidate = path.join(projectsRoot, entry.name, fileName);
+    if (!(await pathExists(candidate))) continue;
+    const cwd = await readCwdFromTranscript(candidate);
+    return { filePath: candidate, projectDir: entry.name, cwd };
+  }
+  return null;
+}
+
+/**
+ * Read the cwd field from the first transcript line that carries one.
+ *
+ * Claude's on-disk format does NOT emit a `system.init` event the way the
+ * stream wire format does. Instead, every event line (`user`, `assistant`,
+ * etc.) carries its own `cwd`, `sessionId`, `gitBranch`, `version` envelope.
+ * Read the first few lines raw, extract the first `cwd` we find.
+ *
+ * Returns `null` if no line in the first ~50 carries a `cwd` field.
+ */
+async function readCwdFromTranscript(filePath: string): Promise<string | null> {
+  const fh = await fsOpen(filePath, "r").catch(() => null);
+  if (!fh) return null;
+
+  try {
+    const stream = fh.createReadStream({ encoding: "utf8", autoClose: false });
+    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+    let count = 0;
+    try {
+      for await (const raw of rl) {
+        if (++count > 50) break;
+        const trimmed = raw.trim();
+        if (!trimmed) continue;
+        try {
+          const obj = JSON.parse(trimmed) as Record<string, unknown>;
+          // Outer envelope: every Claude line carries `cwd` at the top level.
+          if (typeof obj["cwd"] === "string" && obj["cwd"]) {
+            return obj["cwd"] as string;
+          }
+          // Forward-compat: streaming-style init events also have cwd.
+          if (
+            obj["type"] === "system" &&
+            obj["subtype"] === "init" &&
+            typeof obj["cwd"] === "string"
+          ) {
+            return obj["cwd"] as string;
+          }
+        } catch {
+          // skip malformed
+        }
+      }
+    } finally {
+      rl.close();
+      stream.destroy();
+    }
+  } finally {
+    await fh.close();
+  }
+  return null;
 }
 
 async function pathExists(filePath: string): Promise<boolean> {
@@ -395,3 +512,44 @@ export async function peekClaudeTranscript(filePath: string): Promise<ClaudePeek
     await handle.close();
   }
 }
+
+// ---------------------------------------------------------------------------
+// Polymorphic facade
+// ---------------------------------------------------------------------------
+
+/**
+ * Polymorphic transcript ops for Claude. Delegates to the named functions
+ * above; mounted as `claudeProvider.transcript` so apps doing runtime-
+ * dispatched recovery can call `getProvider(name).transcript.find(...)`
+ * without a switch statement.
+ *
+ * Apps that know they're on Claude at compile time should prefer the named
+ * helpers (`getClaudeTranscriptPath`, `findClaudeTranscriptBySessionId`) —
+ * they return richer types (`canonicalCwd`, `projectDir`, `claudeHome`) that
+ * the polymorphic interface flattens away.
+ */
+export const claudeTranscriptOps: TranscriptOps<StreamEvent> = {
+  async find(opts): Promise<FoundTranscript | null> {
+    // Fast path: cwd hint provided → direct O(1) lookup.
+    if (opts.cwd) {
+      const loc = await getClaudeTranscriptPath({
+        sessionId: opts.sessionId,
+        cwd: opts.cwd,
+      });
+      if (await pathExists(loc.filePath)) {
+        return { filePath: loc.filePath, cwd: loc.canonicalCwd };
+      }
+      // cwd was wrong (e.g. session was launched in a different worktree);
+      // fall through to scan.
+    }
+    const found = await findClaudeTranscriptBySessionId({ sessionId: opts.sessionId });
+    if (!found) return null;
+    return { filePath: found.filePath, cwd: found.cwd };
+  },
+  read(opts) {
+    return readClaudeTranscript(opts);
+  },
+  peek(filePath) {
+    return peekClaudeTranscript(filePath);
+  },
+};

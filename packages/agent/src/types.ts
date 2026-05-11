@@ -53,6 +53,81 @@ export interface ProviderModule {
   listModels?(options?: { cacheTtlMs?: number }): Promise<ProviderModel[]>;
   /** Check current quota/rate limit status. Not all providers support this. */
   checkQuota?(ctx: QuotaContext): Promise<QuotaStatus>;
+  /**
+   * Polymorphic on-disk transcript access. Present only on providers that
+   * persist a durable JSONL transcript (currently Claude and Codex). Apps
+   * that know the provider at compile time can keep using the per-provider
+   * named helpers (e.g. `getClaudeTranscriptPath`); this field is for
+   * runtime-dispatched recovery flows.
+   */
+  transcript?: TranscriptOps<unknown>;
+}
+
+// Result of looking up a transcript for a given session.
+export interface FoundTranscript {
+  /** Absolute path to the on-disk JSONL transcript. */
+  filePath: string;
+  /**
+   * The literal cwd recorded in the transcript, if recoverable. For Claude
+   * this comes from the on-disk envelope's `cwd` field; for Codex from the
+   * `session_meta` line or legacy `environment_context` user message.
+   * Null when the transcript carries no cwd metadata.
+   */
+  cwd: string | null;
+}
+
+// One unit pulled from a transcript by `read()`. The `event` type varies
+// by provider (Claude: `StreamEvent`; Codex: `CodexTranscriptLine`); the
+// envelope shape is identical so polymorphic callers can iterate uniformly.
+export interface TranscriptYield<TEvent> {
+  event: TEvent;
+  /**
+   * Byte offset immediately after the trailing `\n` of the line this event
+   * came from. Pass back as `fromOffset` to resume from the next line.
+   */
+  offset: number;
+}
+
+// Result of `peek()`. Same shape across providers.
+export interface TranscriptPeek<TEvent> {
+  lastEvent: TEvent | null;
+  size: number | null;
+}
+
+/**
+ * Polymorphic transcript access for a provider. Methods delegate to the
+ * provider's per-name helpers (e.g. `claudeProvider.transcript.find` calls
+ * `findClaudeTranscriptBySessionId` / `getClaudeTranscriptPath` under the
+ * hood). `TEvent` is the per-provider event shape and varies between
+ * implementations.
+ */
+export interface TranscriptOps<TEvent> {
+  /**
+   * Locate the transcript file for a session.
+   *
+   * `cwd` is an optional hint: providers that key transcripts by cwd (Claude)
+   * use it for an O(1) direct lookup; providers that don't (Codex) ignore it.
+   * In all cases the returned `filePath` is verified to exist — a `null`
+   * return means no transcript was found for this session.
+   *
+   * The returned `cwd` is the literal cwd recorded inside the transcript,
+   * recovered when the file is opened. May be `null` if the transcript has
+   * no cwd metadata.
+   */
+  find(opts: { sessionId: string; cwd?: string }): Promise<FoundTranscript | null>;
+  /**
+   * Stream-read a transcript file, yielding parsed events with byte offsets.
+   * Behavior matches the underlying named function (skips wrapper lines,
+   * tolerates malformed JSON, resume-from-offset).
+   */
+  read(opts: {
+    filePath: string;
+    fromOffset?: number;
+    /** Defensive dedup for providers that expose stable per-event IDs (Claude). Ignored by others. */
+    sinceEventId?: string;
+  }): AsyncIterable<TranscriptYield<TEvent>>;
+  /** Cheap "what's the last event + total size?" probe — reads only the tail of the file. */
+  peek(filePath: string): Promise<TranscriptPeek<TEvent>>;
 }
 
 // Execution input

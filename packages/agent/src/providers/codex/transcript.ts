@@ -31,6 +31,7 @@ import * as path from "node:path";
 import * as readline from "node:readline";
 
 import { getDefaultRuntimeHome, getRuntimeHomeEnvVar } from "../../utils/runtime-homes.js";
+import type { FoundTranscript, TranscriptOps } from "../../types.js";
 
 /** Bytes scanned from the tail of the file in {@link peekCodexTranscript}. */
 const PEEK_TAIL_BYTES = 16 * 1024;
@@ -70,6 +71,53 @@ export interface CodexTranscriptLocation {
   source: "active" | "archived";
   /** The codex home that was searched. */
   codexHome: string;
+}
+
+/**
+ * Read the literal cwd Codex was launched with, recovered from the first
+ * `session_meta` line in a rollout (or the legacy unwrapped first line for
+ * pre-0.10 transcripts).
+ *
+ * Returns `null` if the file has no recoverable cwd (truncated transcript,
+ * unrecognized format, etc.). Stops scanning after the first ~50 lines —
+ * `session_meta` is always the first line, but the older format may need a
+ * few lines to find the `environment_context` user_message with the cwd.
+ */
+export async function readCodexCwd(filePath: string): Promise<string | null> {
+  let count = 0;
+  for await (const { event } of readCodexTranscript({ filePath })) {
+    count++;
+
+    // Wrapped (≥0.10): first line is `{type: "session_meta", payload: {cwd}}`.
+    if (event.type === "session_meta" && event.payload) {
+      const cwd = event.payload["cwd"];
+      if (typeof cwd === "string" && cwd) return cwd;
+    }
+
+    // Legacy unwrapped: cwd is buried inside a user `message` with an
+    // `environment_context` block. Two phrasings have shipped:
+    //   1. XML-style: `<environment_context><cwd>/path</cwd>...`
+    //   2. Plaintext: `<environment_context>\nCurrent working directory: /path\n...`
+    if (event.type === "message") {
+      const role = event.raw["role"];
+      const content = event.raw["content"];
+      if (role === "user" && Array.isArray(content)) {
+        for (const block of content) {
+          if (typeof block !== "object" || block === null) continue;
+          const b = block as Record<string, unknown>;
+          if (b["type"] !== "input_text") continue;
+          const text = typeof b["text"] === "string" ? b["text"] : "";
+          const xml = text.match(/<cwd>([^<]+)<\/cwd>/);
+          if (xml && xml[1]) return xml[1];
+          const plain = text.match(/Current working directory:\s*([^\n\r]+)/);
+          if (plain && plain[1]) return plain[1].trim();
+        }
+      }
+    }
+
+    if (count >= 50) break;
+  }
+  return null;
 }
 
 /**
@@ -221,8 +269,14 @@ export interface ReadCodexTranscriptOptions {
 }
 
 export interface CodexTranscriptYield {
-  /** Parsed line, normalized for the consumer. */
-  line: CodexTranscriptLine;
+  /**
+   * Parsed line, normalized for the consumer. Named `event` for symmetry
+   * with Claude's `readClaudeTranscript` and the polymorphic
+   * `provider.transcript.read` interface — both yield `{event, offset}`.
+   * The underlying type is provider-specific (`CodexTranscriptLine` here,
+   * `StreamEvent` for Claude).
+   */
+  event: CodexTranscriptLine;
   /**
    * Byte offset immediately AFTER the trailing `\n` of this line. Pass back
    * as {@link ReadCodexTranscriptOptions.fromOffset} to resume on the next line.
@@ -261,7 +315,7 @@ export async function* readCodexTranscript(
       const parsed = parseCodexLine(trimmed);
       if (!parsed) continue;
 
-      yield { line: parsed, offset: pos };
+      yield { event: parsed, offset: pos };
     }
   } catch (err) {
     const e = err as NodeJS.ErrnoException;
@@ -315,8 +369,12 @@ async function pathExists(filePath: string): Promise<boolean> {
 // ---------------------------------------------------------------------------
 
 export interface CodexPeekResult {
-  /** Last successfully parsed line, or null if the file is empty/missing/unparseable. */
-  lastLine: CodexTranscriptLine | null;
+  /**
+   * Last successfully parsed line, or null if the file is empty/missing/unparseable.
+   * Named `lastEvent` for symmetry with Claude's `peekClaudeTranscript` and
+   * the polymorphic `provider.transcript.peek` interface.
+   */
+  lastEvent: CodexTranscriptLine | null;
   /** Total size of the file in bytes, or null if missing. */
   size: number | null;
 }
@@ -331,9 +389,9 @@ export async function peekCodexTranscript(filePath: string): Promise<CodexPeekRe
     const s = await stat(filePath);
     size = s.size;
   } catch {
-    return { lastLine: null, size: null };
+    return { lastEvent: null, size: null };
   }
-  if (size === 0) return { lastLine: null, size: 0 };
+  if (size === 0) return { lastEvent: null, size: 0 };
 
   const readBytes = Math.min(PEEK_TAIL_BYTES, size);
   const start = size - readBytes;
@@ -343,7 +401,7 @@ export async function peekCodexTranscript(filePath: string): Promise<CodexPeekRe
   try {
     handle = await fsOpen(filePath, "r");
   } catch {
-    return { lastLine: null, size };
+    return { lastEvent: null, size };
   }
 
   try {
@@ -362,11 +420,36 @@ export async function peekCodexTranscript(filePath: string): Promise<CodexPeekRe
       if (!trimmed) continue;
       const parsed = parseCodexLine(trimmed);
       if (!parsed) continue;
-      return { lastLine: parsed, size };
+      return { lastEvent: parsed, size };
     }
 
-    return { lastLine: null, size };
+    return { lastEvent: null, size };
   } finally {
     await handle.close();
   }
 }
+
+// ---------------------------------------------------------------------------
+// Polymorphic facade
+// ---------------------------------------------------------------------------
+
+/**
+ * Polymorphic transcript ops for Codex. Delegates to the named functions
+ * above; mounted as `codexProvider.transcript`. The `cwd` hint to `find` is
+ * accepted for interface symmetry with Claude but is ignored — Codex
+ * rollouts are organized by date, not by cwd.
+ */
+export const codexTranscriptOps: TranscriptOps<CodexTranscriptLine> = {
+  async find(opts): Promise<FoundTranscript | null> {
+    const loc = await getCodexTranscriptPath({ sessionId: opts.sessionId });
+    if (!loc) return null;
+    const cwd = await readCodexCwd(loc.filePath);
+    return { filePath: loc.filePath, cwd };
+  },
+  read(opts) {
+    return readCodexTranscript(opts);
+  },
+  peek(filePath) {
+    return peekCodexTranscript(filePath);
+  },
+};
