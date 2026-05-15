@@ -80,6 +80,14 @@ export {
   resolveNativeSkillsWorkspace,
   ensureSkillSymlink,
 } from "./utils/skills.js";
+export {
+  commandInventoryFromEvent,
+  discoverSkillCommands,
+  reconcileSkillCommands,
+  formatSlashInvocation,
+  invokeSkill,
+  buildExpandedSkillPrompt,
+} from "./utils/skill-commands.js";
 
 // Types
 export type {
@@ -143,3 +151,15 @@ export type {
   SkillRemoveResult,
   InstalledSkill,
 } from "./utils/skills.js";
+
+export type {
+  SkillCommandSource,
+  SkillCommandExecution,
+  SkillCommandDescriptor,
+  RuntimeCommandInventory,
+  SkillCommandDiagnostic,
+  DiscoverSkillCommandsOptions,
+  DiscoverSkillCommandsResult,
+  ReconcileSkillCommandsOptions,
+  InvokeSkillOptions,
+} from "./utils/skill-commands.js";

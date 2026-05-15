@@ -25,6 +25,8 @@ describe("ProviderCapabilities", () => {
       quotaProbing: true,
       mcp: true,
       skills: true,
+      skillInventory: "provider-init",
+      skillInvocation: "native-slash",
       instructions: true,
       workspace: true,
       planMode: true,
@@ -45,6 +47,16 @@ describe("ProviderCapabilities", () => {
     expect(caps.modelDiscovery).toBe(false);
     expect(caps.quotaProbing).toBe(false);
     expect(caps.mcp).toBe(false);
+  });
+
+  it("declares provider-specific skill inventory and invocation behavior", () => {
+    const claude = getProvider("claude").capabilities;
+    expect(claude.skillInventory).toBe("provider-init");
+    expect(claude.skillInvocation).toBe("native-slash");
+
+    const codex = getProvider("codex").capabilities;
+    expect(codex.skillInventory).toBe("local-discovery");
+    expect(codex.skillInvocation).toBe("expanded-prompt");
   });
 
   it("openclaw has no capabilities", () => {

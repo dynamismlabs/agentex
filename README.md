@@ -2,7 +2,7 @@
 
 Open-source infrastructure for running AI coding agents for local execution. Four composable packages:
 
-- **[@agentex/agent](./packages/agent)** — Execute Claude Code, Codex, OpenClaw, or any CLI agent programmatically with streaming, sessions, and a unified interface.
+- **[@agentex/agent](./packages/agent)** — Execute Claude Code, Codex, OpenClaw, or any CLI agent programmatically with streaming, sessions, skill discovery/invocation, and a unified interface.
 - **[@agentex/gateway](./packages/gateway)** — Multi-channel communication gateway that connects agents to Telegram, Discord, Slack, WhatsApp, email, webhooks, and cron with a single YAML config.
 - **[@agentex/workspace](./packages/workspace)** — Isolation and lifecycle primitives: git worktrees, file cloning, port allocation, run-script process-group teardown, structured diff, per-worktree checkpoints, status / commit / push / merge / mergeFrom / pullLatestBase, file tree + watch, plus a `raw` git escape hatch.
 - **[@agentex/github](./packages/github)** — Thin typed wrapper over the `gh` CLI for PRs, issues, and status checks. Pairs with `@agentex/workspace` (workspace owns git plumbing; github owns the host API).
@@ -28,7 +28,7 @@ pnpm -r test
 
 ### @agentex/agent
 
-Spawn AI agents as child processes with streaming output and session resume.
+Spawn AI agents as child processes with streaming output, session resume, and reusable skill/slash-command support.
 
 ```typescript
 import { getProvider } from "@agentex/agent";
@@ -44,7 +44,7 @@ const result = await claude.execute({
 });
 ```
 
-Built-in providers: `claude`, `codex`, `openclaw`, `process`
+Built-in providers: `claude`, `codex`, `gemini`, `cursor`, `opencode`, `pi`, `openclaw`, `process`
 
 ### @agentex/workspace
 

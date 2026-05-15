@@ -131,6 +131,8 @@ describe("parseStreamLine", () => {
       subtype: "init",
       session_id: "sess-abc-123",
       model: "claude-sonnet-4-20250514",
+      slash_commands: ["help", "code-review"],
+      skills: ["code-review"],
     });
     const events = parseStreamLine(line);
     expect(events).toHaveLength(1);
@@ -140,6 +142,8 @@ describe("parseStreamLine", () => {
       expect(event.subtype).toBe("init");
       expect(event.sessionId).toBe("sess-abc-123");
       expect(event.model).toBe("claude-sonnet-4-20250514");
+      expect(event.slashCommands).toEqual(["help", "code-review"]);
+      expect(event.skills).toEqual(["code-review"]);
     }
   });
 

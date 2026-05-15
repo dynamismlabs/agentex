@@ -55,7 +55,10 @@ console.log(result.raw);        // the final provider-native event, verbatim (es
 | `openclaw` | gateway HTTP     | OpenClaw HTTP-gateway agent                 |
 | `process`  | any executable   | Generic process executor (arbitrary binary) |
 
-Provider capabilities (sessions, skills, workspaces, MCP, model discovery, quota probing, instructions) are declared on each module's `capabilities` field — check `provider.capabilities` to branch on what's supported.
+Provider capabilities (sessions, skills, workspaces, MCP, model discovery, quota probing, instructions) are declared on each module's `capabilities` field — check `provider.capabilities` to branch on what's supported. Skill-aware providers also report:
+
+- `skillInventory` — `"provider-init"` for Claude's runtime inventory, `"local-discovery"` for Codex, or `"none"`.
+- `skillInvocation` — `"native-slash"` for Claude, `"expanded-prompt"` for Codex, `"configured-only"`, or `"unsupported"`.
 
 ## Execution Context
 
@@ -181,7 +184,7 @@ interface BaseStreamEventFields {
 
 Variants:
 
-- `system` — Session init (`subtype`, `model`, `cwd`, `tools`, `permissionMode`)
+- `system` — Session init (`subtype`, `model`, `cwd`, `tools`, `permissionMode`). Claude init events also include `slashCommands?: string[]` and `skills?: string[]` when Claude Code reports them.
 - `assistant` — Text output from the agent (`text`)
 - `thinking` — Agent's internal reasoning (`text`)
 - `tool_call` — Agent invoked a tool (`toolCallId: string | null`, `name`, `input`)
@@ -497,23 +500,117 @@ const results = await executeAll(
 );
 ```
 
-## Skills
+## Skills And Slash Commands
+
+AgentEx supports both skill installation and the higher-level slash-command UI flow:
+
+1. Install or pass skill directories through `config.skillDirs`.
+2. Discover rich local metadata for the UI.
+3. Reconcile that metadata with the provider runtime inventory when one exists.
+4. Invoke the selected skill using provider-appropriate semantics.
+
+### Install Or List Skills
 
 Install and remove reusable agent skills across multiple runtimes at once, into either the user's home or a workspace directory.
 
 ```typescript
 import { installSkills, listInstalledSkills, removeSkills } from "@agentex/agent";
 
-await installSkills({
-  location: "global",                 // or "workspace" with cwd
+const skillDirs = ["/path/to/code-review", "/path/to/testing"];
+
+await installSkills(skillDirs, {
+  location: "workspace",              // or "global"
+  cwd: process.cwd(),                 // required for workspace installs
   includeNativeDirs: false,           // true also installs into ~/.gemini/skills/, etc.
 });
 
-const installed = await listInstalledSkills({ location: "global" });
-await removeSkills({ location: "global" });
+const installed = await listInstalledSkills({ location: "workspace", cwd: process.cwd() });
+await removeSkills(skillDirs, { location: "workspace", cwd: process.cwd() });
 ```
 
 Channels and locations follow the emerging `.agents/skills/` + `.claude/skills/` convention — see the `SkillRuntime`, `SkillLocation`, and `SkillChannel` types.
+
+### Discover Slash-Invokable Skills
+
+Use `discoverSkillCommands(...)` to parse local `SKILL.md` files into UI-ready descriptors. It reads frontmatter fields such as `description`, `argument-hint`, and `user-invocable`; if no description is present, it falls back to the first non-empty body paragraph.
+
+```typescript
+import {
+  discoverSkillCommands,
+  reconcileSkillCommands,
+  commandInventoryFromEvent,
+  invokeSkill,
+  getProvider,
+  type RuntimeCommandInventory,
+} from "@agentex/agent";
+
+const providerType = "claude";
+const provider = getProvider(providerType);
+const skillDirs = ["/path/to/code-review"];
+
+let inventory: RuntimeCommandInventory | null = null;
+
+const session = await provider.createSession!({
+  cwd: process.cwd(),
+  config: { skillDirs },
+  onEvent(event) {
+    inventory ??= commandInventoryFromEvent(event);
+  },
+});
+
+const { commands, diagnostics } = await discoverSkillCommands({
+  cwd: process.cwd(),
+  skillDirs,
+  runtime: providerType,
+});
+
+for (const diagnostic of diagnostics) {
+  console.warn(diagnostic.message);
+}
+
+const visibleCommands = reconcileSkillCommands({
+  discovered: commands,
+  inventory,
+  provider: providerType,
+}).filter((command) => command.available && command.userInvocable);
+
+await invokeSkill(session, visibleCommands[0]!, {
+  args: "review the auth changes",
+});
+```
+
+For a slash menu, render `visibleCommands` and show at least:
+
+- `/${command.name}`
+- `command.description`
+- `command.argumentHint`
+- `command.source`
+
+Ranking/typeahead is host-owned in core v1. A typical UI opens suggestions when the composer starts with `/`, filters by command name and description, inserts `/name ` on selection, and submits through `invokeSkill(...)`.
+
+### Provider Semantics
+
+Claude Code exposes runtime names in its `system/init` event as `slash_commands` and `skills`. AgentEx parses those into `event.slashCommands` and `event.skills`, and `commandInventoryFromEvent(...)` normalizes them. For Claude, `reconcileSkillCommands(...)` marks provider-slash commands unavailable when the running session did not report them.
+
+Claude invocation uses native slash dispatch:
+
+```typescript
+await invokeSkill(session, command, { args: "focus on regressions" });
+// sends: /command-name focus on regressions
+```
+
+Claude Code then resolves the slash command, expands `SKILL.md`, substitutes arguments, and applies provider-native metadata.
+
+Codex does not currently expose a runtime slash/skill inventory through AgentEx. For Codex, discovered skills default to expanded-prompt invocation:
+
+```typescript
+await invokeSkill(codexSession, command, {
+  args: "review src/server.ts",
+  userRequest: "Focus on missing tests.",
+});
+```
+
+AgentEx reads the skill body, substitutes supported argument placeholders, wraps it with skill metadata, and sends the expanded prompt as the turn input. If Codex later exposes native slash dispatch, AgentEx can switch that command's `execution.kind` to `provider-slash` without changing host UI code.
 
 ## Temporary Config Override
 
@@ -621,10 +718,16 @@ registerProvider(myProvider);
 - `prepareWorkspace({ strategy, baseBranch?, branchName?, targetDir? })` → `PreparedWorkspace` with `cwd`, `diff()`, `cleanup()`.
 
 ### Skills
-- `installSkills(opts)` / `removeSkills(opts)` / `listInstalledSkills(opts)`
+- `installSkills(skillDirs, opts?)` / `removeSkills(skillDirs, opts?)` / `listInstalledSkills(opts?)`
 - `resolveSkillsHome(channel)` / `resolveSkillsWorkspace(channel, cwd)`
 - `resolveNativeSkillsHome(runtime)` / `resolveNativeSkillsWorkspace(runtime, cwd)`
 - `ensureSkillSymlink(...)`
+- `commandInventoryFromEvent(event)` — extract provider-reported slash/skill names from a `system/init` event.
+- `discoverSkillCommands({ cwd?, skillDirs?, includeInstalled?, runtime? })` — parse local `SKILL.md` metadata into `SkillCommandDescriptor[]`.
+- `reconcileSkillCommands({ discovered, inventory?, provider, appCommands? })` — merge app commands and apply provider runtime availability.
+- `formatSlashInvocation(command, args?)` — build `/name args` text.
+- `invokeSkill(session, command, options?)` — send native slash text for `provider-slash` commands or an expanded prompt for `expanded-prompt` commands.
+- `buildExpandedSkillPrompt(command, options?)` — construct the expanded-prompt payload without sending it.
 
 ### Runtime config
 - `withTempConfig({ runtime, seedFromDefault?, overrides? })` → env + configDir + cleanup.

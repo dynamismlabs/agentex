@@ -5,6 +5,8 @@ export interface ProviderCapabilities {
   quotaProbing: boolean;
   mcp: boolean;
   skills: boolean;
+  skillInventory?: "provider-init" | "local-discovery" | "none";
+  skillInvocation?: "native-slash" | "expanded-prompt" | "configured-only" | "unsupported";
   instructions: boolean;
   workspace: boolean;
   /**
@@ -463,6 +465,8 @@ export type StreamEvent =
       cwd: string | null;
       tools: string[] | null;
       permissionMode: string | null;
+      slashCommands?: string[];
+      skills?: string[];
     } & BaseStreamEventFields)
   | ({ type: "assistant"; text: string } & BaseStreamEventFields)
   | ({ type: "thinking"; text: string } & BaseStreamEventFields)

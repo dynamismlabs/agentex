@@ -58,6 +58,11 @@ function asNullableString(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
+function asStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value.filter((item): item is string => typeof item === "string");
+}
+
 function asNumber(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
@@ -281,6 +286,8 @@ export function parseStreamLine(line: string): StreamEvent[] {
       cwd: asNullableString(event["cwd"]),
       tools: Array.isArray(event["tools"]) ? event["tools"] as string[] : null,
       permissionMode: asNullableString(event["permissionMode"]),
+      slashCommands: asStringArray(event["slash_commands"]),
+      skills: asStringArray(event["skills"]),
       ...baseFieldsFromEvent(event, null),
     }];
   }

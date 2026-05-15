@@ -93,6 +93,7 @@ export interface SkillRemoveResult {
 
 export interface InstalledSkill {
   name: string;
+  /** Directory containing SKILL.md. Symlinks are resolved to their target directory. */
   sourcePath: string | null;
   isSymlink: boolean;
 }

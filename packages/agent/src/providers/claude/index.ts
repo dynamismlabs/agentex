@@ -25,6 +25,8 @@ export const claudeProvider: ProviderModule = {
     quotaProbing: true,
     mcp: true,
     skills: true,
+    skillInventory: "provider-init",
+    skillInvocation: "native-slash",
     instructions: true,
     workspace: true,
     planMode: true,

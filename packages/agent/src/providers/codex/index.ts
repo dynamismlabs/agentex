@@ -13,6 +13,8 @@ export const codexProvider: ProviderModule = {
     quotaProbing: false,
     mcp: false,
     skills: true,
+    skillInventory: "local-discovery",
+    skillInvocation: "expanded-prompt",
     instructions: true,
     workspace: true,
     planMode: true,
