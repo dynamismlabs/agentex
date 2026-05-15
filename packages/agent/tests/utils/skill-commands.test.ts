@@ -135,6 +135,70 @@ describe("discoverSkillCommands", () => {
     });
   });
 
+  it("parses literal block-scalar descriptions (`description: |`)", async () => {
+    const skillDir = await createSkillDir("autoplan", [
+      "---",
+      "name: autoplan",
+      "description: |",
+      "  Auto-review pipeline — runs the CEO, design, and eng review skills sequentially",
+      "  with auto-decisions using 6 decision principles. Surfaces taste decisions at",
+      "  a final approval gate.",
+      "version: 1.0.0",
+      "---",
+      "Body content.",
+    ].join("\n"));
+
+    const result = await discoverSkillCommands({
+      skillDirs: [skillDir],
+      runtime: "claude",
+    });
+
+    expect(result.commands[0]?.description).toBe(
+      "Auto-review pipeline — runs the CEO, design, and eng review skills sequentially\n" +
+        "with auto-decisions using 6 decision principles. Surfaces taste decisions at\n" +
+        "a final approval gate.",
+    );
+  });
+
+  it("parses folded block-scalar descriptions (`description: >`)", async () => {
+    const skillDir = await createSkillDir("benchmark", [
+      "---",
+      "description: >",
+      "  Performance regression detection using the browse daemon.",
+      "  Establishes baselines for page load times.",
+      "---",
+      "Body.",
+    ].join("\n"));
+
+    const result = await discoverSkillCommands({
+      skillDirs: [skillDir],
+      runtime: "claude",
+    });
+
+    expect(result.commands[0]?.description).toBe(
+      "Performance regression detection using the browse daemon. Establishes baselines for page load times.",
+    );
+  });
+
+  it("ends a block scalar at the next un-indented key", async () => {
+    const skillDir = await createSkillDir("careful", [
+      "---",
+      "description: |",
+      "  First line.",
+      "  Second line.",
+      "version: 2.0.0",
+      "---",
+      "Body.",
+    ].join("\n"));
+
+    const result = await discoverSkillCommands({
+      skillDirs: [skillDir],
+      runtime: "claude",
+    });
+
+    expect(result.commands[0]?.description).toBe("First line.\nSecond line.");
+  });
+
   it("uses expanded-prompt execution for Codex", async () => {
     const skillDir = await createSkillDir("testing", [
       "---",

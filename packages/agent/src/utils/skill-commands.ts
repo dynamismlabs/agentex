@@ -352,14 +352,58 @@ function parseSkillFileContent(content: string): ParsedSkillFile {
 
 function parseSimpleFrontmatter(input: string): Record<string, string> {
   const values: Record<string, string> = {};
-  for (const line of input.split("\n")) {
+  const lines = input.split("\n");
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i] ?? "";
     const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
+    if (!trimmed || trimmed.startsWith("#")) {
+      i++;
+      continue;
+    }
     const idx = trimmed.indexOf(":");
-    if (idx <= 0) continue;
+    if (idx <= 0) {
+      i++;
+      continue;
+    }
     const key = trimmed.slice(0, idx).trim();
-    const value = stripQuotes(trimmed.slice(idx + 1).trim());
-    if (key) values[key] = value;
+    const valuePart = trimmed.slice(idx + 1).trim();
+
+    // YAML block scalars: `description: |` (literal — newlines preserved)
+    // or `description: >` (folded — single newlines become spaces). Both
+    // optionally followed by `-` (strip trailing newlines) or `+` (keep).
+    // The block continues for lines indented strictly more than the key's
+    // line; blank lines belong to the block. Indent modifiers (`|2`) and
+    // YAML's full quoting rules are deliberately out of scope — skills
+    // overwhelmingly use the plain forms.
+    const blockMatch = key ? /^([|>])[+-]?\s*$/.exec(valuePart) : null;
+    if (blockMatch) {
+      const folded = blockMatch[1] === ">";
+      const keyIndent = line.length - line.trimStart().length;
+      const blockLines: string[] = [];
+      let baseIndent: number | null = null;
+      let j = i + 1;
+      while (j < lines.length) {
+        const next = lines[j] ?? "";
+        if (next.trim() === "") {
+          blockLines.push("");
+          j++;
+          continue;
+        }
+        const indent = next.length - next.trimStart().length;
+        if (indent <= keyIndent) break;
+        if (baseIndent === null) baseIndent = indent;
+        blockLines.push(next.slice(Math.min(indent, baseIndent)));
+        j++;
+      }
+      const joiner = folded ? " " : "\n";
+      values[key] = blockLines.join(joiner).trim();
+      i = j;
+      continue;
+    }
+
+    if (key) values[key] = stripQuotes(valuePart);
+    i++;
   }
   return values;
 }
