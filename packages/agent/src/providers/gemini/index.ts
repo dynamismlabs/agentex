@@ -14,6 +14,8 @@ export const geminiProvider: ProviderModule = {
     instructions: true,
     workspace: true,
     planMode: false,
+    concurrentSend: false,
+    cancelQueuedMessage: false,
   },
   execute: executeGeminiProvider,
   resolveAuth: (ctx) => resolveAuthForProvider("gemini", ctx),

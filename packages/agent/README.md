@@ -8,7 +8,7 @@ Programmatic execution of AI coding agents. Spawn and manage Claude Code, Codex,
 npm install @agentex/agent
 ```
 
-Node.js >= 18. Each provider requires its CLI to be installed and on `$PATH`.
+Node.js >= 18. Each provider requires its CLI to be installed and on `$PATH`. The Codex session adapter additionally requires **codex-cli 0.130.0 or newer** (the `app-server` subcommand); older CLIs will fail with `unexpected argument '--json'`.
 
 ## Quick Start
 
@@ -55,7 +55,7 @@ console.log(result.raw);        // the final provider-native event, verbatim (es
 | `openclaw` | gateway HTTP     | OpenClaw HTTP-gateway agent                 |
 | `process`  | any executable   | Generic process executor (arbitrary binary) |
 
-Provider capabilities (sessions, skills, workspaces, MCP, model discovery, quota probing, instructions) are declared on each module's `capabilities` field — check `provider.capabilities` to branch on what's supported. Skill-aware providers also report:
+Provider capabilities (sessions, skills, workspaces, MCP, model discovery, quota probing, instructions, concurrent send, cancel queued messages) are declared on each module's `capabilities` field — check `provider.capabilities` to branch on what's supported. Skill-aware providers also report:
 
 - `skillInventory` — `"provider-init"` for Claude's runtime inventory, `"local-discovery"` for Codex, or `"none"`.
 - `skillInvocation` — `"native-slash"` for Claude, `"expanded-prompt"` for Codex, `"configured-only"`, or `"unsupported"`.
@@ -257,13 +257,58 @@ const session = await claude.createSession!({
   },
 });
 
-const first = await session.send("List the API routes in src/");
+const { uuid, result } = await session.send("List the API routes in src/");
+const turnResult = await result;          // resolves on the next TurnResult
 const followUp = await session.send("Now add rate limiting to each one.");
+await followUp.result;
 
 await session.close();
 ```
 
-`session.send()` returns a `TurnResult` with `summary`, `usage`, `costUsd`, and a `status` of `completed | failed | max_turns | max_budget | aborted`. Handle elicitations (MCP forms), hook callbacks, and interrupts through the corresponding `SessionContext` callbacks.
+`session.send()` returns a `SendHandle` with a synchronously-available `uuid` and a `result: Promise<TurnResult>`. `TurnResult` carries `summary`, `usage`, `costUsd`, and a `status` of `completed | failed | max_turns | max_budget | aborted`. Handle elicitations (MCP forms), hook callbacks, and interrupts through the corresponding `SessionContext` callbacks.
+
+### Concurrent send ("type while the agent is working")
+
+For providers with `capabilities.concurrentSend = true` (Claude, Codex), `session.send()` is callable at any time — including while a previous turn is still running. The underlying CLI's own queue handles ordering: Claude drains queued messages mid-turn as `<system-reminder>` attachments on the next tool-result batch; Codex coalesces them into the active or next turn.
+
+```typescript
+// Fire a long-running turn.
+const { uuid, result } = await session.send("Run the test suite and fix any failures.");
+
+// User decides they want a tweak — no need to wait for the turn to finish.
+await session.send("While you're at it, also add a CHANGELOG entry.");
+
+// Both messages get processed in the same turn (Claude mid-turn drain) or
+// adjacent turns (Codex). Both `result` Promises resolve when the turn ends —
+// they may resolve to the *same* TurnResult if the CLI coalesces them.
+await result;
+```
+
+When multiple sends are coalesced into one turn by the CLI, the `result` Promises returned by each `send()` resolve with the **same** `TurnResult` object — callers cannot assume 1:1 correspondence between `send()` calls and `TurnResult`s.
+
+For providers with `concurrentSend = false`, calling `send()` while a turn is in progress throws. Check the capability flag to gate UI:
+
+```typescript
+if (provider.capabilities.concurrentSend) {
+  // Render the "type while working" textarea.
+}
+```
+
+### Cancelling a queued message
+
+For providers with `capabilities.cancelQueuedMessage = true` (Claude only), `session.cancel(uuid)` removes a message from the CLI's queue if it hasn't started processing yet.
+
+```typescript
+const { uuid } = await session.send("Refactor the auth middleware.");
+// ...user changes their mind...
+const { cancelled } = await session.cancel(uuid);
+if (cancelled) console.log("Pulled the message before the agent started on it.");
+else console.log("Too late — the agent already drained it.");
+```
+
+`cancel()` is always callable. For providers with `cancelQueuedMessage = false` (Codex, and any session-less provider), it returns `{ cancelled: false }` immediately. For Claude, it sends a `cancel_async_message` control_request to the CLI, which runs `dequeueAllMatching` against its internal queue and reports whether the message was found.
+
+> **Race note.** Cancellation is best-effort. If the CLI drained the message mid-turn (Claude's `query.ts` between-tool-batches drain) before your `cancel()` request landed, you get `{ cancelled: false }` — and the message will be visible to the model as a `<system-reminder>`. The library does not unmount what the model has already seen.
 
 ## Plan Mode
 

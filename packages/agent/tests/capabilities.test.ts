@@ -14,6 +14,8 @@ describe("ProviderCapabilities", () => {
       expect(typeof provider.capabilities.instructions).toBe("boolean");
       expect(typeof provider.capabilities.workspace).toBe("boolean");
       expect(typeof provider.capabilities.planMode).toBe("boolean");
+      expect(typeof provider.capabilities.concurrentSend).toBe("boolean");
+      expect(typeof provider.capabilities.cancelQueuedMessage).toBe("boolean");
     }
   });
 
@@ -30,7 +32,26 @@ describe("ProviderCapabilities", () => {
       instructions: true,
       workspace: true,
       planMode: true,
+      concurrentSend: true,
+      cancelQueuedMessage: true,
     });
+  });
+
+  it("claude and codex are the only providers with concurrentSend", () => {
+    for (const name of listProviders()) {
+      const caps = getProvider(name).capabilities;
+      const expected = name === "claude" || name === "codex";
+      expect(caps.concurrentSend).toBe(expected);
+    }
+  });
+
+  it("only claude supports per-message cancel", () => {
+    // Codex's JSON-RPC has no per-message cancel; only turn/cancel via interrupt().
+    for (const name of listProviders()) {
+      const caps = getProvider(name).capabilities;
+      const expected = name === "claude";
+      expect(caps.cancelQueuedMessage).toBe(expected);
+    }
   });
 
   it("only claude and codex advertise native plan mode", () => {

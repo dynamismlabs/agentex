@@ -13,6 +13,8 @@ export const openclawProvider: ProviderModule = {
     instructions: false,
     workspace: false,
     planMode: false,
+    concurrentSend: false,
+    cancelQueuedMessage: false,
   },
   execute: executeOpenclawProvider,
   resolveAuth: async () => ({

@@ -14,6 +14,8 @@ export const opencodeProvider: ProviderModule = {
     instructions: true,
     workspace: true,
     planMode: false,
+    concurrentSend: false,
+    cancelQueuedMessage: false,
   },
   execute: executeOpenCodeProvider,
   resolveAuth: (ctx) => resolveAuthForProvider("opencode", ctx),

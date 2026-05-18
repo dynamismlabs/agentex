@@ -11,12 +11,19 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { getProvider, parseAskUserQuestion, aggregateUsage } from "../src/index.js";
 import type {
+  AgentSession,
   StreamEvent,
   TurnResult,
   UserInputRequest,
   ElicitationRequest,
   HookCallbackRequest,
 } from "../src/index.js";
+
+/** Send a message and await its TurnResult — bridges the new SendHandle API. */
+async function sendAndAwait(session: AgentSession, message: string): Promise<TurnResult> {
+  const handle = await session.send(message);
+  return handle.result;
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURES_DIR = path.resolve(__dirname, "../tests/fixtures");
@@ -39,20 +46,19 @@ async function testProvider(type: string, useMock: boolean) {
 
   const provider = getProvider(type);
 
-  // In mock mode, skip environment test (mock binaries won't be in PATH)
+  // In mock mode, skip environment check (mock binaries won't be in PATH)
   if (!useMock) {
-    console.log("\n--- Environment Test ---");
-    const envResult = await provider.testEnvironment({
-      providerType: type,
-      config: {},
-    });
-    console.log(`Status: ${envResult.status}`);
-    for (const check of envResult.checks) {
-      console.log(`  [${check.level}] ${check.code}: ${check.message}`);
+    console.log("\n--- Environment Check ---");
+    const auth = await provider.resolveAuth();
+    console.log(`  Binary installed: ${auth.binary.installed}${auth.binary.version ? ` (v${auth.binary.version})` : ""}`);
+    if (!auth.binary.installed) {
+      console.log(`  Skipping execution — binary not installed: ${auth.binary.error ?? "unknown"}`);
+      return;
     }
-
-    if (envResult.status === "fail") {
-      console.log(`Skipping execution — environment check failed.`);
+    const present = auth.options.filter((o) => o.present);
+    console.log(`  Auth: ${present.length > 0 ? present.map((o) => o.method).join(", ") : "none present"}`);
+    if (present.length === 0) {
+      console.log(`  Skipping execution — no auth present`);
       return;
     }
 
@@ -164,21 +170,21 @@ async function testSession(useMock: boolean) {
 
   // Turn 1
   console.log("\n--- Turn 1 ---");
-  const r1 = await session.send("Hello from smoke test turn 1");
+  const r1 = await sendAndAwait(session, "Hello from smoke test turn 1");
   logTurn(r1);
   if (r1.status === "failed") issues.push(`turn 1 error: ${r1.errorMessage}`);
   if (!r1.summary) issues.push("turn 1 missing summary");
 
   // Turn 2 — verify context retention (session stays alive)
   console.log("\n--- Turn 2 ---");
-  const r2 = await session.send("This is turn 2, do you remember turn 1?");
+  const r2 = await sendAndAwait(session, "This is turn 2, do you remember turn 1?");
   logTurn(r2);
   if (r2.status === "failed") issues.push(`turn 2 error: ${r2.errorMessage}`);
   if (!r2.summary) issues.push("turn 2 missing summary");
 
   // Turn 3
   console.log("\n--- Turn 3 ---");
-  const r3 = await session.send("Final turn, turn 3");
+  const r3 = await sendAndAwait(session, "Final turn, turn 3");
   logTurn(r3);
   if (r3.status === "failed") issues.push(`turn 3 error: ${r3.errorMessage}`);
   if (!r3.summary) issues.push("turn 3 missing summary");
@@ -277,7 +283,7 @@ async function testSessionProtocol(useMock: boolean): Promise<boolean> {
 
   // --- Test 1: can_use_tool permission ---
   console.log("\n--- Permission (can_use_tool) ---");
-  const r1 = await session.send("test-permissions");
+  const r1 = await sendAndAwait(session, "test-permissions");
   logTurn(r1);
   if (r1.status === "failed") issues.push(`permission turn error: ${r1.errorMessage}`);
   if (permissionCalls.length === 0) {
@@ -299,7 +305,7 @@ async function testSessionProtocol(useMock: boolean): Promise<boolean> {
   // --- Test 2: AskUserQuestion ---
   console.log("\n--- AskUserQuestion ---");
   permissionCalls.length = 0;
-  const r2 = await session.send("test-ask-question");
+  const r2 = await sendAndAwait(session, "test-ask-question");
   logTurn(r2);
   if (r2.status === "failed") issues.push(`ask-question turn error: ${r2.errorMessage}`);
   if (permissionCalls.length === 0) {
@@ -321,7 +327,7 @@ async function testSessionProtocol(useMock: boolean): Promise<boolean> {
   // --- Test 2b: AskUserQuestion multi-select ---
   console.log("\n--- AskUserQuestion (multiSelect) ---");
   permissionCalls.length = 0;
-  const r2b = await session.send("test-ask-multiselect");
+  const r2b = await sendAndAwait(session, "test-ask-multiselect");
   logTurn(r2b);
   if (r2b.status === "failed") issues.push(`ask-multiselect turn error: ${r2b.errorMessage}`);
   if (permissionCalls.length === 0) {
@@ -341,7 +347,7 @@ async function testSessionProtocol(useMock: boolean): Promise<boolean> {
 
   // --- Test 3: Elicitation ---
   console.log("\n--- Elicitation ---");
-  const r3 = await session.send("test-elicitation");
+  const r3 = await sendAndAwait(session, "test-elicitation");
   logTurn(r3);
   if (r3.status === "failed") issues.push(`elicitation turn error: ${r3.errorMessage}`);
   if (elicitationCalls.length === 0) {
@@ -370,7 +376,7 @@ async function testSessionProtocol(useMock: boolean): Promise<boolean> {
 
   // --- Test 4: Hook callback ---
   console.log("\n--- Hook callback ---");
-  const r4 = await session.send("test-hook");
+  const r4 = await sendAndAwait(session, "test-hook");
   logTurn(r4);
   if (r4.status === "failed") issues.push(`hook turn error: ${r4.errorMessage}`);
   if (hookCalls.length === 0) {
@@ -388,7 +394,7 @@ async function testSessionProtocol(useMock: boolean): Promise<boolean> {
   // --- Test 5: Cancel ---
   console.log("\n--- Cancel (control_cancel_request) ---");
   permissionCalls.length = 0;
-  const r5 = await session.send("test-cancel");
+  const r5 = await sendAndAwait(session, "test-cancel");
   logTurn(r5);
   if (r5.status === "failed") issues.push(`cancel turn error: ${r5.errorMessage}`);
   // The permission callback may or may not fire — the cancel races it.
@@ -445,17 +451,17 @@ async function testSessionEdgeCases(useMock: boolean): Promise<boolean> {
     });
 
     // Permission with no callback → should auto-allow, turn completes
-    const r1 = await session.send("test-permissions");
+    const r1 = await sendAndAwait(session, "test-permissions");
     if (r1.status === "failed") issues.push(`fallback permission turn error: ${r1.errorMessage}`);
     else console.log("  auto-allow (no onUserInputRequest): turn completed");
 
     // Elicitation with no callback → should auto-decline, turn completes
-    const r2 = await session.send("test-elicitation");
+    const r2 = await sendAndAwait(session, "test-elicitation");
     if (r2.status === "failed") issues.push(`fallback elicitation turn error: ${r2.errorMessage}`);
     else console.log("  auto-decline (no onElicitation): turn completed");
 
     // Hook with no callback → should return empty, turn completes
-    const r3 = await session.send("test-hook");
+    const r3 = await sendAndAwait(session, "test-hook");
     if (r3.status === "failed") issues.push(`fallback hook turn error: ${r3.errorMessage}`);
     else console.log("  auto-empty (no onHookCallback): turn completed");
 
@@ -480,7 +486,7 @@ async function testSessionEdgeCases(useMock: boolean): Promise<boolean> {
       },
     });
 
-    const r = await session.send("test-permissions");
+    const r = await sendAndAwait(session, "test-permissions");
     logTurn(r);
     if (r.status === "failed") issues.push(`deny turn error: ${r.errorMessage}`);
     if (deniedToolName !== "Bash") issues.push(`deny: expected toolName "Bash", got "${deniedToolName}"`);
@@ -508,7 +514,7 @@ async function testSessionEdgeCases(useMock: boolean): Promise<boolean> {
       },
     });
 
-    const r = await session.send("test-permissions");
+    const r = await sendAndAwait(session, "test-permissions");
     logTurn(r);
     if (!callbackFired) issues.push("error test: onUserInputRequest never fired");
     if (r.status === "failed") issues.push(`error test turn error: ${r.errorMessage}`);
@@ -536,7 +542,7 @@ async function testSessionEdgeCases(useMock: boolean): Promise<boolean> {
       },
     });
 
-    const r = await session.send("test-elicitation");
+    const r = await sendAndAwait(session, "test-elicitation");
     logTurn(r);
     if (!callbackFired) issues.push("elicitation error test: callback never fired");
     if (r.status === "failed") issues.push(`elicitation error test turn error: ${r.errorMessage}`);
@@ -563,7 +569,7 @@ async function testSessionEdgeCases(useMock: boolean): Promise<boolean> {
       },
     });
 
-    const r = await session.send("test-hook");
+    const r = await sendAndAwait(session, "test-hook");
     logTurn(r);
     if (!callbackFired) issues.push("hook error test: callback never fired");
     if (r.status === "failed") issues.push(`hook error test turn error: ${r.errorMessage}`);

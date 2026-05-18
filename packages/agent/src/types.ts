@@ -29,6 +29,29 @@ export interface ProviderCapabilities {
    * Providers with this set to `false` ignore `config.planMode` entirely.
    */
   planMode: boolean;
+  /**
+   * Descriptive: the underlying CLI accepts user messages mid-turn. When
+   * `true`, callers may call `session.send()` while a previous turn is still
+   * in progress; the CLI's own queue handles ordering and either drains
+   * mid-turn (Claude injects as `<system-reminder>` attachments on the next
+   * tool-result batch) or coalesces queued items into the next turn.
+   *
+   * When `false`, calling `send()` while a turn is in progress throws.
+   *
+   * Apps may use this flag to gate "type while working" UI; it does not gate
+   * the API itself.
+   */
+  concurrentSend: boolean;
+  /**
+   * Descriptive: `session.cancel(uuid)` can remove queued (not-yet-processing)
+   * messages on this provider. When `false`, `cancel()` is still callable but
+   * always returns `{cancelled: false}`.
+   *
+   * Note that even when `true`, cancel is best-effort — once the CLI has
+   * dequeued a message for processing (mid-turn drain or new-turn dispatch),
+   * cancel returns `{cancelled: false}`.
+   */
+  cancelQueuedMessage: boolean;
 }
 
 // Core provider interface — every provider must implement this
@@ -766,13 +789,71 @@ export interface SessionContext {
   onHookCallback?: (req: HookCallbackRequest) => Promise<HookCallbackResponse>;
 }
 
+/**
+ * Handle returned by `AgentSession.send()`. Carries the library-generated
+ * UUID for the user message (use with `cancel(uuid)`) plus a Promise for the
+ * TurnResult.
+ *
+ * When `concurrentSend` is true and multiple `send()` calls are coalesced into
+ * one turn by the CLI, their `result` Promises resolve with the same
+ * TurnResult object — callers cannot assume 1:1 correspondence between
+ * `send()` calls and TurnResults.
+ */
+export interface SendHandle {
+  /** Library-generated UUID attached to the user message. Pass to `cancel()`. */
+  uuid: string;
+  /** Resolves with the next TurnResult after the message was written. */
+  result: Promise<TurnResult>;
+}
+
+/** Outcome of a `cancel(uuid)` call. */
+export interface CancelResult {
+  /**
+   * `true` only when the CLI confirmed the queued message was removed before
+   * being processed. `false` when:
+   *   - the provider doesn't support per-message cancel (capabilities.cancelQueuedMessage === false)
+   *   - the message had already been dequeued (lost race to mid-turn drain or new-turn dispatch)
+   *   - the UUID is unknown to the CLI
+   */
+  cancelled: boolean;
+}
+
 /** A persistent session handle for multi-turn conversations. */
 export interface AgentSession {
   readonly sessionId: string | null;
+  /**
+   * Reflects the most recent observed lifecycle event, not whether `send()`
+   * is callable. For providers with `concurrentSend: true`, `send()` is
+   * always callable while state is not `closed`.
+   */
   readonly state: SessionState;
 
-  /** Send a user message and wait for the agent's turn to complete. */
-  send(message: string): Promise<TurnResult>;
+  /**
+   * Send a user message.
+   *
+   * Returns a `SendHandle` synchronously-then-asynchronously: `uuid` is
+   * available as soon as the Promise resolves (which is on the next tick);
+   * `result` resolves with the next `TurnResult` after the message was
+   * written.
+   *
+   * For providers with `concurrentSend: true` (Claude, Codex), callable at
+   * any time including while a turn is in progress — the CLI's own queue
+   * handles ordering. For providers with `concurrentSend: false`, throws when
+   * called while !idle.
+   *
+   * Multiple concurrent sends may resolve with the same shared `TurnResult`
+   * if the CLI coalesces them. See `SendHandle` JSDoc.
+   */
+  send(message: string): Promise<SendHandle>;
+
+  /**
+   * Cancel a previously-sent message that is still queued in the CLI.
+   *
+   * Always callable. Returns `{cancelled: false}` when the provider doesn't
+   * support per-message cancel, when the message has already been dequeued,
+   * or when the UUID is unknown.
+   */
+  cancel(uuid: string): Promise<CancelResult>;
 
   /** Gracefully interrupt the current turn. */
   interrupt(): Promise<void>;

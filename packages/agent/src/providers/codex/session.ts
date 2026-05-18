@@ -1,7 +1,10 @@
 import type { ChildProcess } from "node:child_process";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import type {
   AgentSession,
+  CancelResult,
+  SendHandle,
   SessionContext,
   SessionState,
   StreamEvent,
@@ -54,17 +57,25 @@ type IncomingMessage =
   | { kind: "legacy_event"; event: Record<string, unknown> };
 
 function classifyMessage(msg: Record<string, unknown>): IncomingMessage | null {
-  const isRpc = msg["jsonrpc"] === "2.0";
+  // Detect JSON-RPC by *structure*, not by the `jsonrpc:"2.0"` discriminator.
+  // codex-cli 0.130.0's `app-server` emits responses without the `jsonrpc`
+  // field (technically non-compliant with the spec, but it's what ships).
+  // Heuristic: a message is JSON-RPC if it has any of (jsonrpc, id, method).
+  const hasJsonRpc = msg["jsonrpc"] === "2.0";
+  const hasId = "id" in msg && (typeof msg["id"] === "number" || typeof msg["id"] === "string");
+  const hasMethod = "method" in msg && typeof msg["method"] === "string";
+  const hasResult = "result" in msg;
+  const hasError = "error" in msg;
 
-  if (isRpc) {
-    const hasId = "id" in msg && (typeof msg["id"] === "number" || typeof msg["id"] === "string");
-    const hasMethod = "method" in msg && typeof msg["method"] === "string";
-    const id = typeof msg["id"] === "number" ? msg["id"] : parseInt(String(msg["id"]), 10);
+  if (hasJsonRpc || hasId || hasMethod) {
+    const id = hasId
+      ? (typeof msg["id"] === "number" ? msg["id"] : parseInt(String(msg["id"]), 10))
+      : null;
 
     if (hasId && hasMethod) {
-      return { kind: "request", id, method: msg["method"] as string, params: asObj(msg, "params") };
+      return { kind: "request", id: id!, method: msg["method"] as string, params: asObj(msg, "params") };
     }
-    if (hasId && !hasMethod) {
+    if (hasId && (hasResult || hasError)) {
       const errRaw = msg["error"];
       const error = typeof errRaw === "object" && errRaw !== null
         ? { code: num(errRaw as Record<string, unknown>, "code"), message: str(errRaw as Record<string, unknown>, "message") }
@@ -72,12 +83,11 @@ function classifyMessage(msg: Record<string, unknown>): IncomingMessage | null {
       const result = typeof msg["result"] === "object" && msg["result"] !== null
         ? (msg["result"] as Record<string, unknown>)
         : undefined;
-      return { kind: "response", id, result, error };
+      return { kind: "response", id: id!, result, error };
     }
     if (hasMethod) {
       return { kind: "notification", method: msg["method"] as string, params: asObj(msg, "params") };
     }
-    return null;
   }
 
   // Legacy NDJSON events (from `codex exec --json` format) — have a `type` field
@@ -118,14 +128,19 @@ export async function createCodexSession(ctx: SessionContext): Promise<AgentSess
     ? withPlanModePreamble(baseInstructions)
     : baseInstructions;
 
-  // Spawn Codex in interactive JSON-RPC mode.
-  // planMode and skipPermissions are mutually exclusive — planMode wins.
-  const args = [...resolved.prefixArgs, "--json"];
+  // Spawn Codex in interactive JSON-RPC mode via the `app-server` subcommand
+  // (codex-cli 0.130.0+; the old top-level `--json` flag was removed).
+  //
+  // Args order matters: `--sandbox` and `--dangerously-bypass-approvals-and-sandbox`
+  // are TOP-LEVEL options and must come BEFORE the `app-server` subcommand.
+  // extraArgs land after the subcommand — semantics depend on the user's intent.
+  const args = [...resolved.prefixArgs];
   if (config.planMode) {
     args.push("--sandbox", "read-only");
   } else if (config.skipPermissions) {
     args.push("--dangerously-bypass-approvals-and-sandbox");
   }
+  args.push("app-server");
   if (config.extraArgs) args.push(...config.extraArgs);
 
   const proc = spawn(resolved.bin, args, {
@@ -172,9 +187,18 @@ export class CodexSessionImpl implements AgentSession {
     reject: (err: Error) => void;
   }>();
 
-  // Active turn state
-  private _turnResolve: ((result: TurnResult) => void) | null = null;
-  private _turnReject: ((err: Error) => void) | null = null;
+  // Pending result-resolvers. With concurrent send, multiple in-flight send()
+  // Promises may share a single result event (when the CLI coalesces them
+  // into one turn) or get distinct results across turns. On each
+  // turn.completed / turn.failed we drain the entire list — every pending
+  // Promise resolves with the same TurnResult.
+  private _pendingResults: Array<{
+    resolve: (result: TurnResult) => void;
+    reject: (err: Error) => void;
+  }> = [];
+
+  // Per-turn accumulators. Cleared after each result delivery so a subsequent
+  // turn's events don't inherit stale values.
   private _turnSummary: string | null = null;
   private _turnUsage: { inputTokens: number; outputTokens: number } | null = null;
   private _turnModel: string | null = null;
@@ -211,28 +235,24 @@ export class CodexSessionImpl implements AgentSession {
       if (this._state !== "closed") {
         this._state = "closed";
         const err = new Error(`Codex process exited unexpectedly (code=${code}, signal=${signal})`);
-        for (const [, pending] of this._pendingRpc) pending.reject(err);
-        this._pendingRpc.clear();
-        if (this._turnReject) {
-          this._turnReject(err);
-          this._turnResolve = null;
-          this._turnReject = null;
-        }
+        this.rejectAllPending(err);
       }
     });
 
     proc.on("error", (err) => {
       if (this._state !== "closed") {
         this._state = "closed";
-        for (const [, pending] of this._pendingRpc) pending.reject(err);
-        this._pendingRpc.clear();
-        if (this._turnReject) {
-          this._turnReject(err);
-          this._turnResolve = null;
-          this._turnReject = null;
-        }
+        this.rejectAllPending(err);
       }
     });
+  }
+
+  /** Reject every pending send() Promise and outgoing JSON-RPC call. */
+  private rejectAllPending(err: Error): void {
+    const pending = this._pendingResults.splice(0);
+    for (const p of pending) p.reject(err);
+    for (const [, p] of this._pendingRpc) p.reject(err);
+    this._pendingRpc.clear();
   }
 
   get sessionId(): string | null { return this._threadId; }
@@ -274,37 +294,58 @@ export class CodexSessionImpl implements AgentSession {
     if (this.instructions) threadParams["developerInstructions"] = this.instructions;
 
     const res = await this.rpcRequest("thread/start", threadParams);
-    this._threadId = str(res, "threadId") || str(res, "thread_id") || null;
+    // codex-cli 0.130.0+ shape: { thread: { id, sessionId, ... }, model, ... }
+    const thread = asObj(res, "thread");
+    this._threadId = str(thread, "id") || str(thread, "sessionId") || null;
   }
 
   // -------------------------------------------------------------------------
   // Public API
   // -------------------------------------------------------------------------
 
-  async send(message: string): Promise<TurnResult> {
+  async send(message: string): Promise<SendHandle> {
     if (this._state === "closed") throw new Error("Session is closed");
-    if (this._state !== "idle") throw new Error("A turn is already in progress");
 
-    this._state = "thinking";
-    this._turnSummary = null;
-    this._turnUsage = null;
-    this._turnModel = null;
-    this._turnIsError = false;
-    this._turnErrorMessage = null;
-    this._turnStartedAt = new Date();
+    // No protocol-level guard — Codex's TUI demonstrates queueing of user
+    // messages during an active turn, and our wire test (transcript
+    // 019e33c3) confirms two `user_message` events recorded across a
+    // long-running turn. We bet on the JSON-RPC layer queueing similarly
+    // and pass through. If the second `turn/start` lands during the first
+    // turn, the per-turn accumulators continue collecting until the result
+    // event fires; the result then drains all pending resolvers.
+    if (this._state === "idle") {
+      this._state = "thinking";
+      this._turnStartedAt = new Date();
+    }
 
-    // Start a turn — the completion comes via notifications, not the RPC response
-    const turnParams: Record<string, unknown> = { input: message };
+    // UUID is for API parity with Claude — Codex's JSON-RPC doesn't carry it
+    // through the wire protocol, so cancel(uuid) is a no-op for Codex.
+    const uuid = randomUUID();
+
+    // Start a turn — the completion comes via notifications, not the RPC response.
+    // codex-cli 0.130.0+ expects `input` as a content-block array, not a plain
+    // string. The MCP-style shape: [{type:"text", text:"..."}].
+    const turnParams: Record<string, unknown> = {
+      input: [{ type: "text", text: message }],
+    };
     if (this._threadId) turnParams["threadId"] = this._threadId;
 
-    this.rpcRequest("turn/start", turnParams).catch(() => {
-      // Turn-level errors arrive via turn.failed notifications
+    const result = new Promise<TurnResult>((resolve, reject) => {
+      this._pendingResults.push({ resolve, reject });
     });
 
-    return new Promise<TurnResult>((resolve, reject) => {
-      this._turnResolve = resolve;
-      this._turnReject = reject;
+    this.rpcRequest("turn/start", turnParams).catch(() => {
+      // Turn-level errors arrive via turn.failed notifications.
     });
+
+    return { uuid, result };
+  }
+
+  async cancel(_uuid: string): Promise<CancelResult> {
+    // Codex's JSON-RPC protocol exposes no per-message cancel — only
+    // turn-wide `turn/cancel` (which is what `interrupt()` calls).
+    // capabilities.cancelQueuedMessage is false; this is a documented no-op.
+    return { cancelled: false };
   }
 
   async interrupt(): Promise<void> {
@@ -455,7 +496,9 @@ export class CodexSessionImpl implements AgentSession {
 
     // Map v2 notification methods to processing
     if (method === "thread/started") {
-      this._threadId = str(params, "threadId") || str(params, "thread_id") || this._threadId;
+      // codex-cli 0.130.0+ shape: { thread: { id, sessionId, ... } }
+      const thread = asObj(params, "thread");
+      this._threadId = str(thread, "id") || str(thread, "sessionId") || this._threadId;
       this.emitStreamEvent(rawLine);
       return;
     }
@@ -657,12 +700,21 @@ export class CodexSessionImpl implements AgentSession {
     if (this._state === "closed") return;
 
     this._state = "idle";
-    if (this._turnResolve) {
-      const resolve = this._turnResolve;
-      this._turnResolve = null;
-      this._turnReject = null;
-      resolve(result);
-    }
+
+    // Drain ALL pending send() resolvers with this turn's result. Multiple
+    // concurrent sends coalesced into one turn share the same TurnResult.
+    const pending = this._pendingResults.splice(0);
+
+    // Clear per-turn accumulators so a subsequent turn doesn't inherit
+    // stale summary / usage / model.
+    this._turnSummary = null;
+    this._turnUsage = null;
+    this._turnModel = null;
+    this._turnIsError = false;
+    this._turnErrorMessage = null;
+    this._turnStartedAt = null;
+
+    for (const p of pending) p.resolve(result);
   }
 
   private emitStreamEvent(rawLine: string): void {

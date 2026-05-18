@@ -197,14 +197,16 @@ export async function invokeSkill(
   }
 
   if (command.execution.kind === "provider-slash") {
-    return session.send(formatCommandText(command.execution.commandText, options.args));
+    const handle = await session.send(formatCommandText(command.execution.commandText, options.args));
+    return handle.result;
   }
 
   const prompt = await buildExpandedSkillPrompt(command, {
     args: options.args,
     userRequest: options.userRequest,
   });
-  return session.send(prompt);
+  const handle = await session.send(prompt);
+  return handle.result;
 }
 
 export async function buildExpandedSkillPrompt(

@@ -18,6 +18,8 @@ export const codexProvider: ProviderModule = {
     instructions: true,
     workspace: true,
     planMode: true,
+    concurrentSend: true,
+    cancelQueuedMessage: false,
   },
   execute: executeCodexProvider,
   createSession: (ctx: SessionContext): Promise<AgentSession> => createCodexSession(ctx),

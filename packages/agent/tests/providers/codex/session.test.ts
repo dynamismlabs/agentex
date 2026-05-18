@@ -37,12 +37,13 @@ function makeDrivenSession(ctx: SessionContext): {
   const session = new CodexSessionImpl(proc, ctx, "/tmp", "test-model", null);
   const turnResult = new Promise<TurnResult>((resolve, reject) => {
     const s = session as unknown as {
-      _turnResolve: (r: TurnResult) => void;
-      _turnReject: (e: Error) => void;
+      _pendingResults: Array<{
+        resolve: (r: TurnResult) => void;
+        reject: (e: Error) => void;
+      }>;
       _state: string;
     };
-    s._turnResolve = resolve;
-    s._turnReject = reject;
+    s._pendingResults.push({ resolve, reject });
     s._state = "thinking";
     // Leave _turnStartedAt as null (the class default) so resolveTurn skips
     // the disk-scan branch and takes the sync deliverTurnResult path.
@@ -177,5 +178,76 @@ describe("CodexSession — onEvent dispatch", () => {
     resolveSlow!();
     await turnResult;
     expect(order).toEqual(["slow-handler-done", "result-handler-done"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Concurrent send + cancel — Codex JSON-RPC has no per-message cancel.
+// ---------------------------------------------------------------------------
+
+describe("CodexSession — concurrent send", () => {
+  it("send() while a turn is in progress no longer throws", async () => {
+    const { proc } = makeFakeProc();
+    const session = new CodexSessionImpl(proc, {}, "/tmp", "test-model", null);
+
+    const h1 = await session.send("first");
+    expect(h1.uuid).toBeTruthy();
+    const h2 = await session.send("second mid-turn");
+    expect(h2.uuid).toBeTruthy();
+    expect(h2.uuid).not.toBe(h1.uuid);
+  });
+
+  it("multiple pending sends share the TurnResult when one turn.completed fires", async () => {
+    const { proc } = makeFakeProc();
+    const session = new CodexSessionImpl(proc, {}, "/tmp", "test-model", null);
+
+    const h1 = await session.send("a");
+    const h2 = await session.send("b");
+    const h3 = await session.send("c");
+
+    // One turn.completed drains every pending resolver with the same result.
+    (session as unknown as { handleLine: (l: string) => void }).handleLine(
+      ndjson({
+        type: "item.completed",
+        item: { type: "agent_message", text: "shared" },
+      }),
+    );
+    (session as unknown as { handleLine: (l: string) => void }).handleLine(
+      ndjson({ type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } }),
+    );
+
+    const [r1, r2, r3] = await Promise.all([h1.result, h2.result, h3.result]);
+    expect(r1).toBe(r2);
+    expect(r2).toBe(r3);
+    expect(r1.summary).toBe("shared");
+  });
+
+  it("per-turn accumulators reset between sequential turns", async () => {
+    const { proc } = makeFakeProc();
+    const session = new CodexSessionImpl(proc, {}, "/tmp", "test-model", null);
+    const feed = (line: string): void => {
+      (session as unknown as { handleLine: (l: string) => void }).handleLine(line);
+    };
+
+    const h1 = await session.send("turn-1");
+    feed(ndjson({ type: "item.completed", item: { type: "agent_message", text: "first" } }));
+    feed(ndjson({ type: "turn.completed" }));
+    const r1 = await h1.result;
+    expect(r1.summary).toBe("first");
+
+    // Second turn must NOT inherit the first turn's summary.
+    const h2 = await session.send("turn-2");
+    feed(ndjson({ type: "turn.completed" }));
+    const r2 = await h2.result;
+    expect(r2.summary).toBeNull();
+  });
+});
+
+describe("CodexSession — cancel", () => {
+  it("returns {cancelled: false} — Codex has no per-message cancel", async () => {
+    const { proc } = makeFakeProc();
+    const session = new CodexSessionImpl(proc, {}, "/tmp", "test-model", null);
+
+    expect(await session.cancel("any-uuid")).toEqual({ cancelled: false });
   });
 });

@@ -14,6 +14,8 @@ export const piProvider: ProviderModule = {
     instructions: true,
     workspace: true,
     planMode: false,
+    concurrentSend: false,
+    cancelQueuedMessage: false,
   },
   execute: executePiProvider,
   resolveAuth: (ctx) => resolveAuthForProvider("pi", ctx),

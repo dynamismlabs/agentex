@@ -42,6 +42,8 @@ export const processProvider: ProviderModule = {
     instructions: true,
     workspace: true,
     planMode: false,
+    concurrentSend: false,
+    cancelQueuedMessage: false,
   },
   execute: executeProcessProvider,
   resolveAuth: resolveProcessAuth,

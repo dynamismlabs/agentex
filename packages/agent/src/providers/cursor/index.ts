@@ -14,6 +14,8 @@ export const cursorProvider: ProviderModule = {
     instructions: true,
     workspace: true,
     planMode: false,
+    concurrentSend: false,
+    cancelQueuedMessage: false,
   },
   execute: executeCursorProvider,
   resolveAuth: (ctx) => resolveAuthForProvider("cursor", ctx),

@@ -30,6 +30,8 @@ export const claudeProvider: ProviderModule = {
     instructions: true,
     workspace: true,
     planMode: true,
+    concurrentSend: true,
+    cancelQueuedMessage: true,
   },
   execute: executeClaudeProvider,
   createSession: (ctx: SessionContext): Promise<AgentSession> => createClaudeSession(ctx),

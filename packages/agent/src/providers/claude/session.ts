@@ -3,6 +3,8 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type {
   AgentSession,
+  CancelResult,
+  SendHandle,
   SessionContext,
   SessionState,
   StreamEvent,
@@ -197,9 +199,15 @@ export class ClaudeSessionImpl implements AgentSession {
   private _lineBuffer = "";
   private _stderrBuffer = "";
 
-  // Active turn state
-  private _turnResolve: ((result: TurnResult) => void) | null = null;
-  private _turnReject: ((err: Error) => void) | null = null;
+  // Pending result-resolvers. With concurrent send, multiple in-flight send()
+  // Promises may share a single result event (when the CLI coalesces them
+  // into one turn) or get distinct results across turns. On each `result`
+  // event we drain the entire list — every pending Promise resolves with the
+  // same TurnResult. Subsequent sends queue against a fresh list.
+  private _pendingResults: Array<{
+    resolve: (result: TurnResult) => void;
+    reject: (err: Error) => void;
+  }> = [];
 
   /**
    * Tracks request_ids for async callbacks (permission, elicitation, hooks)
@@ -207,6 +215,16 @@ export class ClaudeSessionImpl implements AgentSession {
    * one of these, we remove it so the stale response is never sent back.
    */
   private _pendingCallbacks = new Set<string>();
+
+  /**
+   * Outgoing control_requests we sent to the CLI and are awaiting a
+   * control_response for, keyed by request_id. Currently only used by
+   * `cancel(uuid)` (interrupt remains fire-and-forget).
+   */
+  private _pendingControlResponses = new Map<string, {
+    resolve: (response: Record<string, unknown>) => void;
+    reject: (err: Error) => void;
+  }>();
 
   /**
    * Serial dispatch chain for `onEvent`. Each dispatched event appends a
@@ -236,27 +254,27 @@ export class ClaudeSessionImpl implements AgentSession {
     proc.on("exit", (code, signal) => {
       if (this._state !== "closed") {
         this._state = "closed";
-        // If a turn was in progress, reject it
-        if (this._turnReject) {
-          this._turnReject(new Error(
-            `Claude process exited unexpectedly (code=${code}, signal=${signal})`
-          ));
-          this._turnResolve = null;
-          this._turnReject = null;
-        }
+        const err = new Error(
+          `Claude process exited unexpectedly (code=${code}, signal=${signal})`
+        );
+        this.rejectAllPending(err);
       }
     });
 
     proc.on("error", (err) => {
       if (this._state !== "closed") {
         this._state = "closed";
-        if (this._turnReject) {
-          this._turnReject(err);
-          this._turnResolve = null;
-          this._turnReject = null;
-        }
+        this.rejectAllPending(err);
       }
     });
+  }
+
+  /** Reject every pending send() Promise and outgoing control_response. */
+  private rejectAllPending(err: Error): void {
+    const pending = this._pendingResults.splice(0);
+    for (const p of pending) p.reject(err);
+    for (const [, p] of this._pendingControlResponses) p.reject(err);
+    this._pendingControlResponses.clear();
   }
 
   get sessionId(): string | null { return this._sessionId; }
@@ -266,26 +284,62 @@ export class ClaudeSessionImpl implements AgentSession {
   // Public API
   // -------------------------------------------------------------------------
 
-  async send(message: string): Promise<TurnResult> {
+  async send(message: string): Promise<SendHandle> {
     if (this._state === "closed") throw new Error("Session is closed");
-    if (this._state !== "idle") throw new Error("A turn is already in progress");
 
-    this._state = "thinking";
+    // No guard on _state — Claude's CLI accepts user messages mid-turn and
+    // queues them internally (drain via `cancel_async_message` if needed).
+    // Set state for observability if currently idle; mid-turn the active
+    // turn's state machine keeps driving it.
+    if (this._state === "idle") this._state = "thinking";
 
-    // Write user message in stream-json format
+    const uuid = randomUUID();
+
+    // Write user message in stream-json format. `uuid` becomes the queue
+    // key the CLI uses for `cancel_async_message`.
     const userMsg = ndjsonLine({
       type: "user",
       session_id: this._sessionId ?? "",
       message: { role: "user", content: message },
       parent_tool_use_id: null,
+      uuid,
+    });
+
+    const result = new Promise<TurnResult>((resolve, reject) => {
+      this._pendingResults.push({ resolve, reject });
     });
 
     this.proc.stdin!.write(userMsg);
 
-    return new Promise<TurnResult>((resolve, reject) => {
-      this._turnResolve = resolve;
-      this._turnReject = reject;
+    return { uuid, result };
+  }
+
+  async cancel(uuid: string): Promise<CancelResult> {
+    if (this._state === "closed") return { cancelled: false };
+
+    const requestId = randomUUID();
+    const responsePromise = new Promise<Record<string, unknown>>((resolve, reject) => {
+      this._pendingControlResponses.set(requestId, { resolve, reject });
     });
+
+    const cancelMsg = ndjsonLine({
+      type: "control_request",
+      request_id: requestId,
+      request: {
+        subtype: "cancel_async_message",
+        message_uuid: uuid,
+      },
+    });
+
+    this.proc.stdin!.write(cancelMsg);
+
+    try {
+      const response = await responsePromise;
+      return { cancelled: response["cancelled"] === true };
+    } catch {
+      // Process exited / error before response — treat as "not cancelled."
+      return { cancelled: false };
+    }
   }
 
   async interrupt(): Promise<void> {
@@ -372,6 +426,13 @@ export class ClaudeSessionImpl implements AgentSession {
       return;
     }
 
+    // Control response — CLI is responding to a control_request we sent
+    // (currently only `cancel_async_message`; `interrupt` is fire-and-forget).
+    if (type === "control_response") {
+      this.handleControlResponse(msg);
+      return;
+    }
+
     // Result event — turn is complete. Forward to onEvent first (via
     // handleStreamMessage / parseStreamLine) so the wire event flows through
     // the same path as every other line; then resolve the TurnResult. The
@@ -422,6 +483,30 @@ export class ClaudeSessionImpl implements AgentSession {
         this.sendControlResponse(requestId, {});
         break;
     }
+  }
+
+  /**
+   * Handle a `control_response` from the CLI — a reply to an outgoing
+   * `control_request` we sent (currently only `cancel_async_message`).
+   *
+   * Wire shape:
+   *   {type:"control_response", response:{request_id, subtype:"success"|"error", response:{...} | error}}
+   */
+  private handleControlResponse(msg: Record<string, unknown>): void {
+    const response = obj(msg, "response");
+    const requestId = str(response, "request_id");
+    if (!requestId) return;
+    const pending = this._pendingControlResponses.get(requestId);
+    if (!pending) return;
+    this._pendingControlResponses.delete(requestId);
+
+    const subtype = str(response, "subtype");
+    if (subtype === "error") {
+      const errMsg = str(response, "error") || "control_response error";
+      pending.reject(new Error(errMsg));
+      return;
+    }
+    pending.resolve(obj(response, "response"));
   }
 
   // -------------------------------------------------------------------------
@@ -667,12 +752,13 @@ export class ClaudeSessionImpl implements AgentSession {
     if (this._state === "closed") return;
 
     this._state = "idle";
-    if (this._turnResolve) {
-      const resolve = this._turnResolve;
-      this._turnResolve = null;
-      this._turnReject = null;
-      resolve(result);
-    }
+
+    // Drain ALL pending send() resolvers with this turn's result. Multiple
+    // concurrent sends coalesced by the CLI into one turn share the same
+    // TurnResult — documented in SendHandle JSDoc. Splice empties the list
+    // so subsequent sends queue against a fresh list for the next turn.
+    const pending = this._pendingResults.splice(0);
+    for (const p of pending) p.resolve(result);
   }
 
   // -------------------------------------------------------------------------

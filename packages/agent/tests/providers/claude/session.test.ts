@@ -134,11 +134,12 @@ function makeDrivenSession(ctx: SessionContext): {
   const session = new ClaudeSessionImpl(proc, ctx, null);
   const turnResult = new Promise<TurnResult>((resolve, reject) => {
     (session as unknown as {
-      _turnResolve: (r: TurnResult) => void;
-      _turnReject: (e: Error) => void;
+      _pendingResults: Array<{
+        resolve: (r: TurnResult) => void;
+        reject: (e: Error) => void;
+      }>;
       _state: string;
-    })._turnResolve = resolve;
-    (session as unknown as { _turnReject: (e: Error) => void })._turnReject = reject;
+    })._pendingResults.push({ resolve, reject });
     (session as unknown as { _state: string })._state = "thinking";
   });
   const feed = (line: string): void => {
@@ -313,12 +314,16 @@ describe("ClaudeSession — onEvent dispatch", () => {
     // Simulate process exit while result handler is still draining.
     await new Promise((r) => setTimeout(r, 5));
     (session as unknown as { _state: string })._state = "closed";
-    const turnReject = (session as unknown as {
-      _turnReject: (e: Error) => void;
-    })._turnReject;
-    // Clear _turnResolve so the post-drain code can't double-resolve.
-    (session as unknown as { _turnResolve: null })._turnResolve = null;
-    turnReject(new Error("simulated exit"));
+    // Drain pending resolvers and reject the awaiting Promise — emulates
+    // the exit-handler's rejectAllPending() path without double-resolving
+    // when handleResult resumes (its splice will then find an empty list).
+    const pending = (session as unknown as {
+      _pendingResults: Array<{
+        resolve: (r: TurnResult) => void;
+        reject: (e: Error) => void;
+      }>;
+    })._pendingResults.splice(0);
+    for (const p of pending) p.reject(new Error("simulated exit"));
 
     // Unblock chain — handleResult resumes after this.
     resolveSlow!();
@@ -374,5 +379,140 @@ describe("ClaudeSession — onEvent dispatch", () => {
     resolveSlow!();
     await turnResult;
     expect(order).toEqual(["slow-handler-done", "result-handler-done"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Concurrent send — multiple in-flight sends share a TurnResult when the
+// CLI coalesces them into a single turn.
+// ---------------------------------------------------------------------------
+
+describe("ClaudeSession — concurrent send", () => {
+  it("send() while a turn is in progress no longer throws", async () => {
+    const { proc } = makeFakeProc();
+    const session = new ClaudeSessionImpl(proc, {}, null);
+
+    // First send transitions idle → thinking. Second send must not throw.
+    const handle1 = await session.send("first message");
+    expect(handle1.uuid).toBeTruthy();
+    expect(session.state).toBe("thinking");
+
+    // Concurrent — would have thrown under the old guard.
+    const handle2 = await session.send("second message during turn");
+    expect(handle2.uuid).toBeTruthy();
+    expect(handle2.uuid).not.toBe(handle1.uuid);
+  });
+
+  it("multiple pending sends share the same TurnResult when the CLI emits one result", async () => {
+    const { proc, stdinWrites } = makeFakeProc();
+    const session = new ClaudeSessionImpl(proc, {}, null);
+
+    const handle1 = await session.send("first");
+    const handle2 = await session.send("second");
+    const handle3 = await session.send("third");
+
+    // Three user messages were written to stdin, each with its own uuid.
+    const userWrites = stdinWrites.filter((w) => w.includes('"type":"user"'));
+    expect(userWrites).toHaveLength(3);
+    const writtenUuids = userWrites.map((w) => JSON.parse(w).uuid);
+    expect(writtenUuids).toEqual([handle1.uuid, handle2.uuid, handle3.uuid]);
+
+    // Single result event drains all three pending resolvers with the same TurnResult.
+    (session as unknown as { handleLine: (l: string) => void }).handleLine(
+      JSON.stringify({
+        type: "result",
+        subtype: "success",
+        session_id: "s1",
+        result: "coalesced",
+        is_error: false,
+      }),
+    );
+
+    const [r1, r2, r3] = await Promise.all([handle1.result, handle2.result, handle3.result]);
+    expect(r1).toBe(r2);
+    expect(r2).toBe(r3);
+    expect(r1.summary).toBe("coalesced");
+  });
+
+  it("attaches the library-generated uuid to the wire user message", async () => {
+    const { proc, stdinWrites } = makeFakeProc();
+    const session = new ClaudeSessionImpl(proc, {}, null);
+
+    const { uuid } = await session.send("hello");
+
+    // Find the user-message write and verify the uuid matches the handle.
+    const userWrite = stdinWrites.find((w) => w.includes('"type":"user"'));
+    expect(userWrite).toBeTruthy();
+    const parsed = JSON.parse(userWrite!);
+    expect(parsed.uuid).toBe(uuid);
+    expect(parsed.message.content).toBe("hello");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cancel() — control_request {subtype:'cancel_async_message', message_uuid}
+// ---------------------------------------------------------------------------
+
+describe("ClaudeSession — cancel", () => {
+  it("builds a cancel_async_message control_request with the given uuid", async () => {
+    const { proc, stdinWrites } = makeFakeProc();
+    const session = new ClaudeSessionImpl(proc, {}, null);
+
+    const target = "00000000-0000-0000-0000-000000000abc";
+    // Fire-and-forget — we'll resolve it via a synthesized control_response.
+    const cancelP = session.cancel(target);
+
+    // The most recent write should be the control_request.
+    const lastWrite = stdinWrites.at(-1)!;
+    const parsed = JSON.parse(lastWrite);
+    expect(parsed.type).toBe("control_request");
+    expect(parsed.request.subtype).toBe("cancel_async_message");
+    expect(parsed.request.message_uuid).toBe(target);
+    expect(typeof parsed.request_id).toBe("string");
+    expect(parsed.request_id.length).toBeGreaterThan(0);
+
+    // Feed a matching success control_response.
+    (session as unknown as { handleLine: (l: string) => void }).handleLine(
+      JSON.stringify({
+        type: "control_response",
+        response: {
+          request_id: parsed.request_id,
+          subtype: "success",
+          response: { cancelled: true },
+        },
+      }),
+    );
+
+    const result = await cancelP;
+    expect(result.cancelled).toBe(true);
+  });
+
+  it("returns {cancelled: false} when the CLI reports nothing to cancel", async () => {
+    const { proc, stdinWrites } = makeFakeProc();
+    const session = new ClaudeSessionImpl(proc, {}, null);
+
+    const cancelP = session.cancel("unknown-uuid");
+    const parsed = JSON.parse(stdinWrites.at(-1)!);
+
+    (session as unknown as { handleLine: (l: string) => void }).handleLine(
+      JSON.stringify({
+        type: "control_response",
+        response: {
+          request_id: parsed.request_id,
+          subtype: "success",
+          response: { cancelled: false },
+        },
+      }),
+    );
+
+    expect(await cancelP).toEqual({ cancelled: false });
+  });
+
+  it("returns {cancelled: false} when the session is already closed", async () => {
+    const { proc } = makeFakeProc();
+    const session = new ClaudeSessionImpl(proc, {}, null);
+    // Simulate process exit so state flips to closed.
+    proc.emit("exit", 0, null);
+    expect(await session.cancel("any-uuid")).toEqual({ cancelled: false });
   });
 });
