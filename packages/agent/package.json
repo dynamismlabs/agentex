@@ -2,6 +2,15 @@
   "name": "@agentex/agent",
   "version": "0.0.17",
   "description": "Programmatic execution of AI coding agents (Claude Code, Codex, OpenClaw)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dynamismlabs/agentex.git",
+    "directory": "packages/agent"
+  },
+  "homepage": "https://github.com/dynamismlabs/agentex/tree/main/packages/agent#readme",
+  "bugs": {
+    "url": "https://github.com/dynamismlabs/agentex/issues"
+  },
   "type": "module",
   "exports": {
     ".": {

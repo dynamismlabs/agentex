@@ -61,6 +61,10 @@ import { workspace } from "@agentex/workspace";
 await workspace.create(opts)            // CreateOptions → Workspace
 await workspace.open(path, opts?)       // OpenOptions → Workspace (re-hydrate from disk)
 await workspace.archive(path, opts?)    // ArchiveOptions; status-checked teardown by default
+                                        //   { force }        — skip the dirty/ahead check
+                                        //   { source }       — override/supply the source repo
+                                        //   { deleteBranch }  — also drop the branch ref (git only;
+                                        //                        safe `-d` unless force → `-D`)
 await workspace.detectKind(path)        // → "bare" | "git"
 await workspace.detectDefaultBranch(path, remote = "origin")
                                         // → string (resolves remote/HEAD → main → master → init.defaultBranch)

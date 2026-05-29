@@ -50,6 +50,22 @@ export async function branchExists(cwd: string, branch: string): Promise<boolean
   }
 }
 
+export async function branchDelete(
+  cwd: string,
+  branch: string,
+  opts: { force?: boolean } = {},
+): Promise<void> {
+  // `-d` (lowercase) is the safe delete: git refuses with "not fully merged"
+  // if the branch has commits that aren't reachable from its upstream or the
+  // current HEAD — which is what protects against silently dropping unpushed,
+  // unmerged work. `-D` skips that check and deletes unconditionally; callers
+  // opt into it via `force: true` (they've explicitly accepted destruction).
+  // Default (`force` undefined) is `-D` for the standalone primitive; the
+  // archive flow always passes an explicit `force`.
+  const flag = opts.force === false ? "-d" : "-D";
+  await execFileSafe("git", ["branch", flag, branch], { cwd });
+}
+
 export async function refExists(cwd: string, ref: string): Promise<boolean> {
   try {
     await execFileSafe("git", ["show-ref", "--verify", "--quiet", ref], { cwd });

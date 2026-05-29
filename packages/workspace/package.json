@@ -1,7 +1,16 @@
 {
   "name": "@agentex/workspace",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Isolation and lifecycle primitives for agent workspaces (bare directories and git worktrees)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dynamismlabs/agentex.git",
+    "directory": "packages/workspace"
+  },
+  "homepage": "https://github.com/dynamismlabs/agentex/tree/main/packages/workspace#readme",
+  "bugs": {
+    "url": "https://github.com/dynamismlabs/agentex/issues"
+  },
   "type": "module",
   "exports": {
     ".": {

@@ -2,6 +2,15 @@
   "name": "@agentex/gateway",
   "version": "0.0.1",
   "description": "Multi-channel AI agent communication gateway",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dynamismlabs/agentex.git",
+    "directory": "packages/gateway"
+  },
+  "homepage": "https://github.com/dynamismlabs/agentex/tree/main/packages/gateway#readme",
+  "bugs": {
+    "url": "https://github.com/dynamismlabs/agentex/issues"
+  },
   "type": "module",
   "exports": {
     ".": {

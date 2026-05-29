@@ -8,6 +8,7 @@ import {
   WorkspaceNotFoundError,
 } from "./errors.js";
 import {
+  branchDelete,
   branchExists,
   checkout,
   getCurrentBranch,
@@ -320,6 +321,18 @@ async function archiveGit(wsPath: string, opts: ArchiveOptions): Promise<void> {
     }
   }
 
+  // Capture the branch name BEFORE worktreeRemove — once the worktree dir is
+  // gone, `getCurrentBranch(wsPath)` can't read HEAD. Best-effort: detached
+  // HEAD or any other read failure just skips the branch cleanup below.
+  let branchToDelete: string | null = null;
+  if (opts.deleteBranch === true) {
+    try {
+      branchToDelete = await getCurrentBranch(wsPath);
+    } catch {
+      branchToDelete = null;
+    }
+  }
+
   const config = await loadWorkspaceConfig({ source, workspacePath: wsPath });
 
   await runArchiveScriptIfPresent({
@@ -330,6 +343,16 @@ async function archiveGit(wsPath: string, opts: ArchiveOptions): Promise<void> {
 
   await worktreeRemove({ cwd: source, path: wsPath, force: opts.force === true });
   await worktreePrune(source);
+
+  // `git worktree remove` leaves the branch ref behind. If the consumer asked
+  // for full cleanup, drop it now — but only if it still exists (it may have
+  // been deleted out-of-band, e.g. by the archive script or a prior partial
+  // run). The deletion respects `force`: without it, `git branch -d` refuses
+  // to delete a branch with unmerged/unpushed commits and that error
+  // propagates, rather than silently discarding work.
+  if (branchToDelete !== null && (await branchExists(source, branchToDelete))) {
+    await branchDelete(source, branchToDelete, { force: opts.force === true });
+  }
 }
 
 /* -------------------------------------------------------------------------- */

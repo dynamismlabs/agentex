@@ -2,6 +2,15 @@
   "name": "@agentex/github",
   "version": "0.0.2",
   "description": "Thin typed wrapper over the gh CLI for PR / issue / status operations",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dynamismlabs/agentex.git",
+    "directory": "packages/github"
+  },
+  "homepage": "https://github.com/dynamismlabs/agentex/tree/main/packages/github#readme",
+  "bugs": {
+    "url": "https://github.com/dynamismlabs/agentex/issues"
+  },
   "type": "module",
   "exports": {
     ".": {

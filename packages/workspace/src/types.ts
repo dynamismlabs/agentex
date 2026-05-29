@@ -449,4 +449,31 @@ export interface ArchiveOptions {
    *    library should `git worktree prune` against to clean stale tracking.
    */
   source?: string;
+  /**
+   * For git workspaces only. When `true`, after the worktree is removed and
+   * pruned the library also deletes the branch ref in the source repo. Default
+   * `false` preserves the historical behavior (vanilla `git worktree remove`
+   * leaves the branch behind).
+   *
+   * Safety: the deletion respects `force`. Without `force` it uses the safe
+   * `git branch -d`, which **fails** if the branch has commits not reachable
+   * from its upstream or the source's HEAD — so unpushed, unmerged work is
+   * never silently dropped. With `force: true` the branch is deleted
+   * unconditionally via `git branch -D`.
+   *
+   * Note: the safe-delete check can only run *after* the worktree is removed,
+   * because git refuses to delete a branch checked out in a live worktree. So
+   * if it fails, the worktree is already gone but the branch ref (and its
+   * commits) survives. The path is now missing on disk, which means a re-run
+   * of `archive` takes the prune-only no-op branch and will *not* retry the
+   * deletion — the surviving branch must be removed directly (e.g.
+   * `git branch -D <branch>` in the source) once you've confirmed the work is
+   * safe to drop. Pass `force: true` on the first call to avoid this entirely.
+   *
+   * If the branch ref is already gone (deleted out-of-band), this is a no-op.
+   * Has no effect on bare workspaces, and is a silent no-op when the workspace
+   * path is missing on disk (the branch name can't be read from a gone
+   * worktree).
+   */
+  deleteBranch?: boolean;
 }
