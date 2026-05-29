@@ -396,8 +396,36 @@ export interface CreateGitOptions extends CommonCreateOptions {
   baseBranch: string;
   /** Absolute path where the worktree will be created. Must not exist (or must be empty) per `git worktree add`. */
   path: string;
-  /** New branch name to create on the worktree. Throws `BranchExistsError` if it already exists. */
+  /**
+   * Branch name for the worktree. By default a new branch is created from
+   * `baseBranch`; if a branch by that name already exists in `source`, throws
+   * `BranchExistsError`. Set `reuseBranch: true` to check out an existing
+   * branch instead — see that option's docs for the resume / re-attach flow.
+   */
   branch: string;
+  /**
+   * When `true`, if `branch` already exists in `source`, check it out into
+   * the new worktree instead of throwing `BranchExistsError`. Used for the
+   * "resume an archived workspace" flow: `archive` removes the worktree but
+   * (by default) preserves the branch ref, and on reopen the consumer wants
+   * to land the new worktree on that same branch — same code state, same
+   * cwd, so downstream tools that key off cwd (transcript dirs, IDE state,
+   * file watchers) stay coherent.
+   *
+   * When `branch` doesn't exist, this is a no-op and the library falls
+   * through to the normal `-b <branch> <baseBranch>` create path — the
+   * consumer gets a fresh branch with no surprise. So `reuseBranch: true`
+   * means "reuse if you can, otherwise create."
+   *
+   * `baseSha` recorded in the worktree metadata for the reuse path is the
+   * current tip of `baseBranch`, not the original divergence point — the
+   * library can't recover the latter once the worktree was archived. If the
+   * consumer needs the original (e.g. for an accurate "diff since base"),
+   * they can pass `baseSha` on subsequent `open()` calls.
+   *
+   * Defaults to `false` (legacy behavior: throws on existing branch).
+   */
+  reuseBranch?: boolean;
   /**
    * Optional cone-mode sparse-checkout patterns (directory paths) to limit
    * which subset of the source is materialized in the worktree. Each entry is

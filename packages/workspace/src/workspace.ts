@@ -17,6 +17,7 @@ import {
   sparseCheckoutInit,
   sparseCheckoutSet,
   worktreeAdd,
+  worktreeAddExisting,
   worktreePrune,
   worktreeRemove,
 } from "./git/commands.js";
@@ -119,28 +120,48 @@ async function createGit(opts: CreateGitOptions): Promise<GitWorkspace> {
     throw new NotAGitRepoError(source);
   }
 
-  // Atomic baseSha capture — done *before* worktree-add so the recorded SHA
-  // is exactly the one git will branch from in the next call.
-  const baseSha = await revParse(source, opts.baseBranch);
+  // Decide create-new vs reuse-existing based on `reuseBranch` opt-in
+  // crossed with whether the branch is actually there. `reuseBranch: true`
+  // is "reuse if you can, otherwise create" — a no-op when the branch
+  // doesn't exist, so consumers can pass it unconditionally on resume
+  // flows without special-casing first-time setup.
+  const branchAlreadyExists = await branchExists(source, opts.branch);
+  const reuse = branchAlreadyExists && opts.reuseBranch === true;
 
-  // Preflight branch existence so we throw the typed error before we let git
-  // mutate anything. Belt-and-suspenders: also map the post-add stderr in
-  // case of a race.
-  if (await branchExists(source, opts.branch)) {
+  if (branchAlreadyExists && !reuse) {
     throw new BranchExistsError(opts.branch);
   }
 
+  // Atomic baseSha capture — done *before* worktree-add so the recorded SHA
+  // is exactly the one git will branch from (create path) or what we record
+  // as the consumer's notion of "base" (reuse path). On reuse, the existing
+  // branch's actual divergence point isn't recoverable from the source repo
+  // alone, so we record the current tip of `baseBranch` and let the consumer
+  // override via `open({ baseSha })` if they have the original.
+  const baseSha = await revParse(source, opts.baseBranch);
+
   try {
-    await worktreeAdd({
-      cwd: source,
-      path: opts.path,
-      branch: opts.branch,
-      base: opts.baseBranch,
-      noCheckout: opts.sparseInclude !== undefined,
-    });
+    if (reuse) {
+      await worktreeAddExisting({
+        cwd: source,
+        path: opts.path,
+        branch: opts.branch,
+        noCheckout: opts.sparseInclude !== undefined,
+      });
+    } else {
+      await worktreeAdd({
+        cwd: source,
+        path: opts.path,
+        branch: opts.branch,
+        base: opts.baseBranch,
+        noCheckout: opts.sparseInclude !== undefined,
+      });
+    }
   } catch (err) {
     const stderr = readStderrFromUnknown(err);
-    if (looksLikeBranchExists(stderr, opts.branch)) {
+    if (!reuse && looksLikeBranchExists(stderr, opts.branch)) {
+      // Race: branch was created between our preflight check and `worktree add`.
+      // Surface the typed error for callers that didn't opt into reuse.
       throw new BranchExistsError(opts.branch);
     }
     throw err;

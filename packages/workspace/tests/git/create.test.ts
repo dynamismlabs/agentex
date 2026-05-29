@@ -107,6 +107,126 @@ describe("workspace.create (git)", () => {
     expect(await pathExists(wsPath)).toBe(false);
   });
 
+  it("with reuseBranch: true and an existing branch, checks out the existing branch at its current tip", async () => {
+    const root = await tmp("git-create-reuse-existing");
+    const sourcePath = path.join(root, "source");
+    const wsPath = path.join(root, "ws");
+    await setupSimpleRepo(sourcePath);
+
+    // Build up the branch with content the consumer expects to find again
+    // on reuse. Two commits past `main` so we can tell the worktree landed
+    // on the branch tip rather than on `main`.
+    const { git } = await import("../git-helpers.js");
+    await git(sourcePath, "branch", "feature/resume", "main");
+    await git(sourcePath, "checkout", "feature/resume");
+    await commitFile(sourcePath, "branch-only.md", "branch state\n", "add branch-only file");
+    await commitFile(sourcePath, "branch-only-2.md", "more\n", "second branch commit");
+    const branchTip = await headSha(sourcePath, "feature/resume");
+    await git(sourcePath, "checkout", "main");
+
+    const ws = await workspace.create({
+      kind: "git",
+      source: sourcePath,
+      baseBranch: "main",
+      path: wsPath,
+      branch: "feature/resume",
+      reuseBranch: true,
+    });
+
+    expect(ws.kind).toBe("git");
+    expect(ws.path).toBe(wsPath);
+    expect(ws.git.branch).toBe("feature/resume");
+    // Branch tip = worktree HEAD. `main` does NOT contain these files.
+    expect(await pathExists(path.join(wsPath, "branch-only.md"))).toBe(true);
+    expect(await pathExists(path.join(wsPath, "branch-only-2.md"))).toBe(true);
+    // Worktree's HEAD is the branch tip, not main.
+    const worktreeHead = await headSha(wsPath, "HEAD");
+    expect(worktreeHead).toBe(branchTip);
+  });
+
+  it("with reuseBranch: true and NO existing branch, falls through to create-new — the opt-in is a no-op", async () => {
+    const root = await tmp("git-create-reuse-noexist");
+    const sourcePath = path.join(root, "source");
+    const wsPath = path.join(root, "ws");
+    await setupSimpleRepo(sourcePath);
+    const baseSha = await headSha(sourcePath, "main");
+
+    const ws = await workspace.create({
+      kind: "git",
+      source: sourcePath,
+      baseBranch: "main",
+      path: wsPath,
+      branch: "feature/fresh",
+      reuseBranch: true,
+    });
+
+    expect(ws.git.branch).toBe("feature/fresh");
+    expect(ws.git.baseSha).toBe(baseSha);
+    // Branch was created off main → main's content is present.
+    expect(await pathExists(path.join(wsPath, "README.md"))).toBe(true);
+  });
+
+  it("with reuseBranch: false / omitted and an existing branch, still throws BranchExistsError (preserves legacy behavior)", async () => {
+    const root = await tmp("git-create-reuse-omitted");
+    const sourcePath = path.join(root, "source");
+    const wsPath = path.join(root, "ws");
+    await setupSimpleRepo(sourcePath);
+
+    const { git } = await import("../git-helpers.js");
+    await git(sourcePath, "branch", "feature/already", "main");
+
+    await expect(
+      workspace.create({
+        kind: "git",
+        source: sourcePath,
+        baseBranch: "main",
+        path: wsPath,
+        branch: "feature/already",
+        // reuseBranch omitted — defaults to legacy throw behavior.
+      }),
+    ).rejects.toBeInstanceOf(BranchExistsError);
+
+    await expect(
+      workspace.create({
+        kind: "git",
+        source: sourcePath,
+        baseBranch: "main",
+        path: path.join(root, "ws2"),
+        branch: "feature/already",
+        reuseBranch: false, // explicit false also throws.
+      }),
+    ).rejects.toBeInstanceOf(BranchExistsError);
+  });
+
+  it("with reuseBranch: true on a branch already checked out in another worktree, propagates the raw git error", async () => {
+    const root = await tmp("git-create-reuse-checked-out");
+    const sourcePath = path.join(root, "source");
+    const wsA = path.join(root, "wsA");
+    const wsB = path.join(root, "wsB");
+    await setupSimpleRepo(sourcePath);
+
+    // First worktree owns `feature/locked` — second create attempt should
+    // fail because git won't let two worktrees check out the same branch.
+    await workspace.create({
+      kind: "git",
+      source: sourcePath,
+      baseBranch: "main",
+      path: wsA,
+      branch: "feature/locked",
+    });
+
+    await expect(
+      workspace.create({
+        kind: "git",
+        source: sourcePath,
+        baseBranch: "main",
+        path: wsB,
+        branch: "feature/locked",
+        reuseBranch: true,
+      }),
+    ).rejects.toThrow(); // raw git error — string-match isn't worth coupling to
+  });
+
   it("throws NotAGitRepoError when the source is not a git repo", async () => {
     const root = await tmp("git-create-not-git");
     const sourcePath = path.join(root, "not-a-repo");

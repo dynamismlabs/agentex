@@ -109,6 +109,24 @@ export async function worktreeAdd(args: {
   return execFileSafe("git", argv, { cwd: args.cwd });
 }
 
+/**
+ * `git worktree add <path> <existing-branch>` — checkout-only variant of
+ * `worktreeAdd`. No `-b`, no base ref; the worktree's HEAD is set to the
+ * existing branch's current tip. Fails if the branch is checked out in
+ * another live worktree (git's "is already checked out at <path>" guard).
+ */
+export async function worktreeAddExisting(args: {
+  cwd: string;
+  path: string;
+  branch: string;
+  noCheckout?: boolean;
+}): Promise<ExecResult> {
+  const argv = ["worktree", "add"];
+  if (args.noCheckout) argv.push("--no-checkout");
+  argv.push(args.path, args.branch);
+  return execFileSafe("git", argv, { cwd: args.cwd });
+}
+
 export async function worktreeRemove(args: {
   cwd: string;
   path: string;
