@@ -32,6 +32,14 @@ export async function revParseGitPath(cwd: string, relative: string): Promise<st
   return stdout.trim();
 }
 
+export async function mergeBase(cwd: string, refA: string, refB: string): Promise<string> {
+  // The best common ancestor of two refs — i.e. where a branch diverged from
+  // its base. Exits non-zero (and throws here) when the refs share no common
+  // history; the caller decides on a fallback.
+  const { stdout } = await execFileSafe("git", ["merge-base", refA, refB], { cwd });
+  return stdout.trim();
+}
+
 export async function getCurrentBranch(cwd: string): Promise<string> {
   const { stdout } = await execFileSafe("git", ["symbolic-ref", "--short", "HEAD"], { cwd });
   return stdout.trim();
@@ -109,18 +117,15 @@ export async function worktreeAdd(args: {
   return execFileSafe("git", argv, { cwd: args.cwd });
 }
 
-/**
- * `git worktree add <path> <existing-branch>` — checkout-only variant of
- * `worktreeAdd`. No `-b`, no base ref; the worktree's HEAD is set to the
- * existing branch's current tip. Fails if the branch is checked out in
- * another live worktree (git's "is already checked out at <path>" guard).
- */
 export async function worktreeAddExisting(args: {
   cwd: string;
   path: string;
   branch: string;
   noCheckout?: boolean;
 }): Promise<ExecResult> {
+  // `git worktree add <path> <branch>` — no `-b`, no base. Checks out an
+  // already-existing branch into a new worktree (its HEAD lands at the
+  // branch tip), as opposed to `worktreeAdd` which creates a new branch.
   const argv = ["worktree", "add"];
   if (args.noCheckout) argv.push("--no-checkout");
   argv.push(args.path, args.branch);

@@ -12,6 +12,7 @@ import {
   branchExists,
   checkout,
   getCurrentBranch,
+  mergeBase,
   revParse,
   revParseGitDir,
   sparseCheckoutInit,
@@ -120,28 +121,35 @@ async function createGit(opts: CreateGitOptions): Promise<GitWorkspace> {
     throw new NotAGitRepoError(source);
   }
 
-  // Decide create-new vs reuse-existing based on `reuseBranch` opt-in
-  // crossed with whether the branch is actually there. `reuseBranch: true`
-  // is "reuse if you can, otherwise create" — a no-op when the branch
-  // doesn't exist, so consumers can pass it unconditionally on resume
-  // flows without special-casing first-time setup.
+  // Preflight branch existence so we throw the typed error before we let git
+  // mutate anything. Belt-and-suspenders: also map the post-add stderr in
+  // case of a race.
   const branchAlreadyExists = await branchExists(source, opts.branch);
   const reuse = branchAlreadyExists && opts.reuseBranch === true;
-
   if (branchAlreadyExists && !reuse) {
     throw new BranchExistsError(opts.branch);
   }
 
-  // Atomic baseSha capture — done *before* worktree-add so the recorded SHA
-  // is exactly the one git will branch from (create path) or what we record
-  // as the consumer's notion of "base" (reuse path). On reuse, the existing
-  // branch's actual divergence point isn't recoverable from the source repo
-  // alone, so we record the current tip of `baseBranch` and let the consumer
-  // override via `open({ baseSha })` if they have the original.
-  const baseSha = await revParse(source, opts.baseBranch);
+  // baseSha means "where this branch diverged from base" — the ref diff("base")
+  // and shortstat("base") run against. For a *new* branch that's the base tip
+  // (captured atomically before the add, so it matches what git branches from).
+  // For a *reused* branch we recover the actual divergence point via merge-base
+  // so the diff reports only the branch's own changes, not how far base has
+  // advanced since. Fall back to the base tip if the two share no history.
+  let baseSha: string;
+  if (reuse) {
+    try {
+      baseSha = await mergeBase(source, opts.branch, opts.baseBranch);
+    } catch {
+      baseSha = await revParse(source, opts.baseBranch);
+    }
+  } else {
+    baseSha = await revParse(source, opts.baseBranch);
+  }
 
   try {
     if (reuse) {
+      // Adopt the existing branch into the worktree — HEAD lands at its tip.
       await worktreeAddExisting({
         cwd: source,
         path: opts.path,
@@ -159,9 +167,11 @@ async function createGit(opts: CreateGitOptions): Promise<GitWorkspace> {
     }
   } catch (err) {
     const stderr = readStderrFromUnknown(err);
+    // Race: the branch appeared between our preflight and the add. We don't
+    // adopt races — surfacing BranchExistsError here is intentional even when
+    // reuseBranch was opted in (reuse only kicks in when the branch was already
+    // present at preflight time).
     if (!reuse && looksLikeBranchExists(stderr, opts.branch)) {
-      // Race: branch was created between our preflight check and `worktree add`.
-      // Surface the typed error for callers that didn't opt into reuse.
       throw new BranchExistsError(opts.branch);
     }
     throw err;

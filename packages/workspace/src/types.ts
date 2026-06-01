@@ -396,34 +396,29 @@ export interface CreateGitOptions extends CommonCreateOptions {
   baseBranch: string;
   /** Absolute path where the worktree will be created. Must not exist (or must be empty) per `git worktree add`. */
   path: string;
-  /**
-   * Branch name for the worktree. By default a new branch is created from
-   * `baseBranch`; if a branch by that name already exists in `source`, throws
-   * `BranchExistsError`. Set `reuseBranch: true` to check out an existing
-   * branch instead — see that option's docs for the resume / re-attach flow.
-   */
+  /** New branch name to create on the worktree. Throws `BranchExistsError` if it already exists (unless `reuseBranch`). */
   branch: string;
   /**
-   * When `true`, if `branch` already exists in `source`, check it out into
-   * the new worktree instead of throwing `BranchExistsError`. Used for the
-   * "resume an archived workspace" flow: `archive` removes the worktree but
-   * (by default) preserves the branch ref, and on reopen the consumer wants
-   * to land the new worktree on that same branch — same code state, same
-   * cwd, so downstream tools that key off cwd (transcript dirs, IDE state,
-   * file watchers) stay coherent.
+   * "Reuse if it exists, otherwise create." Default `false`.
    *
-   * When `branch` doesn't exist, this is a no-op and the library falls
-   * through to the normal `-b <branch> <baseBranch>` create path — the
-   * consumer gets a fresh branch with no surprise. So `reuseBranch: true`
-   * means "reuse if you can, otherwise create."
+   * When `false` (or omitted), an already-existing `branch` in the source is a
+   * hard error (`BranchExistsError`) — the historical behavior.
    *
-   * `baseSha` recorded in the worktree metadata for the reuse path is the
-   * current tip of `baseBranch`, not the original divergence point — the
-   * library can't recover the latter once the worktree was archived. If the
-   * consumer needs the original (e.g. for an accurate "diff since base"),
-   * they can pass `baseSha` on subsequent `open()` calls.
+   * When `true`:
+   *  - If `branch` already exists in the source, it is **checked out** into the
+   *    new worktree (`git worktree add <path> <branch>`) instead of throwing.
+   *    The worktree's HEAD lands at the branch tip, with all of its existing
+   *    commits — this is the resume case. `baseSha` is recorded as the
+   *    merge-base of `branch` and `baseBranch` (the real divergence point), so
+   *    `git.diff("base")` reports exactly the branch's own changes rather than
+   *    also surfacing how far `baseBranch` has advanced since.
+   *  - If `branch` does not exist, this is a no-op and creation falls through
+   *    to the normal `-b <branch> <baseBranch>` path. So consumers can pass
+   *    `reuseBranch: true` unconditionally on resume flows without
+   *    special-casing first-time setup.
    *
-   * Defaults to `false` (legacy behavior: throws on existing branch).
+   * Note: if `branch` is already checked out in *another* live worktree, git
+   * refuses and the raw error propagates (no typed error for this case).
    */
   reuseBranch?: boolean;
   /**
