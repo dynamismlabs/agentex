@@ -5,6 +5,7 @@ import type {
   AgentSession,
   CancelResult,
   SendHandle,
+  SendOptions,
   SessionContext,
   SessionState,
   StreamEvent,
@@ -14,9 +15,21 @@ import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { injectWorkspaceSkills } from "../../utils/skills.js";
 import { resolveInstructions } from "../../utils/instructions.js";
+import { createToolNameTracker } from "../../utils/tool-names.js";
 import { parseCodexStreamLine } from "./parse.js";
 import { withPlanModePreamble } from "./plan-mode.js";
 import { scanCodexSessionUsage } from "./usage-scanner.js";
+
+/** A pending `send()` whose `result` Promise hasn't settled yet. */
+interface PendingResult {
+  resolve: (result: TurnResult) => void;
+  reject: (err: Error) => void;
+  /** Set once the entry has been settled (by result, timeout, abort, or
+   *  reject) so the other paths skip it — prevents double-handling. */
+  settled?: boolean;
+  /** Tear down this send's timeout timer / abort listener. */
+  cleanup?: () => void;
+}
 
 // ---------------------------------------------------------------------------
 // JSON-RPC 2.0 helpers
@@ -192,10 +205,19 @@ export class CodexSessionImpl implements AgentSession {
   // into one turn) or get distinct results across turns. On each
   // turn.completed / turn.failed we drain the entire list — every pending
   // Promise resolves with the same TurnResult.
-  private _pendingResults: Array<{
-    resolve: (result: TurnResult) => void;
-    reject: (err: Error) => void;
-  }> = [];
+  private _pendingResults: PendingResult[] = [];
+
+  /** Result Promises for sends that haven't settled, tracked so `drain()` can
+   *  await the in-flight turn(s) before closing. */
+  private _inFlight = new Set<Promise<TurnResult>>();
+
+  /** Set by `drain()`: new `send()` calls are refused while true. */
+  private _draining = false;
+  /** Shared promise so concurrent / repeated `drain()` calls coalesce. */
+  private _drainPromise: Promise<void> | null = null;
+
+  /** Stamps `tool_result.toolName` by correlating with prior `tool_call`s. */
+  private readonly _trackToolName = createToolNameTracker();
 
   // Per-turn accumulators. Cleared after each result delivery so a subsequent
   // turn's events don't inherit stale values.
@@ -250,7 +272,12 @@ export class CodexSessionImpl implements AgentSession {
   /** Reject every pending send() Promise and outgoing JSON-RPC call. */
   private rejectAllPending(err: Error): void {
     const pending = this._pendingResults.splice(0);
-    for (const p of pending) p.reject(err);
+    for (const p of pending) {
+      if (p.settled) continue;
+      p.settled = true;
+      p.cleanup?.();
+      p.reject(err);
+    }
     for (const [, p] of this._pendingRpc) p.reject(err);
     this._pendingRpc.clear();
   }
@@ -303,8 +330,9 @@ export class CodexSessionImpl implements AgentSession {
   // Public API
   // -------------------------------------------------------------------------
 
-  async send(message: string): Promise<SendHandle> {
+  async send(message: string, options?: SendOptions): Promise<SendHandle> {
     if (this._state === "closed") throw new Error("Session is closed");
+    if (this._draining) throw new Error("Session is draining — no new sends accepted");
 
     // No protocol-level guard — Codex's TUI demonstrates queueing of user
     // messages during an active turn, and our wire test (transcript
@@ -330,15 +358,88 @@ export class CodexSessionImpl implements AgentSession {
     };
     if (this._threadId) turnParams["threadId"] = this._threadId;
 
+    let resolveFn!: (r: TurnResult) => void;
+    let rejectFn!: (e: Error) => void;
     const result = new Promise<TurnResult>((resolve, reject) => {
-      this._pendingResults.push({ resolve, reject });
+      resolveFn = resolve;
+      rejectFn = reject;
     });
+
+    const entry: PendingResult = { resolve: resolveFn, reject: rejectFn };
+    this._pendingResults.push(entry);
+
+    // Track the in-flight turn so drain() can await it; drop it on settle.
+    this._inFlight.add(result);
+    void result.catch(() => {}).finally(() => this._inFlight.delete(result));
+
+    // Per-send timeout / abort, falling back to the session-level
+    // ProviderConfig.timeoutSec default when no per-call timeout is given.
+    this.armSendDeadline(entry, options);
 
     this.rpcRequest("turn/start", turnParams).catch(() => {
       // Turn-level errors arrive via turn.failed notifications.
     });
 
     return { uuid, result };
+  }
+
+  /**
+   * Wire up this send's timeout and/or abort signal. On fire, the active turn
+   * is cancelled (`turn/cancel`) and the send settles with `timeout` /
+   * `aborted`. No-op when neither a timeout nor a signal applies.
+   */
+  private armSendDeadline(entry: PendingResult, options?: SendOptions): void {
+    const timeoutSec = options?.timeoutSec ?? this.ctx.config?.timeoutSec;
+    const signal = options?.signal;
+    const hasTimeout = typeof timeoutSec === "number" && timeoutSec > 0;
+    if (!hasTimeout && !signal) return;
+
+    if (signal?.aborted) {
+      queueMicrotask(() => this.settleEarly(entry, "aborted"));
+      return;
+    }
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const onAbort = () => this.settleEarly(entry, "aborted");
+    if (hasTimeout) {
+      timer = setTimeout(() => this.settleEarly(entry, "timeout"), timeoutSec! * 1000);
+    }
+    if (signal) signal.addEventListener("abort", onAbort, { once: true });
+
+    entry.cleanup = () => {
+      if (timer) clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", onAbort);
+    };
+  }
+
+  /**
+   * Settle a still-pending send early (timeout or abort). Cancels the active
+   * turn best-effort and resolves the send's `result` with a synthetic
+   * TurnResult. A no-op if the entry already settled (the real result raced
+   * ahead). The late real turn-completion later finds the entry already gone.
+   */
+  private settleEarly(entry: PendingResult, kind: "timeout" | "aborted"): void {
+    if (entry.settled) return;
+    entry.settled = true;
+    entry.cleanup?.();
+
+    const idx = this._pendingResults.indexOf(entry);
+    if (idx >= 0) this._pendingResults.splice(idx, 1);
+
+    // Best-effort cancel of the active turn. With concurrent sends this ends
+    // the single shared turn for all of them — see SendOptions JSDoc.
+    void this.interrupt();
+
+    entry.resolve({
+      summary: null,
+      usage: undefined,
+      costUsd: null,
+      status: kind,
+      errorCode: kind,
+      errorMessage: kind === "timeout"
+        ? "Turn exceeded its timeout and was interrupted"
+        : "Turn was aborted",
+    });
   }
 
   async cancel(_uuid: string): Promise<CancelResult> {
@@ -355,17 +456,34 @@ export class CodexSessionImpl implements AgentSession {
     } catch { /* best effort */ }
   }
 
+  async drain(): Promise<void> {
+    if (this._state === "closed") return;
+    // Coalesce concurrent / repeated drains onto one promise.
+    if (this._drainPromise) return this._drainPromise;
+    this._draining = true;
+    this._drainPromise = (async () => {
+      // Let every in-flight turn settle (resolve or reject) before closing, so
+      // a running tool finishes rather than being killed mid-flight.
+      await Promise.allSettled([...this._inFlight]);
+      await this.close();
+    })();
+    return this._drainPromise;
+  }
+
   async close(): Promise<void> {
     if (this._state === "closed") return;
     this._state = "closed";
 
     this.proc.stdin!.end();
 
+    // Grace window before SIGKILL is configurable via ProviderConfig.graceSec
+    // for sessions running long tools.
+    const graceSec = this.ctx.config?.graceSec ?? 5;
     await new Promise<void>((resolve) => {
       const timeout = setTimeout(() => {
         this.proc.kill("SIGKILL");
         resolve();
-      }, 5000);
+      }, graceSec * 1000);
 
       this.proc.on("exit", () => {
         clearTimeout(timeout);
@@ -714,7 +832,13 @@ export class CodexSessionImpl implements AgentSession {
     this._turnErrorMessage = null;
     this._turnStartedAt = null;
 
-    for (const p of pending) p.resolve(result);
+    for (const p of pending) {
+      // Skip sends already settled early by timeout / abort.
+      if (p.settled) continue;
+      p.settled = true;
+      p.cleanup?.();
+      p.resolve(result);
+    }
   }
 
   private emitStreamEvent(rawLine: string): void {
@@ -735,8 +859,11 @@ export class CodexSessionImpl implements AgentSession {
   private dispatchEvent(event: StreamEvent): void {
     const cb = this.ctx.onEvent;
     if (!cb) return;
+    // Enrich synchronously (in stream order) so tool_result events carry the
+    // name of the tool_call they answer.
+    const enriched = this._trackToolName(event);
     this._eventChain = this._eventChain.then(async () => {
-      try { await cb(event); } catch { /* swallow */ }
+      try { await cb(enriched); } catch { /* swallow */ }
     });
   }
 }

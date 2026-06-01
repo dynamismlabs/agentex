@@ -242,6 +242,7 @@ export function parseCursorStreamLine(line: string): StreamEvent | null {
         return {
           type: "tool_result",
           toolCallId: asString(part["tool_use_id"], "") || null,
+          toolName: null,
           content: asString(part["content"], ""),
           isError: part["is_error"] === true,
           exitCode: null,

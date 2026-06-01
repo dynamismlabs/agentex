@@ -189,7 +189,22 @@ export interface ProviderConfig {
   model?: string;
   effort?: string;
   maxTurns?: number;
+  /**
+   * Hard runtime cap, in seconds.
+   * - `exec()`: kills the child process (SIGTERM → grace → SIGKILL) and reports
+   *   `status: "timeout"`.
+   * - Sessions (`createSession`): acts as the per-session default timeout for
+   *   `send()`. A per-call `SendOptions.timeoutSec` overrides it. On fire, the
+   *   active turn is `interrupt()`ed and that send's `TurnResult` resolves with
+   *   `status: "timeout"`. Unset means no timeout.
+   */
   timeoutSec?: number;
+  /**
+   * Grace period, in seconds, between SIGTERM and SIGKILL when terminating the
+   * underlying process. Applies to both `exec()` and session `close()`/`drain()`.
+   * Defaults to 5. Bump it for workloads that legitimately need longer to clean
+   * up (long Bash, test suites) so they aren't hard-killed mid-flight.
+   */
   graceSec?: number;
   skipPermissions?: boolean;
   skillDirs?: string[];
@@ -504,6 +519,15 @@ export type StreamEvent =
       type: "tool_result";
       /** FK back to the tool_call.toolCallId this responds to. */
       toolCallId: string | null;
+      /**
+       * Name of the tool whose result this is — mirrors the matching
+       * `tool_call.name`. Saves consumers from maintaining their own
+       * `toolCallId → name` cache to attribute a result to a named action.
+       * Null when the name couldn't be correlated (no preceding `tool_call`
+       * was observed on this stream — e.g. onEvent attached mid-turn, or a
+       * provider that emits a result with no paired call).
+       */
+      toolName: string | null;
       content: string;
       isError: boolean;
       /** Exit code for command-execution tools (Codex); null otherwise. */
@@ -818,6 +842,27 @@ export interface CancelResult {
   cancelled: boolean;
 }
 
+/** Per-call options for `AgentSession.send()`. */
+export interface SendOptions {
+  /**
+   * Hard cap on this turn's runtime, in seconds. On fire, the SDK
+   * `interrupt()`s the active turn and resolves this send's `result` with
+   * `status: "timeout"`. Overrides `ProviderConfig.timeoutSec` for this call.
+   *
+   * Note: a session runs a single underlying agent, so interrupting one
+   * timed-out send also ends any other sends coalesced into the same turn —
+   * the natural shape for the one-send-per-turn (scheduled-run) use case.
+   */
+  timeoutSec?: number;
+  /**
+   * Abort just this turn (not the whole session). On abort, the active turn is
+   * `interrupt()`ed and this send's `result` resolves with `status: "aborted"`.
+   * Distinct from `SessionContext.signal`, which closes the entire session.
+   * Stacks with `timeoutSec`; whichever fires first wins.
+   */
+  signal?: AbortSignal;
+}
+
 /** A persistent session handle for multi-turn conversations. */
 export interface AgentSession {
   readonly sessionId: string | null;
@@ -843,8 +888,11 @@ export interface AgentSession {
    *
    * Multiple concurrent sends may resolve with the same shared `TurnResult`
    * if the CLI coalesces them. See `SendHandle` JSDoc.
+   *
+   * Pass `SendOptions` to bound this turn with a timeout and/or abort signal.
+   * Throws if the session is closed or `drain()`ing.
    */
-  send(message: string): Promise<SendHandle>;
+  send(message: string, options?: SendOptions): Promise<SendHandle>;
 
   /**
    * Cancel a previously-sent message that is still queued in the CLI.
@@ -858,6 +906,15 @@ export interface AgentSession {
   /** Gracefully interrupt the current turn. */
   interrupt(): Promise<void>;
 
+  /**
+   * Graceful stop: refuse new `send()` calls (they throw), await any in-flight
+   * turn's `result` to settle, then `close()`. Use this — not `interrupt()`
+   * (loses in-flight work) or `close()` (kills mid-tool) — when you want a
+   * running turn to finish before shutting down (budget gate, SIGTERM, schedule
+   * pause). Resolves once fully closed. Idempotent.
+   */
+  drain(): Promise<void>;
+
   /** Terminate the session and kill the underlying process. */
   close(): Promise<void>;
 }
@@ -867,7 +924,13 @@ export interface TurnResult {
   summary: string | null;
   usage?: Record<string, TokenUsage>;
   costUsd: number | null;
-  status: "completed" | "failed" | "max_turns" | "max_budget" | "aborted";
+  /**
+   * `timeout` — the per-send timeout (`SendOptions.timeoutSec` or the session
+   * default `ProviderConfig.timeoutSec`) fired and the turn was interrupted.
+   * `aborted` — a `SendOptions.signal` aborted the turn (or the turn was
+   * otherwise interrupted).
+   */
+  status: "completed" | "failed" | "max_turns" | "max_budget" | "aborted" | "timeout";
   errorCode: string | null;
   errorMessage: string | null;
 }

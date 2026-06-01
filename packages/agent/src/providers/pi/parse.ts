@@ -198,6 +198,7 @@ export function parsePiStreamLine(line: string): StreamEvent | null {
     return {
       type: "tool_result",
       toolCallId: asString(event["toolCallId"], "") || null,
+      toolName: asString(event["toolName"], "") || null,
       content: typeof result === "string" ? result : JSON.stringify(result),
       isError: event["isError"] === true,
       exitCode: null,

@@ -237,6 +237,7 @@ export function parseGeminiStreamLine(line: string): StreamEvent[] {
         events.push({
           type: "tool_result",
           toolCallId: asString(block["tool_use_id"], "") || null,
+          toolName: null,
           content: asString(block["content"], ""),
           isError: block["is_error"] === true,
           exitCode: null,

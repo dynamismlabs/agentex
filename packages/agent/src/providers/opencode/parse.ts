@@ -142,6 +142,7 @@ export function parseOpenCodeStreamLine(line: string): StreamEvent | null {
       return {
         type: "tool_result",
         toolCallId: asString(part["id"], "") || asString(part["tool_use_id"], "") || null,
+        toolName: name || null,
         content: status === "error" ? asString(state["error"], "") : asString(state["result"], ""),
         isError: status === "error",
         exitCode: null,

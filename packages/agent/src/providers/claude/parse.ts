@@ -355,6 +355,10 @@ export function parseStreamLine(line: string): StreamEvent[] {
         out.push({
           type: "tool_result",
           toolCallId: asNullableString(block["tool_use_id"]),
+          // Claude's wire `tool_result` block carries only `tool_use_id`, not
+          // the tool name. The session/exec tool-name tracker fills this by
+          // correlating with the earlier `tool_call`.
+          toolName: null,
           content: asString(block["content"], ""),
           isError: block["is_error"] === true,
           exitCode: null,
@@ -379,6 +383,10 @@ export function parseStreamLine(line: string): StreamEvent[] {
         out.push({
           type: "tool_result",
           toolCallId: asNullableString(block["tool_use_id"]),
+          // Claude's wire `tool_result` block carries only `tool_use_id`, not
+          // the tool name. The session/exec tool-name tracker fills this by
+          // correlating with the earlier `tool_call`.
+          toolName: null,
           content: asString(block["content"], ""),
           isError: block["is_error"] === true,
           exitCode: null,

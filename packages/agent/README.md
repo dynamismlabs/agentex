@@ -189,7 +189,7 @@ Variants:
 - `thinking` — Agent's internal reasoning (`text`)
 - `tool_call` — Agent invoked a tool (`toolCallId: string | null`, `name`, `input`)
 - `unknown` — Fallback for unrecognized wire events (`subtype` = the provider's `type` field). Forward-compat access to new CLI events via `raw` without a library update.
-- `tool_result` — Tool returned a result (`toolCallId: string | null`, `content`, `isError`, `exitCode: number | null`)
+- `tool_result` — Tool returned a result (`toolCallId: string | null`, `toolName: string | null`, `content`, `isError`, `exitCode: number | null`). `toolName` mirrors the matching `tool_call.name` (correlated for you), so you don't need your own `toolCallId → name` cache; null when no preceding `tool_call` was seen on the stream.
 - `rate_limit` — Provider reported rate-limit state (`status`, `limitType`, `resetAt`, `overageStatus`, `isUsingOverage`)
 - `permission_mode` — Permission mode change mid-session (`permissionMode: string`). Claude only, e.g., when the user accepts a plan and the session leaves `plan` mode.
 - `result` — Final result (`text`, `costUsd`, `isError`, `stopReason`, `terminalReason`, `numTurns`, `durationMs`)
@@ -207,7 +207,7 @@ Verified live against `claude 2.1.116` and `codex-cli 0.122.0` (2026-04-21). Oth
 | `eventId`              | Top-level per-line `uuid`                          | **null** — Codex doesn't emit a per-event ID     |
 | `turnId`               | **null** — Claude doesn't model turns              | v2 app-server: native UUIDv7 from `params.turnId`. NDJSON: **null** — no turn id in legacy format |
 | `parentToolCallId`     | `parent_tool_use_id` (set for sub-agent messages)  | **null** — not emitted                           |
-| Tool correlation       | `tool_use.id` (`toolu_*`) ↔ `tool_result.tool_use_id` | `item.id` reappears on the same item's `item.completed` |
+| Tool correlation       | `tool_use.id` (`toolu_*`) ↔ `tool_result.tool_use_id`; the library stamps `tool_result.toolName` from the matching call | `item.id` reappears on the same item's `item.completed`; `toolName` set directly from the item type |
 | `tool_result.exitCode` | **null** (Claude doesn't expose shell exit codes)  | `item.exit_code` for `command_execution`         |
 | Assistant message span | One `message.id` may span multiple event lines (thinking + tool_use emitted separately with distinct `uuid`s) | One `item.completed` per agent message |
 
@@ -265,7 +265,26 @@ await followUp.result;
 await session.close();
 ```
 
-`session.send()` returns a `SendHandle` with a synchronously-available `uuid` and a `result: Promise<TurnResult>`. `TurnResult` carries `summary`, `usage`, `costUsd`, and a `status` of `completed | failed | max_turns | max_budget | aborted`. Handle elicitations (MCP forms), hook callbacks, and interrupts through the corresponding `SessionContext` callbacks.
+`session.send()` returns a `SendHandle` with a synchronously-available `uuid` and a `result: Promise<TurnResult>`. `TurnResult` carries `summary`, `usage`, `costUsd`, and a `status` of `completed | failed | max_turns | max_budget | aborted | timeout`. Handle elicitations (MCP forms), hook callbacks, and interrupts through the corresponding `SessionContext` callbacks.
+
+### Bounding a turn (timeout / abort)
+
+`send()` takes an optional `SendOptions` to cap a single turn — the natural shape for scheduled / fire-and-forget runs where a cron firing every minute can't be allowed to run a multi-hour turn:
+
+```typescript
+// Hard cap this turn. On fire, the library interrupts the agent and resolves
+// `result` with status "timeout" — no consumer-side Promise.race needed.
+const { result } = await session.send("Summarize the repo.", { timeoutSec: 90 });
+const turn = await result;
+if (turn.status === "timeout") { /* mark the run timed-out */ }
+
+// Or abort just this turn (not the whole session) via an AbortSignal.
+const ac = new AbortController();
+const handle = await session.send("Long task…", { signal: ac.signal });
+ac.abort();                       // → result resolves with status "aborted"
+```
+
+`SendOptions.timeoutSec` overrides `ProviderConfig.timeoutSec`, which acts as the session-level default when no per-call value is given. The per-send `signal` is distinct from `SessionContext.signal`: the per-send one ends just that turn, the session-level one closes the whole session. Because a session runs a single underlying agent, a timeout/abort interrupts the active turn — so any concurrent sends coalesced into the same turn end with it.
 
 ### Concurrent send ("type while the agent is working")
 
@@ -309,6 +328,18 @@ else console.log("Too late — the agent already drained it.");
 `cancel()` is always callable. For providers with `cancelQueuedMessage = false` (Codex, and any session-less provider), it returns `{ cancelled: false }` immediately. For Claude, it sends a `cancel_async_message` control_request to the CLI, which runs `dequeueAllMatching` against its internal queue and reports whether the message was found.
 
 > **Race note.** Cancellation is best-effort. If the CLI drained the message mid-turn (Claude's `query.ts` between-tool-batches drain) before your `cancel()` request landed, you get `{ cancelled: false }` — and the message will be visible to the model as a `<system-reminder>`. The library does not unmount what the model has already seen.
+
+### Graceful shutdown with `drain()`
+
+`close()` kills the process (SIGTERM → SIGKILL after `graceSec`, default 5) — fine for "stop now," wrong when a tool is mid-flight. `drain()` is the graceful stop: it refuses new `send()` calls (they throw), waits for any in-flight turn's `result` to settle, then closes. Use it for budget gates, `SIGTERM` handlers, and schedule pauses where a running turn should finish rather than be cut off.
+
+```typescript
+process.on("SIGTERM", async () => {
+  await session.drain();   // let the current turn finish, then close
+});
+```
+
+`drain()` is idempotent. Bump `ProviderConfig.graceSec` for sessions running legitimately long tools (test suites, long Bash) so `close()`/`drain()` don't hard-kill them prematurely.
 
 ## Plan Mode
 

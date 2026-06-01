@@ -5,6 +5,7 @@ import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { runChildProcess, deriveErrorCode } from "../../utils/process.js";
 import { detectAuth } from "../../utils/auth.js";
 import { buildSkillsDir, cleanupSkillsDir } from "../../utils/skills.js";
+import { createToolNameTracker } from "../../utils/tool-names.js";
 import { uuidv7 } from "../../utils/uuid.js";
 import { prepareWorkspace } from "../../utils/workspace.js";
 import type { PreparedWorkspace } from "../../utils/workspace.js";
@@ -113,6 +114,9 @@ export async function executeClaudeProvider(ctx: ExecutionContext): Promise<Exec
 
     // stdout line buffer for real-time event parsing
     let lineBuffer = "";
+    // Correlates tool_call → tool_result so emitted tool_result events carry
+    // toolName. One tracker per attempt (a retry restarts the stream).
+    const trackToolName = createToolNameTracker();
 
     ctx.onLifecycle?.({ phase: "spawning" });
     const proc = await runChildProcess({
@@ -145,7 +149,7 @@ export async function executeClaudeProvider(ctx: ExecutionContext): Promise<Exec
             const trimmed = line.trim();
             if (!trimmed) continue;
             for (const event of parseStreamLine(trimmed)) {
-              try { await ctx.onEvent(event); } catch { /* swallow */ }
+              try { await ctx.onEvent(trackToolName(event)); } catch { /* swallow */ }
             }
           }
         }
@@ -155,7 +159,7 @@ export async function executeClaudeProvider(ctx: ExecutionContext): Promise<Exec
     // Parse remaining buffer
     if (lineBuffer.trim() && ctx.onEvent) {
       for (const event of parseStreamLine(lineBuffer.trim())) {
-        try { await ctx.onEvent(event); } catch { /* swallow */ }
+        try { await ctx.onEvent(trackToolName(event)); } catch { /* swallow */ }
       }
     }
 

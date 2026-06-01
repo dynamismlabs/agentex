@@ -251,3 +251,104 @@ describe("CodexSession — cancel", () => {
     expect(await session.cancel("any-uuid")).toEqual({ cancelled: false });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Per-send timeout / abort (SendOptions)
+// ---------------------------------------------------------------------------
+
+function feedCodex(session: CodexSessionImpl, obj: Record<string, unknown>): void {
+  (session as unknown as { handleLine: (l: string) => void }).handleLine(JSON.stringify(obj));
+}
+
+describe("CodexSession — per-send timeout / abort", () => {
+  it("resolves status 'timeout' when the deadline fires", async () => {
+    const { proc } = makeFakeProc();
+    const session = new CodexSessionImpl(proc, {}, "/tmp", "test-model", null);
+
+    const handle = await session.send("slow", { timeoutSec: 0.02 });
+    const tr = await handle.result;
+    expect(tr.status).toBe("timeout");
+    expect(tr.errorCode).toBe("timeout");
+  });
+
+  it("falls back to ProviderConfig.timeoutSec as the session-level default", async () => {
+    const { proc } = makeFakeProc();
+    const session = new CodexSessionImpl(proc, { config: { timeoutSec: 0.02 } }, "/tmp", "test-model", null);
+
+    const handle = await session.send("task");
+    const tr = await handle.result;
+    expect(tr.status).toBe("timeout");
+  });
+
+  it("a real result before the timeout wins", async () => {
+    const { proc } = makeFakeProc();
+    const session = new CodexSessionImpl(proc, {}, "/tmp", "test-model", null);
+
+    const handle = await session.send("task", { timeoutSec: 100 });
+    feedCodex(session, { type: "item.completed", item: { type: "agent_message", text: "done" } });
+    // Usage present → sync delivery (no disk-scan branch).
+    feedCodex(session, { type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } });
+
+    const tr = await handle.result;
+    expect(tr.status).toBe("completed");
+    expect(tr.summary).toBe("done");
+  });
+
+  it("SendOptions.signal abort resolves status 'aborted'", async () => {
+    const { proc } = makeFakeProc();
+    const session = new CodexSessionImpl(proc, {}, "/tmp", "test-model", null);
+
+    const ac = new AbortController();
+    const handle = await session.send("task", { signal: ac.signal });
+    ac.abort();
+
+    const tr = await handle.result;
+    expect(tr.status).toBe("aborted");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// drain()
+// ---------------------------------------------------------------------------
+
+describe("CodexSession — drain", () => {
+  it("refuses new sends while draining, awaits the in-flight turn, then closes", async () => {
+    const { proc } = makeFakeProc();
+    const session = new CodexSessionImpl(proc, { config: { graceSec: 0.02 } }, "/tmp", "test-model", null);
+
+    const handle = await session.send("task");
+    const drainP = session.drain();
+
+    await expect(session.send("nope")).rejects.toThrow(/draining/);
+
+    // Usage present → sync delivery, no disk scan.
+    feedCodex(session, { type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } });
+    const tr = await handle.result;
+    expect(tr.status).toBe("completed");
+
+    await drainP;
+    expect(session.state).toBe("closed");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// tool_result.toolName (Codex sets it directly in the parser)
+// ---------------------------------------------------------------------------
+
+describe("CodexSession — tool_result.toolName", () => {
+  it("emits tool_result.toolName for command_execution items", async () => {
+    const events: StreamEvent[] = [];
+    const { feed, turnResult } = makeDrivenSession({ onEvent: (e) => { events.push(e); } });
+
+    feed(ndjson({ type: "item.started", item: { id: "item_0", type: "command_execution", command: "ls" } }));
+    feed(ndjson({
+      type: "item.completed",
+      item: { id: "item_0", type: "command_execution", aggregated_output: "files", exit_code: 0 },
+    }));
+    feed(ndjson({ type: "turn.completed" }));
+
+    await turnResult;
+    const tr = events.find((e) => e.type === "tool_result");
+    expect(tr?.type === "tool_result" && tr.toolName).toBe("command_execution");
+  });
+});

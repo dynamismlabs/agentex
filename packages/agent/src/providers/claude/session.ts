@@ -5,6 +5,7 @@ import type {
   AgentSession,
   CancelResult,
   SendHandle,
+  SendOptions,
   SessionContext,
   SessionState,
   StreamEvent,
@@ -14,7 +15,19 @@ import type {
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { buildSkillsDir, cleanupSkillsDir } from "../../utils/skills.js";
+import { createToolNameTracker } from "../../utils/tool-names.js";
 import { parseStreamLine, classifyClaudeAuthFromResult, CLAUDE_LOGIN_COMMAND } from "./parse.js";
+
+/** A pending `send()` whose `result` Promise hasn't settled yet. */
+interface PendingResult {
+  resolve: (result: TurnResult) => void;
+  reject: (err: Error) => void;
+  /** Set once the entry has been settled (by result, timeout, abort, or
+   *  reject) so the other paths skip it — prevents double-handling. */
+  settled?: boolean;
+  /** Tear down this send's timeout timer / abort listener. */
+  cleanup?: () => void;
+}
 
 // ---------------------------------------------------------------------------
 // ndjson helpers
@@ -204,10 +217,19 @@ export class ClaudeSessionImpl implements AgentSession {
   // into one turn) or get distinct results across turns. On each `result`
   // event we drain the entire list — every pending Promise resolves with the
   // same TurnResult. Subsequent sends queue against a fresh list.
-  private _pendingResults: Array<{
-    resolve: (result: TurnResult) => void;
-    reject: (err: Error) => void;
-  }> = [];
+  private _pendingResults: PendingResult[] = [];
+
+  /** Result Promises for sends that haven't settled, tracked so `drain()` can
+   *  await the in-flight turn(s) before closing. */
+  private _inFlight = new Set<Promise<TurnResult>>();
+
+  /** Set by `drain()`: new `send()` calls are refused while true. */
+  private _draining = false;
+  /** Shared promise so concurrent / repeated `drain()` calls coalesce. */
+  private _drainPromise: Promise<void> | null = null;
+
+  /** Stamps `tool_result.toolName` by correlating with prior `tool_call`s. */
+  private readonly _trackToolName = createToolNameTracker();
 
   /**
    * Tracks request_ids for async callbacks (permission, elicitation, hooks)
@@ -272,7 +294,12 @@ export class ClaudeSessionImpl implements AgentSession {
   /** Reject every pending send() Promise and outgoing control_response. */
   private rejectAllPending(err: Error): void {
     const pending = this._pendingResults.splice(0);
-    for (const p of pending) p.reject(err);
+    for (const p of pending) {
+      if (p.settled) continue;
+      p.settled = true;
+      p.cleanup?.();
+      p.reject(err);
+    }
     for (const [, p] of this._pendingControlResponses) p.reject(err);
     this._pendingControlResponses.clear();
   }
@@ -284,8 +311,9 @@ export class ClaudeSessionImpl implements AgentSession {
   // Public API
   // -------------------------------------------------------------------------
 
-  async send(message: string): Promise<SendHandle> {
+  async send(message: string, options?: SendOptions): Promise<SendHandle> {
     if (this._state === "closed") throw new Error("Session is closed");
+    if (this._draining) throw new Error("Session is draining — no new sends accepted");
 
     // No guard on _state — Claude's CLI accepts user messages mid-turn and
     // queues them internally (drain via `cancel_async_message` if needed).
@@ -305,13 +333,88 @@ export class ClaudeSessionImpl implements AgentSession {
       uuid,
     });
 
+    let resolveFn!: (r: TurnResult) => void;
+    let rejectFn!: (e: Error) => void;
     const result = new Promise<TurnResult>((resolve, reject) => {
-      this._pendingResults.push({ resolve, reject });
+      resolveFn = resolve;
+      rejectFn = reject;
     });
+
+    const entry: PendingResult = { resolve: resolveFn, reject: rejectFn };
+    this._pendingResults.push(entry);
+
+    // Track the in-flight turn so drain() can await it; drop it on settle.
+    this._inFlight.add(result);
+    void result.catch(() => {}).finally(() => this._inFlight.delete(result));
+
+    // Per-send timeout / abort, falling back to the session-level
+    // ProviderConfig.timeoutSec default when no per-call timeout is given.
+    this.armSendDeadline(entry, options);
 
     this.proc.stdin!.write(userMsg);
 
     return { uuid, result };
+  }
+
+  /**
+   * Wire up this send's timeout and/or abort signal. On fire, the active turn
+   * is interrupted and the send settles with `timeout` / `aborted`. No-op when
+   * neither a timeout nor a signal applies.
+   */
+  private armSendDeadline(entry: PendingResult, options?: SendOptions): void {
+    const timeoutSec = options?.timeoutSec ?? this.ctx.config?.timeoutSec;
+    const signal = options?.signal;
+    const hasTimeout = typeof timeoutSec === "number" && timeoutSec > 0;
+    if (!hasTimeout && !signal) return;
+
+    if (signal?.aborted) {
+      // Already aborted before the write — settle on the next tick so the
+      // caller still receives its SendHandle first.
+      queueMicrotask(() => this.settleEarly(entry, "aborted"));
+      return;
+    }
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const onAbort = () => this.settleEarly(entry, "aborted");
+    if (hasTimeout) {
+      timer = setTimeout(() => this.settleEarly(entry, "timeout"), timeoutSec! * 1000);
+    }
+    if (signal) signal.addEventListener("abort", onAbort, { once: true });
+
+    entry.cleanup = () => {
+      if (timer) clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", onAbort);
+    };
+  }
+
+  /**
+   * Settle a still-pending send early (timeout or abort). Interrupts the active
+   * turn best-effort and resolves the send's `result` with a synthetic
+   * TurnResult. A no-op if the entry already settled (the real result raced
+   * ahead). The late real `result` event later finds the entry already gone.
+   */
+  private settleEarly(entry: PendingResult, kind: "timeout" | "aborted"): void {
+    if (entry.settled) return;
+    entry.settled = true;
+    entry.cleanup?.();
+
+    const idx = this._pendingResults.indexOf(entry);
+    if (idx >= 0) this._pendingResults.splice(idx, 1);
+
+    // Best-effort interrupt of the active turn. With concurrent sends this ends
+    // the single shared turn for all of them — see SendOptions JSDoc.
+    void this.interrupt();
+
+    entry.resolve({
+      summary: null,
+      usage: undefined,
+      costUsd: null,
+      status: kind,
+      errorCode: kind,
+      errorMessage: kind === "timeout"
+        ? "Turn exceeded its timeout and was interrupted"
+        : "Turn was aborted",
+    });
   }
 
   async cancel(uuid: string): Promise<CancelResult> {
@@ -357,6 +460,20 @@ export class ClaudeSessionImpl implements AgentSession {
     // The result event from the interrupted turn will resolve the pending send()
   }
 
+  async drain(): Promise<void> {
+    if (this._state === "closed") return;
+    // Coalesce concurrent / repeated drains onto one promise.
+    if (this._drainPromise) return this._drainPromise;
+    this._draining = true;
+    this._drainPromise = (async () => {
+      // Let every in-flight turn settle (resolve or reject) before closing, so
+      // a running tool finishes rather than being killed mid-flight.
+      await Promise.allSettled([...this._inFlight]);
+      await this.close();
+    })();
+    return this._drainPromise;
+  }
+
   async close(): Promise<void> {
     if (this._state === "closed") return;
     this._state = "closed";
@@ -364,12 +481,14 @@ export class ClaudeSessionImpl implements AgentSession {
     // Close stdin to signal the process to exit
     this.proc.stdin!.end();
 
-    // Give it a moment to exit gracefully, then force kill
+    // Give it a moment to exit gracefully, then force kill. The grace window is
+    // configurable via ProviderConfig.graceSec for sessions running long tools.
+    const graceSec = this.ctx.config?.graceSec ?? 5;
     await new Promise<void>((resolve) => {
       const timeout = setTimeout(() => {
         this.proc.kill("SIGKILL");
         resolve();
-      }, 5000);
+      }, graceSec * 1000);
 
       this.proc.on("exit", () => {
         clearTimeout(timeout);
@@ -758,7 +877,13 @@ export class ClaudeSessionImpl implements AgentSession {
     // TurnResult — documented in SendHandle JSDoc. Splice empties the list
     // so subsequent sends queue against a fresh list for the next turn.
     const pending = this._pendingResults.splice(0);
-    for (const p of pending) p.resolve(result);
+    for (const p of pending) {
+      // Skip sends already settled early by timeout / abort.
+      if (p.settled) continue;
+      p.settled = true;
+      p.cleanup?.();
+      p.resolve(result);
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -798,8 +923,11 @@ export class ClaudeSessionImpl implements AgentSession {
   private dispatchEvent(event: StreamEvent): void {
     const cb = this.ctx.onEvent;
     if (!cb) return;
+    // Enrich synchronously (in stream order) so tool_result events carry the
+    // name of the tool_call they answer.
+    const enriched = this._trackToolName(event);
     this._eventChain = this._eventChain.then(async () => {
-      try { await cb(event); } catch { /* swallow */ }
+      try { await cb(enriched); } catch { /* swallow */ }
     });
   }
 

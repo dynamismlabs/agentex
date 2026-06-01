@@ -328,6 +328,7 @@ function parseV2Notification(event: Record<string, unknown>): StreamEvent | null
       return {
         type: "tool_result",
         toolCallId: itemId,
+        toolName: "command_execution",
         content: asString(item["aggregated_output"], ""),
         isError: exitCode !== null && exitCode !== 0,
         exitCode,
@@ -339,6 +340,7 @@ function parseV2Notification(event: Record<string, unknown>): StreamEvent | null
       return {
         type: "tool_result",
         toolCallId: itemId,
+        toolName: asString(item["name"], "function_call"),
         content: typeof output === "string" ? output : JSON.stringify(output),
         isError: item["status"] === "failed",
         exitCode: null,
@@ -497,6 +499,7 @@ function parseNdjsonEvent(
       return {
         type: "tool_result",
         toolCallId: itemId,
+        toolName: "command_execution",
         content: asString(item["aggregated_output"], ""),
         isError: exitCode !== null && exitCode !== 0,
         exitCode,
@@ -508,6 +511,7 @@ function parseNdjsonEvent(
       return {
         type: "tool_result",
         toolCallId: itemId,
+        toolName: asString(item["name"], "function_call"),
         content: typeof output === "string" ? output : JSON.stringify(output),
         isError: item["status"] === "failed",
         exitCode: null,

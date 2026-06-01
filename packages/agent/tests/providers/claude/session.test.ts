@@ -516,3 +516,204 @@ describe("ClaudeSession — cancel", () => {
     expect(await session.cancel("any-uuid")).toEqual({ cancelled: false });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Per-send timeout / abort (SendOptions)
+// ---------------------------------------------------------------------------
+
+function feedLine(session: ClaudeSessionImpl, obj: Record<string, unknown>): void {
+  (session as unknown as { handleLine: (l: string) => void }).handleLine(JSON.stringify(obj));
+}
+
+describe("ClaudeSession — per-send timeout / abort", () => {
+  it("resolves status 'timeout' and writes an interrupt when the deadline fires", async () => {
+    const { proc, stdinWrites } = makeFakeProc();
+    const session = new ClaudeSessionImpl(proc, {}, null);
+
+    const handle = await session.send("slow task", { timeoutSec: 0.02 });
+    const tr = await handle.result;
+
+    expect(tr.status).toBe("timeout");
+    expect(tr.errorCode).toBe("timeout");
+    expect(tr.errorMessage).toMatch(/timeout/i);
+    // The active turn was interrupted via a control_request.
+    const interruptWrite = stdinWrites.find((w) => w.includes('"subtype":"interrupt"'));
+    expect(interruptWrite).toBeTruthy();
+  });
+
+  it("falls back to ProviderConfig.timeoutSec as the session-level default", async () => {
+    const { proc } = makeFakeProc();
+    const session = new ClaudeSessionImpl(proc, { config: { timeoutSec: 0.02 } }, null);
+
+    const handle = await session.send("task");
+    const tr = await handle.result;
+    expect(tr.status).toBe("timeout");
+  });
+
+  it("per-call timeoutSec overrides the session default (0 disables)", async () => {
+    const { proc, stdinWrites } = makeFakeProc();
+    const session = new ClaudeSessionImpl(proc, { config: { timeoutSec: 0.02 } }, null);
+
+    const handle = await session.send("task", { timeoutSec: 0 });
+    // Real result lands; the disabled per-call timeout must not fire.
+    feedLine(session, { type: "result", subtype: "success", session_id: "s1", result: "done", is_error: false });
+    const tr = await handle.result;
+    expect(tr.status).toBe("completed");
+    expect(stdinWrites.find((w) => w.includes('"subtype":"interrupt"'))).toBeFalsy();
+  });
+
+  it("a real result before the timeout wins; no spurious interrupt", async () => {
+    const { proc, stdinWrites } = makeFakeProc();
+    const session = new ClaudeSessionImpl(proc, {}, null);
+
+    const handle = await session.send("task", { timeoutSec: 100 });
+    feedLine(session, { type: "result", subtype: "success", session_id: "s1", result: "done", is_error: false });
+
+    const tr = await handle.result;
+    expect(tr.status).toBe("completed");
+    expect(tr.summary).toBe("done");
+    expect(stdinWrites.find((w) => w.includes('"subtype":"interrupt"'))).toBeFalsy();
+  });
+
+  it("SendOptions.signal abort resolves status 'aborted'", async () => {
+    const { proc } = makeFakeProc();
+    const session = new ClaudeSessionImpl(proc, {}, null);
+
+    const ac = new AbortController();
+    const handle = await session.send("task", { signal: ac.signal });
+    ac.abort();
+
+    const tr = await handle.result;
+    expect(tr.status).toBe("aborted");
+    expect(tr.errorCode).toBe("aborted");
+  });
+
+  it("a pre-aborted signal still settles the send as 'aborted'", async () => {
+    const { proc } = makeFakeProc();
+    const session = new ClaudeSessionImpl(proc, {}, null);
+
+    const handle = await session.send("task", { signal: AbortSignal.abort() });
+    const tr = await handle.result;
+    expect(tr.status).toBe("aborted");
+  });
+
+  it("only the timed-out send settles early; a concurrent send still gets the real result", async () => {
+    const { proc } = makeFakeProc();
+    const session = new ClaudeSessionImpl(proc, {}, null);
+
+    const slow = await session.send("slow", { timeoutSec: 0.02 });
+    const other = await session.send("other"); // no timeout
+    const slowResult = await slow.result;
+    expect(slowResult.status).toBe("timeout");
+
+    // The shared turn's real result drains the remaining pending send.
+    feedLine(session, { type: "result", subtype: "success", session_id: "s1", result: "done", is_error: false });
+    const otherResult = await other.result;
+    expect(otherResult.status).toBe("completed");
+    expect(otherResult.summary).toBe("done");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// drain() + configurable graceSec
+// ---------------------------------------------------------------------------
+
+describe("ClaudeSession — drain + graceSec", () => {
+  it("refuses new sends while draining, awaits the in-flight turn, then closes", async () => {
+    const { proc } = makeFakeProc();
+    // Small grace so close()'s SIGKILL fallback resolves fast (fake proc never exits).
+    const session = new ClaudeSessionImpl(proc, { config: { graceSec: 0.02 } }, null);
+
+    const handle = await session.send("task");
+    const drainP = session.drain();
+
+    await expect(session.send("nope")).rejects.toThrow(/draining/);
+
+    // Complete the in-flight turn — drain can now proceed to close().
+    feedLine(session, { type: "result", subtype: "success", session_id: "s1", result: "done", is_error: false });
+    const tr = await handle.result;
+    expect(tr.status).toBe("completed");
+
+    await drainP;
+    expect(session.state).toBe("closed");
+  });
+
+  it("drain() is idempotent", async () => {
+    const { proc } = makeFakeProc();
+    const session = new ClaudeSessionImpl(proc, { config: { graceSec: 0.02 } }, null);
+    await Promise.all([session.drain(), session.drain()]);
+    expect(session.state).toBe("closed");
+  });
+
+  it("close() honors ProviderConfig.graceSec for the SIGKILL fallback", async () => {
+    const kills: string[] = [];
+    const { proc } = makeFakeProc();
+    (proc as unknown as { kill: (s: string) => boolean }).kill = (sig: string) => {
+      kills.push(sig);
+      return true;
+    };
+    const session = new ClaudeSessionImpl(proc, { config: { graceSec: 0.02 } }, null);
+
+    const start = Date.now();
+    await session.close();
+    const elapsed = Date.now() - start;
+
+    expect(kills).toContain("SIGTERM");
+    expect(kills).toContain("SIGKILL");
+    // Without the graceSec wiring this would wait the hardcoded 5s.
+    expect(elapsed).toBeLessThan(1500);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// tool_result.toolName enrichment
+// ---------------------------------------------------------------------------
+
+describe("ClaudeSession — tool_result.toolName", () => {
+  it("stamps toolName from the preceding tool_call on the same stream", async () => {
+    const events: StreamEvent[] = [];
+    const { feed, turnResult } = makeDrivenSession({ onEvent: (e) => { events.push(e); } });
+
+    feed(ndjson({
+      type: "assistant",
+      session_id: "s1",
+      message: {
+        id: "m1",
+        role: "assistant",
+        content: [{ type: "tool_use", id: "call_1", name: "Bash", input: { command: "ls" } }],
+      },
+    }));
+    feed(ndjson({
+      type: "user",
+      session_id: "s1",
+      message: {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "call_1", content: "ok", is_error: false }],
+      },
+    }));
+    feed(ndjson({ type: "result", subtype: "success", session_id: "s1", result: "done", is_error: false }));
+
+    await turnResult;
+    const tr = events.find((e) => e.type === "tool_result");
+    expect(tr?.type === "tool_result" && tr.toolName).toBe("Bash");
+  });
+
+  it("leaves toolName null when no matching tool_call was observed", async () => {
+    const events: StreamEvent[] = [];
+    const { feed, turnResult } = makeDrivenSession({ onEvent: (e) => { events.push(e); } });
+
+    feed(ndjson({
+      type: "user",
+      session_id: "s1",
+      message: {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "orphan", content: "x", is_error: false }],
+      },
+    }));
+    feed(ndjson({ type: "result", subtype: "success", session_id: "s1", result: "done", is_error: false }));
+
+    await turnResult;
+    const tr = events.find((e) => e.type === "tool_result");
+    expect(tr?.type === "tool_result" && tr.toolName).toBeNull();
+  });
+});

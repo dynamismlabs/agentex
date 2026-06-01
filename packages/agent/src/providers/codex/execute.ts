@@ -8,6 +8,7 @@ import { runChildProcess, deriveErrorCode } from "../../utils/process.js";
 import { detectAuth } from "../../utils/auth.js";
 import { injectWorkspaceSkills } from "../../utils/skills.js";
 import { resolveInstructions } from "../../utils/instructions.js";
+import { createToolNameTracker } from "../../utils/tool-names.js";
 import { prepareWorkspace } from "../../utils/workspace.js";
 import type { PreparedWorkspace } from "../../utils/workspace.js";
 import { uuidv7 } from "../../utils/uuid.js";
@@ -149,6 +150,9 @@ export async function executeCodexProvider(ctx: ExecutionContext): Promise<Execu
     // Track thread_id across lines — Codex only emits it once (thread.started)
     // but downstream events need it attached for DB correlation.
     let streamThreadId: string | null = resumeSessionId;
+    // Correlates tool_call → tool_result so emitted tool_result events carry
+    // toolName. One tracker per attempt (a retry restarts the stream).
+    const trackToolName = createToolNameTracker();
 
     const handleLine = async (trimmed: string) => {
       if (!trimmed) return;
@@ -163,7 +167,7 @@ export async function executeCodexProvider(ctx: ExecutionContext): Promise<Execu
       if (!ctx.onEvent) return;
       const event = parseCodexStreamLine(trimmed, streamThreadId);
       if (event) {
-        try { await ctx.onEvent(event); } catch { /* swallow */ }
+        try { await ctx.onEvent(trackToolName(event)); } catch { /* swallow */ }
       }
     };
 
