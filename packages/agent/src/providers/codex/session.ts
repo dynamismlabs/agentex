@@ -10,6 +10,7 @@ import type {
   SessionState,
   StreamEvent,
   TurnResult,
+  UserInputResponse,
 } from "../../types.js";
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
@@ -19,6 +20,96 @@ import { createToolNameTracker } from "../../utils/tool-names.js";
 import { parseCodexStreamLine } from "./parse.js";
 import { withPlanModePreamble } from "./plan-mode.js";
 import { scanCodexSessionUsage } from "./usage-scanner.js";
+import { codexSessionCodec } from "./codec.js";
+import { parseCollaborationModes, resolveCollaborationModeParam } from "./modes.js";
+
+/**
+ * Extract a resume thread id from session params (reusing the codec's
+ * sessionId / session_id / thread_id alias handling), or null to start fresh.
+ */
+function readCodexResumeId(
+  sessionParams: Record<string, unknown> | null | undefined,
+): string | null {
+  const decoded = codexSessionCodec.deserialize(sessionParams ?? null);
+  const id = decoded?.["sessionId"];
+  return typeof id === "string" && id.length > 0 ? id : null;
+}
+
+/** One structured question Codex asks via `requestUserInput`, normalized to the
+ *  cross-provider AskUserQuestion shape so callers can reuse parseAskUserQuestion. */
+interface CodexQuestion {
+  id: string;
+  header: string;
+  question: string;
+  options: { label: string; description?: string }[];
+  multiSelect?: boolean;
+}
+
+/** Pull and normalize the question list out of a `requestUserInput` params blob.
+ *  Tolerant of missing/extra fields — drops anything without an id and at least
+ *  a question or a header (Codex sometimes sends header-only prompts). */
+function parseCodexQuestions(params: Record<string, unknown>): CodexQuestion[] {
+  const raw = Array.isArray(params["questions"]) ? params["questions"] : [];
+  const out: CodexQuestion[] = [];
+  for (const item of raw) {
+    if (typeof item !== "object" || item === null) continue;
+    const q = item as Record<string, unknown>;
+    const id = typeof q["id"] === "string" ? q["id"] : "";
+    const questionText = typeof q["question"] === "string" ? q["question"] : "";
+    const header = typeof q["header"] === "string" ? q["header"] : "";
+    if (!id || (!questionText && !header)) continue;
+    // Fall back to the header as the prompt text so the bridged AskUserQuestion is
+    // never empty and the host can key its answer off the same `question` value.
+    const question = questionText || header;
+    const options = Array.isArray(q["options"])
+      ? q["options"]
+          .filter((o): o is Record<string, unknown> => typeof o === "object" && o !== null)
+          .map((o) => ({
+            label: typeof o["label"] === "string" ? o["label"] : "",
+            ...(typeof o["description"] === "string" && o["description"]
+              ? { description: o["description"] as string }
+              : {}),
+          }))
+          .filter((o) => o.label.length > 0)
+      : [];
+    out.push({
+      id,
+      header,
+      question,
+      options,
+      ...(q["multiSelect"] === true ? { multiSelect: true } : {}),
+    });
+  }
+  return out;
+}
+
+function normalizeAnswerValues(raw: unknown): string[] {
+  if (typeof raw === "string") return raw.length > 0 ? [raw] : [];
+  if (Array.isArray(raw)) return raw.filter((v): v is string => typeof v === "string" && v.length > 0);
+  return [];
+}
+
+/** Translate a host AskUserQuestion answer (keyed by question text or header)
+ *  into the Codex `requestUserInput` response shape:
+ *  `{ [questionId]: { answers: string[] } }`. A denied response yields {}. */
+function buildCodexUserInputAnswers(
+  questions: CodexQuestion[],
+  resp: UserInputResponse,
+): Record<string, { answers: string[] }> {
+  const out: Record<string, { answers: string[] }> = {};
+  if (!resp.allow) return out;
+  const updated =
+    resp.updatedInput && typeof resp.updatedInput["answers"] === "object"
+      ? (resp.updatedInput["answers"] as Record<string, unknown>)
+      : null;
+  if (!updated) return out;
+  for (const q of questions) {
+    const raw = updated[q.question] ?? updated[q.header];
+    const values = normalizeAnswerValues(raw);
+    if (values.length > 0) out[q.id] = { answers: values };
+  }
+  return out;
+}
 
 /** A pending `send()` whose `result` Promise hasn't settled yet. */
 interface PendingResult {
@@ -191,6 +282,8 @@ export async function createCodexSession(ctx: SessionContext): Promise<AgentSess
 export class CodexSessionImpl implements AgentSession {
   private _state: SessionState = "idle";
   private _threadId: string | null = null;
+  /** Thread id to resume (from ctx.sessionParams); null starts a fresh thread. */
+  private readonly _resumeThreadId: string | null;
   private _lineBuffer = "";
   private _nextId = 1;
 
@@ -243,6 +336,8 @@ export class CodexSessionImpl implements AgentSession {
     private readonly model: string | null,
     private readonly instructions: string | null,
   ) {
+    this._resumeThreadId = readCodexResumeId(ctx.sessionParams);
+
     proc.stdout!.setEncoding("utf-8");
     proc.stdout!.on("data", (chunk: string) => this.handleStdout(chunk));
 
@@ -315,10 +410,70 @@ export class CodexSessionImpl implements AgentSession {
       capabilities: {},
     });
 
-    // 2. thread/start
+    // 2. Resume an existing thread when the caller supplied sessionParams,
+    //    otherwise start a fresh one. `thread/resume` continues the SAME thread
+    //    with its full context retained — distinct from `thread/fork`, which is
+    //    a divergent rewind copy. The thread keeps its original cwd/model, so we
+    //    pass only the thread id (+ refreshed developer instructions).
+    if (this._resumeThreadId) {
+      const resumeParams: Record<string, unknown> = { threadId: this._resumeThreadId };
+      if (this.instructions) resumeParams["developerInstructions"] = this.instructions;
+      try {
+        const res = await this.rpcRequest("thread/resume", resumeParams);
+        const thread = asObj(res, "thread");
+        // thread/resume may echo the thread back or return {}; fall back to the
+        // id we resumed with so `sessionId` is always populated.
+        this._threadId = str(thread, "id") || str(thread, "sessionId") || this._resumeThreadId;
+        return;
+      } catch (err) {
+        // The thread is unknown to this codex install (different machine, pruned
+        // history). Don't fail the whole session — fall back to a fresh thread
+        // and surface the downgrade on stderr. The new id flows back out via
+        // the next sessionParams snapshot so callers see the session changed.
+        if (this.ctx.onOutput) {
+          const reason = err instanceof Error ? err.message : String(err);
+          try {
+            void this.ctx.onOutput(
+              "stderr",
+              `agentex: codex thread/resume failed for ${this._resumeThreadId}, starting a fresh thread: ${reason}\n`,
+            );
+          } catch { /* swallow */ }
+        }
+      }
+    }
+
+    // thread/start (fresh)
     const threadParams: Record<string, unknown> = { cwd: this.cwd };
     if (this.model) threadParams["model"] = this.model;
     if (this.instructions) threadParams["developerInstructions"] = this.instructions;
+
+    // Apply a chosen collaboration mode (config.modeId) by resolving it against
+    // the live mode list. Only on fresh threads — a resumed thread keeps the
+    // mode it was created with. Mode discovery is advisory: a failure or an
+    // unknown id just falls through to the default mode.
+    const modeId = this.ctx.config?.modeId;
+    if (modeId) {
+      try {
+        // Bound the discovery RPC: an older app-server that ignores
+        // `collaborationMode/list` would otherwise hang the whole handshake.
+        const modesResponse = await Promise.race([
+          this.rpcRequest("collaborationMode/list", {}),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error("collaborationMode/list timed out")), 10_000),
+          ),
+        ]);
+        const collaborationMode = resolveCollaborationModeParam(
+          parseCollaborationModes(modesResponse),
+          modeId,
+        );
+        if (collaborationMode) {
+          // Avoid sending instructions twice: the caller's top-level
+          // `developerInstructions` wins, so drop the mode's copy.
+          if (this.instructions) delete collaborationMode.settings["developer_instructions"];
+          threadParams["collaborationMode"] = collaborationMode;
+        }
+      } catch { /* modes are advisory — ignore discovery failures */ }
+    }
 
     const res = await this.rpcRequest("thread/start", threadParams);
     // codex-cli 0.130.0+ shape: { thread: { id, sessionId, ... }, model, ... }
@@ -562,18 +717,38 @@ export class CodexSessionImpl implements AgentSession {
       method === "item/fileChange/requestApproval"
     ) {
       void this.handleApproval(id, method, params);
+    } else if (
+      method === "item/tool/requestUserInput" ||
+      method === "tool/requestUserInput"
+    ) {
+      // `tool/requestUserInput` is the legacy method name on older codex builds.
+      void this.handleUserInputRequest(id, params);
     } else {
-      // Unknown server request — ack to unblock
+      // Unknown server request — ack to unblock the turn.
       this.rpcResponse(id, {});
     }
+  }
+
+  /**
+   * Leave a waiting-for-input/approval state correctly. A slow host handler can
+   * resolve after the turn already ended (deliverTurnResult → idle), so restore
+   * to `thinking` only when a turn is still in flight, else `idle` — never clobber
+   * a finished turn back to `thinking`.
+   */
+  private restoreStateAfter(waitingState: "waiting_for_approval" | "waiting_for_input"): void {
+    if (this._state !== waitingState) return;
+    this._state = this._pendingResults.length > 0 ? "thinking" : "idle";
   }
 
   private async handleApproval(id: number, method: string, params: Record<string, unknown>): Promise<void> {
     this._state = "waiting_for_approval";
 
+    // Codex's app-server expects `{ decision: "accept" | "decline" | "cancel" }`
+    // (NOT `{ approved: boolean }`). agentex's UserInputResponse has no interrupt
+    // concept, so allow → accept and deny → decline.
     if (!this.ctx.onUserInputRequest) {
-      this.rpcResponse(id, { approved: true });
-      if (this._state === "waiting_for_approval") this._state = "thinking";
+      this.rpcResponse(id, { decision: "accept" });
+      this.restoreStateAfter("waiting_for_approval");
       return;
     }
 
@@ -588,12 +763,47 @@ export class CodexSessionImpl implements AgentSession {
         toolUseId: str(params, "id"),
         description: str(params, "command") || str(params, "path") || undefined,
       });
-      this.rpcResponse(id, { approved: resp.allow });
+      this.rpcResponse(id, { decision: resp.allow ? "accept" : "decline" });
     } catch {
-      this.rpcResponse(id, { approved: false });
+      this.rpcResponse(id, { decision: "decline" });
     }
 
-    if (this._state === "waiting_for_approval") this._state = "thinking";
+    this.restoreStateAfter("waiting_for_approval");
+  }
+
+  /**
+   * Handle a Codex `requestUserInput` server→client request: the agent is asking
+   * the user one or more structured questions. Maps onto the cross-provider
+   * AskUserQuestion shape so callers reuse `parseAskUserQuestion`, then answers
+   * back in Codex's `{ answers: { [questionId]: { answers: string[] } } }` shape.
+   */
+  private async handleUserInputRequest(id: number, params: Record<string, unknown>): Promise<void> {
+    // Questions are user *input*, not a tool-permission gate — distinct state so a
+    // host UI can render a question form vs an approval prompt.
+    this._state = "waiting_for_input";
+
+    const questions = parseCodexQuestions(params);
+
+    // No host handler, or nothing answerable → return empty answers so the
+    // agent proceeds without hanging.
+    if (!this.ctx.onUserInputRequest || questions.length === 0) {
+      this.rpcResponse(id, { answers: {} });
+      this.restoreStateAfter("waiting_for_input");
+      return;
+    }
+
+    try {
+      const resp = await this.ctx.onUserInputRequest({
+        toolName: "AskUserQuestion",
+        input: { questions },
+        toolUseId: str(params, "id") || "codex-user-input",
+      });
+      this.rpcResponse(id, { answers: buildCodexUserInputAnswers(questions, resp) });
+    } catch {
+      this.rpcResponse(id, { answers: {} });
+    }
+
+    this.restoreStateAfter("waiting_for_input");
   }
 
   // -------------------------------------------------------------------------
@@ -776,7 +986,15 @@ export class CodexSessionImpl implements AgentSession {
       ? { [resolvedModel]: { inputTokens: this._turnUsage.inputTokens, outputTokens: this._turnUsage.outputTokens } }
       : undefined;
 
-    // If no usage from the stream, try scanning session logs
+    // Usage precedence: the `turn.completed` payload is authoritative when
+    // present (captured above into _turnUsage). Only when the stream carried no
+    // usage do we fall back to scanning Codex's on-disk session logs.
+    //
+    // RACINESS: the disk scan is best-effort and inherently racy — the rollout
+    // file may still be flushing when we read it, so a fallback scan can miss the
+    // latest turn or read partially-written totals. We therefore scan ONLY when
+    // there is no in-band usage, and never let a scan failure fail the turn
+    // (usage simply stays undefined). Prefer the in-band payload always.
     if (!usage && this._turnStartedAt) {
       const startedAt = this._turnStartedAt;
       const threadId = this._threadId ?? undefined;

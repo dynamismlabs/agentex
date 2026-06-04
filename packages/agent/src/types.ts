@@ -52,6 +52,44 @@ export interface ProviderCapabilities {
    * cancel returns `{cancelled: false}`.
    */
   cancelQueuedMessage: boolean;
+  /**
+   * Provider exposes selectable operating modes via `listModes()` — e.g. Codex
+   * collaboration modes, Copilot's allow-all/agent/plan. When `false`,
+   * `config.modeId` is ignored and `listModes` is absent.
+   */
+  modes: boolean;
+  /**
+   * Capabilities are negotiated at runtime rather than statically known.
+   * `true` for ACP providers, whose real capability set comes from the agent's
+   * `initialize` handshake — the static flags here are a best-effort default
+   * until a session is created. Consumers needing exact capabilities for a
+   * dynamic provider should create a session and read its reported state.
+   */
+  dynamicCapabilities?: boolean;
+}
+
+/**
+ * A selectable operating mode a provider/session exposes. Discovered at
+ * runtime for dynamic providers (ACP), queried from the agent for codex.
+ */
+export interface AgentMode {
+  /**
+   * Stable mode identifier. May be a full URI for ACP providers (e.g.
+   * "https://agentclientprotocol.com/protocol/session-modes#agent") — never
+   * assume it's a simple slug.
+   */
+  id: string;
+  /** Human-readable label for display. */
+  name: string;
+  /** Optional longer description of what the mode does. */
+  description?: string;
+}
+
+/** Options for `ProviderModule.listModes()`. */
+export interface ListModesOptions {
+  cwd?: string;
+  env?: Record<string, string>;
+  config?: ProviderConfig;
 }
 
 // Core provider interface — every provider must implement this
@@ -76,6 +114,12 @@ export interface ProviderModule {
   sessionCodec?: SessionCodec;
   /** List available models. Pass cacheTtlMs to cache results (0 = no cache, default). */
   listModels?(options?: { cacheTtlMs?: number }): Promise<ProviderModel[]>;
+  /**
+   * List the operating modes this provider exposes (see `AgentMode`). Present
+   * only on providers with `capabilities.modes === true`. May spawn the agent
+   * to query it (ACP, codex), so it's async and accepts cwd/env/config.
+   */
+  listModes?(options?: ListModesOptions): Promise<AgentMode[]>;
   /** Check current quota/rate limit status. Not all providers support this. */
   checkQuota?(ctx: QuotaContext): Promise<QuotaStatus>;
   /**
@@ -220,6 +264,14 @@ export interface ProviderConfig {
    * instead, which is the cross-provider abstraction.
    */
   mode?: string;
+  /**
+   * Select a provider operating mode by id (one of `listModes()`). Honored by
+   * providers with `capabilities.modes === true` (codex collaboration modes,
+   * ACP session modes, copilot allow-all/agent/plan). Ignored otherwise.
+   * Distinct from `mode` (cursor's raw `--mode` passthrough) and `planMode`
+   * (the cross-provider read-only abstraction).
+   */
+  modeId?: string;
   /**
    * Run the agent in read-only "plan" mode: it can read, search, and reason,
    * but cannot edit files or run mutating commands. Honored by providers
