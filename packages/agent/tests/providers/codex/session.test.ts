@@ -2,10 +2,12 @@ import { describe, it, expect } from "vitest";
 import { EventEmitter } from "node:events";
 import type { ChildProcess } from "node:child_process";
 import { CodexSessionImpl } from "../../../src/providers/codex/session.js";
+import { parseAskUserQuestion } from "../../../src/index.js";
 import type {
   SessionContext,
   StreamEvent,
   TurnResult,
+  UserInputRequest,
 } from "../../../src/types.js";
 
 function makeFakeProc(): { proc: ChildProcess } {
@@ -350,5 +352,430 @@ describe("CodexSession — tool_result.toolName", () => {
     await turnResult;
     const tr = events.find((e) => e.type === "tool_result");
     expect(tr?.type === "tool_result" && tr.toolName).toBe("command_execution");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Handshake — thread/start (fresh) vs thread/resume (continue a session)
+// ---------------------------------------------------------------------------
+
+/** A JSON-RPC error to return from a makeRpcProc handler. */
+class RpcError {
+  constructor(
+    public readonly code: number,
+    public readonly rpcMessage: string,
+  ) {}
+}
+
+/**
+ * Fake child process that auto-responds to outgoing JSON-RPC *requests* using a
+ * per-method handler map, and records every message the session writes to
+ * stdin. A handler returning an RpcError yields a JSON-RPC error response.
+ */
+function makeRpcProc(handlers: Record<string, (params: Record<string, unknown>) => unknown>): {
+  proc: ChildProcess;
+  writes: Array<Record<string, unknown>>;
+} {
+  const stdout = new EventEmitter() as EventEmitter & { setEncoding: (e: string) => void };
+  stdout.setEncoding = () => {};
+  const stderr = new EventEmitter() as EventEmitter & { setEncoding: (e: string) => void };
+  stderr.setEncoding = () => {};
+  const writes: Array<Record<string, unknown>> = [];
+
+  const stdin = {
+    write: (chunk: string) => {
+      for (const line of chunk.split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        const msg = JSON.parse(trimmed) as Record<string, unknown>;
+        writes.push(msg);
+        if (typeof msg["id"] === "number" && typeof msg["method"] === "string") {
+          const id = msg["id"] as number;
+          const handler = handlers[msg["method"] as string];
+          const out = handler ? handler((msg["params"] as Record<string, unknown>) ?? {}) : {};
+          queueMicrotask(() => {
+            const response =
+              out instanceof RpcError
+                ? { jsonrpc: "2.0", id, error: { code: out.code, message: out.rpcMessage } }
+                : { jsonrpc: "2.0", id, result: out };
+            stdout.emit("data", JSON.stringify(response) + "\n");
+          });
+        }
+      }
+      return true;
+    },
+    end: () => {},
+  };
+
+  const proc = new EventEmitter() as unknown as ChildProcess;
+  Object.assign(proc, { stdin, stdout, stderr, kill: () => true });
+  return { proc, writes };
+}
+
+function methodsWritten(writes: Array<Record<string, unknown>>): string[] {
+  return writes.map((w) => w["method"]).filter((m): m is string => typeof m === "string");
+}
+
+function paramsFor(writes: Array<Record<string, unknown>>, method: string): Record<string, unknown> {
+  const msg = writes.find((w) => w["method"] === method);
+  return (msg?.["params"] as Record<string, unknown>) ?? {};
+}
+
+describe("CodexSession — handshake resume", () => {
+  it("starts a fresh thread (thread/start) when no sessionParams are given", async () => {
+    const { proc, writes } = makeRpcProc({
+      initialize: () => ({}),
+      "thread/start": () => ({ thread: { id: "thr_fresh" } }),
+    });
+    const session = new CodexSessionImpl(proc, {}, "/tmp", "test-model", null);
+    await session.handshake();
+
+    const methods = methodsWritten(writes);
+    expect(methods).toContain("thread/start");
+    expect(methods).not.toContain("thread/resume");
+    expect(session.sessionId).toBe("thr_fresh");
+  });
+
+  it("resumes an existing thread (thread/resume) when sessionParams carry a sessionId", async () => {
+    const { proc, writes } = makeRpcProc({
+      initialize: () => ({}),
+      "thread/resume": (params) => ({ thread: { id: params["threadId"] } }),
+      "thread/start": () => ({ thread: { id: "thr_should_not_be_used" } }),
+    });
+    const session = new CodexSessionImpl(
+      proc,
+      { sessionParams: { sessionId: "thr_existing" } },
+      "/tmp",
+      "test-model",
+      null,
+    );
+    await session.handshake();
+
+    const methods = methodsWritten(writes);
+    expect(methods).toContain("thread/resume");
+    expect(methods).not.toContain("thread/start");
+    expect(session.sessionId).toBe("thr_existing");
+    expect(paramsFor(writes, "thread/resume")["threadId"]).toBe("thr_existing");
+  });
+
+  it("recovers the resume id from the thread_id alias", async () => {
+    const { proc, writes } = makeRpcProc({
+      initialize: () => ({}),
+      "thread/resume": (params) => ({ thread: { id: params["threadId"] } }),
+    });
+    const session = new CodexSessionImpl(
+      proc,
+      { sessionParams: { thread_id: "thr_alias" } },
+      "/tmp",
+      null,
+      null,
+    );
+    await session.handshake();
+    expect(methodsWritten(writes)).toContain("thread/resume");
+    expect(session.sessionId).toBe("thr_alias");
+  });
+
+  it("passes developerInstructions on resume and falls back to the resumed id when the response is empty", async () => {
+    const { proc, writes } = makeRpcProc({
+      initialize: () => ({}),
+      "thread/resume": () => ({}),
+    });
+    const session = new CodexSessionImpl(
+      proc,
+      { sessionParams: { sessionId: "thr_x" } },
+      "/tmp",
+      null,
+      "Be concise.",
+    );
+    await session.handshake();
+    expect(paramsFor(writes, "thread/resume")["developerInstructions"]).toBe("Be concise.");
+    expect(session.sessionId).toBe("thr_x");
+  });
+
+  it("falls back to a fresh thread (with a stderr notice) when resume is rejected", async () => {
+    const stderr: string[] = [];
+    const { proc, writes } = makeRpcProc({
+      initialize: () => ({}),
+      "thread/resume": () => new RpcError(-32000, "unknown thread"),
+      "thread/start": () => ({ thread: { id: "thr_new" } }),
+    });
+    const session = new CodexSessionImpl(
+      proc,
+      {
+        sessionParams: { sessionId: "thr_gone" },
+        onOutput: (stream, chunk) => {
+          if (stream === "stderr") stderr.push(chunk);
+        },
+      },
+      "/tmp",
+      "test-model",
+      null,
+    );
+    await session.handshake();
+
+    const methods = methodsWritten(writes);
+    expect(methods).toContain("thread/resume");
+    expect(methods).toContain("thread/start"); // fell back to a fresh thread
+    expect(session.sessionId).toBe("thr_new");
+    expect(stderr.join("")).toMatch(/thread\/resume failed/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Permission requests (server→client): command/file approval + requestUserInput
+// ---------------------------------------------------------------------------
+
+/** Emit a server→client JSON-RPC request to the session and return the result
+ *  the session writes back (its `rpcResponse`). */
+async function emitServerRequest(
+  proc: ChildProcess,
+  writes: Array<Record<string, unknown>>,
+  request: { id: number; method: string; params: Record<string, unknown> },
+): Promise<Record<string, unknown> | undefined> {
+  const stdout = (proc as unknown as { stdout: EventEmitter }).stdout;
+  stdout.emit("data", JSON.stringify({ jsonrpc: "2.0", ...request }) + "\n");
+  // Let the async onUserInputRequest + rpcResponse settle.
+  await new Promise((r) => setTimeout(r, 10));
+  const resp = writes.find((w) => w["id"] === request.id && "result" in w);
+  return resp?.["result"] as Record<string, unknown> | undefined;
+}
+
+describe("CodexSession — permission requests", () => {
+  it("responds { decision: 'accept' } to a command approval the host allows", async () => {
+    const { proc, writes } = makeRpcProc({});
+    const seen: string[] = [];
+    new CodexSessionImpl(
+      proc,
+      { onUserInputRequest: async (req) => { seen.push(req.toolName); return { allow: true }; } },
+      "/tmp",
+      "m",
+      null,
+    );
+    const result = await emitServerRequest(proc, writes, {
+      id: 100,
+      method: "item/commandExecution/requestApproval",
+      params: { id: "item_1", command: "rm -rf /tmp/x" },
+    });
+    expect(result).toEqual({ decision: "accept" });
+    expect(seen).toEqual(["command_execution"]);
+  });
+
+  it("responds { decision: 'decline' } when the host denies a file change", async () => {
+    const { proc, writes } = makeRpcProc({});
+    new CodexSessionImpl(
+      proc,
+      { onUserInputRequest: async () => ({ allow: false, message: "no" }) },
+      "/tmp",
+      "m",
+      null,
+    );
+    const result = await emitServerRequest(proc, writes, {
+      id: 101,
+      method: "item/fileChange/requestApproval",
+      params: { id: "item_2", path: "/etc/hosts" },
+    });
+    expect(result).toEqual({ decision: "decline" });
+  });
+
+  it("auto-accepts (decision: 'accept') when no host handler is registered", async () => {
+    const { proc, writes } = makeRpcProc({});
+    new CodexSessionImpl(proc, {}, "/tmp", "m", null);
+    const result = await emitServerRequest(proc, writes, {
+      id: 102,
+      method: "item/commandExecution/requestApproval",
+      params: { id: "item_3", command: "ls" },
+    });
+    expect(result).toEqual({ decision: "accept" });
+  });
+
+  it("maps requestUserInput to AskUserQuestion and answers by question id", async () => {
+    const { proc, writes } = makeRpcProc({});
+    const calls: UserInputRequest[] = [];
+    new CodexSessionImpl(
+      proc,
+      {
+        onUserInputRequest: async (req) => {
+          calls.push(req);
+          // Host answers keyed by question text (agentex AskUserQuestion convention).
+          return { allow: true, updatedInput: { answers: { "Pick a framework": "Hono" } } };
+        },
+      },
+      "/tmp",
+      "m",
+      null,
+    );
+
+    const result = await emitServerRequest(proc, writes, {
+      id: 103,
+      method: "item/tool/requestUserInput",
+      params: {
+        id: "q_call_1",
+        questions: [
+          {
+            id: "framework",
+            header: "Framework",
+            question: "Pick a framework",
+            options: [{ label: "Express" }, { label: "Hono" }],
+          },
+        ],
+      },
+    });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.toolName).toBe("AskUserQuestion");
+    // The mapped request is parseAskUserQuestion-compatible.
+    const parsed = parseAskUserQuestion(calls[0]!);
+    expect(parsed).not.toBeNull();
+    expect(parsed![0]!.question).toBe("Pick a framework");
+    expect(parsed![0]!.options.map((o) => o.label)).toEqual(["Express", "Hono"]);
+    expect(result).toEqual({ answers: { framework: { answers: ["Hono"] } } });
+  });
+
+  it("handles the legacy tool/requestUserInput method and multi-select answers", async () => {
+    const { proc, writes } = makeRpcProc({});
+    new CodexSessionImpl(
+      proc,
+      { onUserInputRequest: async () => ({ allow: true, updatedInput: { answers: { "Q?": ["a", "b"] } } }) },
+      "/tmp",
+      "m",
+      null,
+    );
+    const result = await emitServerRequest(proc, writes, {
+      id: 104,
+      method: "tool/requestUserInput",
+      params: {
+        id: "c",
+        questions: [{ id: "x", header: "H", question: "Q?", multiSelect: true, options: [{ label: "a" }, { label: "b" }] }],
+      },
+    });
+    expect(result).toEqual({ answers: { x: { answers: ["a", "b"] } } });
+  });
+
+  it("uses waiting_for_input state for questions and restores to idle (not thinking) with no active turn", async () => {
+    const { proc, writes } = makeRpcProc({});
+    const holder: { session?: CodexSessionImpl } = {};
+    const states: string[] = [];
+    holder.session = new CodexSessionImpl(
+      proc,
+      {
+        onUserInputRequest: async () => {
+          states.push(holder.session!.state);
+          return { allow: true, updatedInput: { answers: { "Q?": "a" } } };
+        },
+      },
+      "/tmp",
+      "m",
+      null,
+    );
+    await emitServerRequest(proc, writes, {
+      id: 200,
+      method: "item/tool/requestUserInput",
+      params: { id: "c", questions: [{ id: "x", header: "H", question: "Q?", options: [{ label: "a" }] }] },
+    });
+    expect(states).toEqual(["waiting_for_input"]);
+    // No turn was in flight, so the state must restore to idle — never clobbered to "thinking".
+    expect(holder.session.state).toBe("idle");
+  });
+
+  it("answers a header-only question (no `question` text)", async () => {
+    const { proc, writes } = makeRpcProc({});
+    new CodexSessionImpl(
+      proc,
+      { onUserInputRequest: async () => ({ allow: true, updatedInput: { answers: { Branch: "main" } } }) },
+      "/tmp",
+      "m",
+      null,
+    );
+    const result = await emitServerRequest(proc, writes, {
+      id: 201,
+      method: "item/tool/requestUserInput",
+      params: { id: "c", questions: [{ id: "branch", header: "Branch", options: [{ label: "main" }] }] },
+    });
+    // The header is used as the prompt text, so the host's answer (keyed by it) lands.
+    expect(result).toEqual({ answers: { branch: { answers: ["main"] } } });
+  });
+
+  it("returns empty answers when the host declines a requestUserInput", async () => {
+    const { proc, writes } = makeRpcProc({});
+    new CodexSessionImpl(
+      proc,
+      { onUserInputRequest: async () => ({ allow: false }) },
+      "/tmp",
+      "m",
+      null,
+    );
+    const result = await emitServerRequest(proc, writes, {
+      id: 105,
+      method: "item/tool/requestUserInput",
+      params: { id: "c", questions: [{ id: "x", header: "H", question: "Q?", options: [] }] },
+    });
+    expect(result).toEqual({ answers: {} });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Collaboration mode selection (config.modeId)
+// ---------------------------------------------------------------------------
+
+describe("CodexSession — usage", () => {
+  it("uses turn.completed usage verbatim (keyed by model) and skips the disk scan", async () => {
+    const { proc } = makeFakeProc();
+    const session = new CodexSessionImpl(proc, {}, "/tmp", "gpt-x", null);
+    const h = await session.send("go"); // sets _turnStartedAt
+    feedCodex(session, { type: "item.completed", item: { type: "agent_message", text: "done" } });
+    // Usage present in the payload → the `if (!usage)` guard skips the scanner.
+    feedCodex(session, { type: "turn.completed", usage: { input_tokens: 42, output_tokens: 7 } });
+    const tr = await h.result;
+    expect(tr.status).toBe("completed");
+    expect(tr.usage).toEqual({ "gpt-x": { inputTokens: 42, outputTokens: 7 } });
+  });
+});
+
+describe("CodexSession — collaboration mode", () => {
+  it("resolves modeId via collaborationMode/list and passes collaborationMode to thread/start", async () => {
+    const { proc, writes } = makeRpcProc({
+      initialize: () => ({}),
+      "collaborationMode/list": () => ({
+        data: [
+          { name: "Auto", mode: "code", model: "gpt-5.4" },
+          { name: "Plan", mode: "plan", developer_instructions: "Investigate only." },
+        ],
+      }),
+      "thread/start": () => ({ thread: { id: "thr_mode" } }),
+    });
+    const session = new CodexSessionImpl(proc, { config: { modeId: "plan" } }, "/tmp", null, null);
+    await session.handshake();
+
+    expect(paramsFor(writes, "thread/start")["collaborationMode"]).toEqual({
+      mode: "plan",
+      settings: { developer_instructions: "Investigate only." },
+    });
+    expect(session.sessionId).toBe("thr_mode");
+  });
+
+  it("makes no collaborationMode/list call and sets no mode when modeId is unset", async () => {
+    const { proc, writes } = makeRpcProc({
+      initialize: () => ({}),
+      "thread/start": () => ({ thread: { id: "thr_default" } }),
+    });
+    const session = new CodexSessionImpl(proc, {}, "/tmp", null, null);
+    await session.handshake();
+
+    expect(methodsWritten(writes)).not.toContain("collaborationMode/list");
+    expect(paramsFor(writes, "thread/start")["collaborationMode"]).toBeUndefined();
+    expect(session.sessionId).toBe("thr_default");
+  });
+
+  it("falls through to the default mode when modeId is unknown", async () => {
+    const { proc, writes } = makeRpcProc({
+      initialize: () => ({}),
+      "collaborationMode/list": () => ({ data: [{ name: "Auto", mode: "code" }] }),
+      "thread/start": () => ({ thread: { id: "thr_x" } }),
+    });
+    const session = new CodexSessionImpl(proc, { config: { modeId: "nonexistent" } }, "/tmp", null, null);
+    await session.handshake();
+
+    expect(methodsWritten(writes)).toContain("collaborationMode/list"); // it tried to resolve
+    expect(paramsFor(writes, "thread/start")["collaborationMode"]).toBeUndefined(); // no match → default
   });
 });

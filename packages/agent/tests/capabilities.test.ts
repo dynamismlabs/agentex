@@ -16,6 +16,7 @@ describe("ProviderCapabilities", () => {
       expect(typeof provider.capabilities.planMode).toBe("boolean");
       expect(typeof provider.capabilities.concurrentSend).toBe("boolean");
       expect(typeof provider.capabilities.cancelQueuedMessage).toBe("boolean");
+      expect(typeof provider.capabilities.modes).toBe("boolean");
     }
   });
 
@@ -34,6 +35,7 @@ describe("ProviderCapabilities", () => {
       planMode: true,
       concurrentSend: true,
       cancelQueuedMessage: true,
+      modes: false,
     });
   });
 
@@ -118,6 +120,13 @@ describe("ProviderCapabilities", () => {
       if (provider.capabilities.quotaProbing) {
         expect(provider.checkQuota).toBeDefined();
       }
+    }
+  });
+
+  it("capabilities.modes is true iff listModes is present", () => {
+    for (const name of listProviders()) {
+      const provider = getProvider(name);
+      expect(provider.capabilities.modes).toBe(provider.listModes !== undefined);
     }
   });
 });
