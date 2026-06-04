@@ -8,8 +8,9 @@
  *   pnpm smoke --mock pi opencode       # test specific providers with mocks
  */
 import * as path from "node:path";
+import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { getProvider, parseAskUserQuestion, aggregateUsage } from "../src/index.js";
+import { getProvider, parseAskUserQuestion, aggregateUsage, loadProvidersFromConfig, acpProvider } from "../src/index.js";
 import type {
   AgentSession,
   StreamEvent,
@@ -31,13 +32,78 @@ const FIXTURES_DIR = path.resolve(__dirname, "../tests/fixtures");
 const MOCK_COMMANDS: Record<string, string> = {
   claude: path.join(FIXTURES_DIR, "mock-claude.sh"),
   codex: path.join(FIXTURES_DIR, "mock-codex.sh"),
-  gemini: path.join(FIXTURES_DIR, "mock-gemini.sh"),
   cursor: path.join(FIXTURES_DIR, "mock-cursor.sh"),
   opencode: path.join(FIXTURES_DIR, "mock-opencode.sh"),
   pi: path.join(FIXTURES_DIR, "mock-pi.sh"),
 };
 
 const MOCK_SESSION_COMMAND = path.join(FIXTURES_DIR, "mock-claude-session.sh");
+const MOCK_ACP_AGENT = ["node", path.join(FIXTURES_DIR, "mock-acp-agent.mjs")];
+
+/**
+ * Smoke the generic ACP provider against a command. Defaults to the bundled
+ * mock ACP agent (binary-free); pass `--command "gemini --acp"` for a real one.
+ */
+async function smokeAcp(command: string[]): Promise<boolean> {
+  console.log(`\n${"=".repeat(50)}`);
+  console.log(`Testing: acp (${command.join(" ")})`);
+  console.log("=".repeat(50));
+
+  const provider = acpProvider({ id: "acp", command });
+  const issues: string[] = [];
+
+  try {
+    const modes = await provider.listModes!();
+    console.log(`  modes: ${modes.map((m) => m.id).join(", ") || "(none)"}`);
+
+    const session = await provider.createSession!({
+      onEvent: (e) => {
+        if (e.type === "assistant" && e.text.trim()) process.stdout.write(".");
+      },
+      onUserInputRequest: async () => ({ allow: true }),
+    });
+    const turn = await (await session.send("Say hello and read a file.")).result;
+    await session.close();
+
+    console.log(`\n  status: ${turn.status}`);
+    console.log(`  summary: ${turn.summary?.slice(0, 80)}`);
+    if (turn.status !== "completed") issues.push(`status ${turn.status}`);
+    if (session.state !== "closed") issues.push(`state ${session.state}`);
+  } catch (err) {
+    issues.push(err instanceof Error ? err.message : String(err));
+  }
+
+  if (issues.length > 0) {
+    console.log(`  FAIL: ${issues.join(", ")}`);
+    return false;
+  }
+  console.log("  PASS");
+  return true;
+}
+
+/**
+ * Per-provider smoke metadata — the extension point later phases plug into.
+ * Adding a provider's smoke leg means adding one entry here:
+ *  - `mock`        mock binary for one-shot `--mock` runs
+ *  - `mockSession` mock binary for the multi-turn session smoke (if any)
+ *  - `session`     provider exposes createSession → run the session leg
+ *  - `needsDaemon` real (non-mock) smoke skips-with-notice when the daemon/binary is absent
+ */
+interface SmokeSpec {
+  mock?: string;
+  mockSession?: string;
+  session?: boolean;
+  needsDaemon?: boolean;
+}
+
+const SMOKE_SPECS: Record<string, SmokeSpec> = {
+  claude: { mock: MOCK_COMMANDS["claude"], mockSession: MOCK_SESSION_COMMAND, session: true },
+  codex: { mock: MOCK_COMMANDS["codex"], session: true },
+  cursor: { mock: MOCK_COMMANDS["cursor"] },
+  opencode: { mock: MOCK_COMMANDS["opencode"], needsDaemon: true },
+  pi: { mock: MOCK_COMMANDS["pi"] },
+};
+// gemini is now ACP-backed — smoke it via `pnpm smoke acp --command "gemini --acp"`.
 
 async function testProvider(type: string, useMock: boolean) {
   console.log(`\n${"=".repeat(50)}`);
@@ -141,22 +207,26 @@ async function testProvider(type: string, useMock: boolean) {
 // Session smoke test (Claude-only, mock or real)
 // ---------------------------------------------------------------------------
 
-async function testSession(useMock: boolean) {
+async function testSession(providerType: string, useMock: boolean, mockSessionCmd: string | undefined) {
   console.log(`\n${"=".repeat(50)}`);
-  console.log(`Testing: createSession (claude${useMock ? ", mock" : ""})`);
+  console.log(`Testing: createSession (${providerType}${useMock ? ", mock" : ""})`);
   console.log("=".repeat(50));
 
-  const provider = getProvider("claude");
+  const provider = getProvider(providerType);
 
   if (!provider.createSession) {
     console.log("  SKIP — createSession not available on provider");
-    return;
+    return true;
+  }
+  if (useMock && !mockSessionCmd) {
+    console.log(`  SKIP — no mock session binary for "${providerType}"`);
+    return true;
   }
 
   const events: StreamEvent[] = [];
   const session = await provider.createSession({
     config: {
-      command: useMock ? MOCK_SESSION_COMMAND : undefined,
+      command: useMock ? mockSessionCmd : undefined,
       skipPermissions: true,
       maxTurns: 5,
       timeoutSec: 30,
@@ -696,9 +766,37 @@ function testParseAskUserQuestion(): boolean {
 async function main() {
   const args = process.argv.slice(2);
   const useMock = args.includes("--mock");
-  const providers = args.filter((a) => a !== "--mock");
-  const defaultProviders = ["claude", "codex", "gemini", "cursor", "opencode", "pi"];
-  const toTest = providers.length > 0 ? providers : defaultProviders;
+
+  // Parse `--config <path>`, `--command "<cmd>"`, and positional provider ids.
+  let configPath: string | null = null;
+  let acpCommand: string[] | null = null;
+  const positional: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "--mock") continue;
+    if (a === "--config") {
+      configPath = args[++i] ?? null;
+      continue;
+    }
+    if (a === "--command") {
+      const raw = args[++i] ?? "";
+      acpCommand = raw.trim().split(/\s+/).filter(Boolean);
+      continue;
+    }
+    positional.push(a);
+  }
+
+  // Load + register derived/ACP providers from a config file (BYOK gateways, etc).
+  let loadedIds: string[] = [];
+  if (configPath) {
+    const raw = JSON.parse(await readFile(configPath, "utf8")) as unknown;
+    const loaded = loadProvidersFromConfig(raw);
+    loadedIds = loaded.map((p) => p.type);
+    console.log(`Loaded ${loaded.length} provider(s) from ${configPath}: ${loadedIds.join(", ")}`);
+  }
+
+  const defaultProviders = [...Object.keys(SMOKE_SPECS), ...loadedIds];
+  const toTest = positional.length > 0 ? positional : defaultProviders;
 
   if (useMock) {
     console.log("Running in mock mode — using mock scripts instead of real binaries.");
@@ -707,8 +805,21 @@ async function main() {
   let passed = 0;
   let failed = 0;
 
+  // ACP leg — `smoke acp` (mock by default, or `--command "gemini --acp"`).
+  if (toTest.includes("acp")) {
+    try {
+      const ok = await smokeAcp(acpCommand ?? MOCK_ACP_AGENT);
+      if (ok) passed++;
+      else failed++;
+    } catch (err) {
+      console.error("\nFATAL for acp:", err);
+      failed++;
+    }
+  }
+
   // One-shot tests
   for (const type of toTest) {
+    if (type === "acp") continue; // handled above
     try {
       await testProvider(type, useMock);
       passed++;
@@ -718,18 +829,22 @@ async function main() {
     }
   }
 
-  // Session test (only for claude, or if explicitly requested)
-  const runSession = toTest.includes("claude") || providers.length === 0;
-  if (runSession) {
+  // Session smoke — for each provider in scope that advertises a session leg
+  for (const type of toTest) {
+    const spec = SMOKE_SPECS[type];
+    if (!spec?.session) continue;
     try {
-      const ok = await testSession(useMock);
+      const ok = await testSession(type, useMock, spec.mockSession);
       if (ok === false) failed++;
       else passed++;
     } catch (err) {
-      console.error("\nFATAL for createSession:", err);
+      console.error(`\nFATAL for ${type} createSession:`, err);
       failed++;
     }
+  }
 
+  // Claude-specific control-protocol + edge-case tests (mock only)
+  if (toTest.includes("claude")) {
     // Protocol tests (permissions, elicitation, hooks, cancel) — mock only
     try {
       const ok = await testSessionProtocol(useMock);

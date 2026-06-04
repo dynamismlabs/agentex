@@ -1,5 +1,21 @@
 // Functions
 export { getProvider, listProviders, registerProvider } from "./registry.js";
+export {
+  defineDerivedProvider,
+  loadProvidersFromConfig,
+  registerAcpFactory,
+  MalformedProviderConfigError,
+} from "./derived.js";
+export type { DerivedProviderConfig, AcpFactory } from "./derived.js";
+export { acpProvider } from "./providers/acp/index.js";
+export type { AcpProviderConfig } from "./providers/acp/index.js";
+export type { AcpTransformers } from "./providers/acp/session.js";
+export {
+  runHttpAgent,
+  httpAgentProvider,
+  httpAgentSessionCodec,
+} from "./providers/_shared/http-agent.js";
+export type { HttpAgentOptions } from "./providers/_shared/http-agent.js";
 export { renderTemplate } from "./utils/template.js";
 export { redactEnvForLogs } from "./utils/env.js";
 export { parseAskUserQuestion } from "./utils/ask-user-question.js";
@@ -93,6 +109,8 @@ export {
 export type {
   ProviderModule,
   ProviderCapabilities,
+  AgentMode,
+  ListModesOptions,
   ExecutionContext,
   ExecutionResult,
   ExecutionStatus,

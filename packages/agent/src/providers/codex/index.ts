@@ -4,6 +4,7 @@ import { createCodexSession } from "./session.js";
 import { codexSessionCodec } from "./codec.js";
 import { resolveAuthForProvider } from "../../utils/auth.js";
 import { codexTranscriptOps } from "./transcript.js";
+import { listCodexModes } from "./modes.js";
 
 export const codexProvider: ProviderModule = {
   type: "codex",
@@ -20,12 +21,14 @@ export const codexProvider: ProviderModule = {
     planMode: true,
     concurrentSend: true,
     cancelQueuedMessage: false,
+    modes: true,
   },
   execute: executeCodexProvider,
   createSession: (ctx: SessionContext): Promise<AgentSession> => createCodexSession(ctx),
   resolveAuth: (ctx) => resolveAuthForProvider("codex", ctx),
   sessionCodec: codexSessionCodec,
   transcript: codexTranscriptOps,
+  listModes: listCodexModes,
 };
 
 export {

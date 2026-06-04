@@ -44,21 +44,85 @@ console.log(result.raw);        // the final provider-native event, verbatim (es
 
 ## Built-in Providers
 
-| Provider   | CLI              | Description                                 |
-| ---------- | ---------------- | ------------------------------------------- |
-| `claude`   | `claude`         | Claude Code (Anthropic)                     |
-| `codex`    | `codex`          | Codex CLI (OpenAI)                          |
-| `gemini`   | `gemini`         | Gemini CLI (Google)                         |
-| `cursor`   | `agent`          | Cursor CLI agent                            |
-| `opencode` | `opencode`       | OpenCode                                    |
-| `pi`       | `pi`             | Pi CLI                                      |
-| `openclaw` | gateway HTTP     | OpenClaw HTTP-gateway agent                 |
-| `process`  | any executable   | Generic process executor (arbitrary binary) |
+Providers fall into three tiers:
 
-Provider capabilities (sessions, skills, workspaces, MCP, model discovery, quota probing, instructions, concurrent send, cancel queued messages) are declared on each module's `capabilities` field — check `provider.capabilities` to branch on what's supported. Skill-aware providers also report:
+- **Tier 1 — deep native:** `claude`, `codex`. Hand-built adapters over each CLI's richest protocol (Claude's stream-json, Codex's `app-server` JSON-RPC). Subscription-native, fullest feature set.
+- **Tier 2 — ACP:** `gemini`, `copilot`, plus any agent registered via [`acpProvider`](#custom--byok-providers) or `extends: "acp"` config. One shared, tested base over the open [Agent Client Protocol](https://agentclientprotocol.com) (JSON-RPC over stdio).
+- **Tier 3 — bespoke escape hatches:** `opencode` (HTTP/SSE daemon), `pi` (persistent RPC), `cursor` (one-shot), `openclaw` (HTTP gateway), `process` (any executable).
+
+| Provider   | Transport                              | Tier | Sessions  | Modes | Permissions |
+| ---------- | -------------------------------------- | ---- | --------- | ----- | ----------- |
+| `claude`   | `claude` CLI stream-json               | 1    | ✅ resume | —     | ✅          |
+| `codex`    | `codex app-server` JSON-RPC            | 1    | ✅ resume | ✅    | ✅          |
+| `gemini`   | `gemini --acp` (ACP)                   | 2    | ✅        | ✅    | ✅          |
+| `copilot`  | `copilot --acp` (ACP)                  | 2    | ✅        | ✅    | ✅          |
+| `opencode` | `opencode serve` HTTP + SSE            | 3    | ✅ resume | —     | —           |
+| `pi`       | persistent `pi --mode rpc`             | 3    | ✅ resume | —     | —           |
+| `cursor`   | `cursor-agent` stream-json (one-shot)  | 3    | —         | —     | —           |
+| `openclaw` | HTTP gateway                           | 3    | —         | —     | —           |
+| `process`  | any executable                         | 3    | —         | —     | —           |
+
+> `cursor` stays one-shot until `cursor-agent` ships an ACP mode; it can then move to Tier 2 via `extends: "acp"`.
+
+Capabilities (sessions, modes, skills, workspaces, MCP, model discovery, quota probing, instructions, concurrent send, cancel queued messages) are declared on each module's `capabilities` field — check `provider.capabilities` to branch on what's supported. ACP providers set `dynamicCapabilities: true` (their real capability set is negotiated at the ACP `initialize` handshake). Skill-aware providers also report:
 
 - `skillInventory` — `"provider-init"` for Claude's runtime inventory, `"local-discovery"` for Codex, or `"none"`.
 - `skillInvocation` — `"native-slash"` for Claude, `"expanded-prompt"` for Codex, `"configured-only"`, or `"unsupported"`.
+
+## Custom / BYOK providers
+
+Three ways to add providers without forking, all behind the same `getProvider` /
+`ProviderModule` surface. See [internal-docs/spec-provider-architecture.md](../../internal-docs/spec-provider-architecture.md)
+for the design.
+
+**Derived providers (config-extend).** Inherit a built-in with an env / command /
+model overlay — the canonical use is pointing Claude at an Anthropic-compatible
+gateway:
+
+```ts
+import { defineDerivedProvider, registerProvider, loadProvidersFromConfig } from "@agentex/agent";
+
+registerProvider(
+  defineDerivedProvider({
+    id: "zai",
+    extends: "claude",
+    env: { ANTHROPIC_BASE_URL: "https://api.z.ai/api/anthropic", ANTHROPIC_AUTH_TOKEN: "…" },
+    models: [{ id: "glm-5.1", name: "GLM 5.1" }],
+  }),
+);
+
+// …or load a whole map from config (also accepts Paseo's `agents.providers` nesting):
+loadProvidersFromConfig({
+  providers: {
+    zai: { extends: "claude", env: { ANTHROPIC_BASE_URL: "…" } },
+    "my-gemini": { extends: "acp", command: ["gemini", "--acp"] },
+  },
+});
+```
+
+**ACP agents.** Any agent speaking the [Agent Client Protocol](https://agentclientprotocol.com)
+is a few lines:
+
+```ts
+import { acpProvider, registerProvider } from "@agentex/agent";
+
+registerProvider(acpProvider({ id: "my-agent", command: ["my-agent", "--acp"] }));
+```
+
+`acpProvider` also accepts `transformers` (`modes` / `modeId`) to absorb a
+specific agent's quirks without forking the base.
+
+**Remote HTTP gateways.** For an "agent behind a URL", `httpAgentProvider` gives
+you gateway-URL resolution, session-key round-trip, `auth_required` mapping, and
+timeouts:
+
+```ts
+import { httpAgentProvider, registerProvider } from "@agentex/agent";
+
+registerProvider(
+  httpAgentProvider({ providerType: "my-gw", defaultBaseUrl: "http://localhost:3001", runPath: "/api/agent/run" }),
+);
+```
 
 ## Execution Context
 
@@ -198,7 +262,7 @@ Lifecycle events (via `onLifecycle`) report phases: `preparing`, `spawning`, `ru
 
 ### What each provider surfaces on stream events
 
-Verified live against `claude 2.1.116` and `codex-cli 0.122.0` (2026-04-21). Other providers emit stubs — see precedence table at the end of this section.
+Verified live against `claude 2.1.116` and `codex-cli 0.122.0` (2026-04-21). ACP providers (`gemini`, `copilot`) and the session-backed `opencode`/`pi` emit real, correlated events (assistant / thinking / tool_call / tool_result); `cursor` and `openclaw` still stub most IDs — see the precedence note at the end of this section.
 
 | Field on `StreamEvent` | Claude source                                      | Codex source                                     |
 | ---------------------- | -------------------------------------------------- | ------------------------------------------------ |
@@ -237,7 +301,7 @@ When in doubt, `raw` is the verbatim provider event — parse it yourself for an
 
 ### Other providers
 
-`cursor`, `gemini`, `opencode`, `pi`, `openclaw` emit the same `StreamEvent` shape but currently stub most IDs to `null`. Their `raw` field is populated; enrichment to match the Claude/Codex level of fidelity is tracked separately and has not been audited against live CLI output.
+`gemini` and `copilot` (ACP) and the session-backed `opencode` and `pi` emit real, correlated `StreamEvent`s — assistant text, thinking, and tool_call/tool_result with proper tool-call ids (ACP and Codex have no per-event/message ids, so those stay `null`). `cursor` and `openclaw` still emit the same `StreamEvent` shape with most ids stubbed to `null`; their `raw` field is populated. `cursor` will gain full fidelity when it moves to the ACP tier.
 
 ## Sessions (multi-turn)
 
