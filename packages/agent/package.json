@@ -1,6 +1,6 @@
 {
   "name": "@agentex/agent",
-  "version": "0.0.19",
+  "version": "0.0.20",
   "description": "Programmatic execution of AI coding agents (Claude Code, Codex, OpenClaw)",
   "repository": {
     "type": "git",
@@ -25,6 +25,7 @@
   ],
   "scripts": {
     "build": "tsc",
+    "prepack": "pnpm run build",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",

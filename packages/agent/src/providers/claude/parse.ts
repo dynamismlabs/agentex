@@ -264,19 +264,120 @@ export function parseClaudeStreamJson(stdout: string): ClaudeParsedResult {
 
 export function toStreamEvents(stdout: string): StreamEvent[] {
   const events: StreamEvent[] = [];
+  const partial: PartialStreamContext = { messageId: null };
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line) continue;
-    events.push(...parseStreamLine(line));
+    events.push(...parseStreamLine(line, partial));
   }
   return events;
 }
 
-export function parseStreamLine(line: string): StreamEvent[] {
+/**
+ * Cross-line context for `--include-partial-messages` streams. The owning
+ * message id arrives only on the `message_start` stream_event, so the caller
+ * owns one of these per stream and threads it through every `parseStreamLine`
+ * call — deltas are then stamped with the `messageId` of the message they
+ * belong to, matching the eventual consolidated `assistant` event so hosts can
+ * reconcile optimistic delta text against the durable event.
+ */
+export interface PartialStreamContext {
+  messageId: string | null;
+}
+
+/**
+ * Map a `stream_event` wrapper line into delta events.
+ *
+ * Emitted (when carrying text):
+ * - `content_block_delta` + `text_delta`     → `assistant_delta`
+ * - `content_block_delta` + `thinking_delta` → `thinking_delta` (best-effort —
+ *   on recent Claude versions these deltas are the only place thinking prose
+ *   appears, since the consolidated thinking block is withheld)
+ *
+ * Known scaffolding (`message_start`/`message_stop` — which also maintain the
+ * cross-line message id — `content_block_start`/`stop`, `message_delta`,
+ * `signature_delta`, `ping`) is consumed silently rather than spamming one
+ * `unknown` event per token. Genuinely unrecognized subtypes still surface as
+ * `unknown` for forward-compat.
+ */
+function parsePartialStreamEvent(
+  wrapper: Record<string, unknown>,
+  partial: PartialStreamContext | undefined,
+): StreamEvent[] {
+  const ev =
+    typeof wrapper["event"] === "object" && wrapper["event"] !== null && !Array.isArray(wrapper["event"])
+      ? (wrapper["event"] as Record<string, unknown>)
+      : null;
+  if (!ev) return [];
+  const evType = asString(ev["type"], "");
+
+  if (evType === "message_start") {
+    if (partial) {
+      const msg =
+        typeof ev["message"] === "object" && ev["message"] !== null
+          ? (ev["message"] as Record<string, unknown>)
+          : null;
+      partial.messageId = msg && typeof msg["id"] === "string" ? msg["id"] : null;
+    }
+    return [];
+  }
+  if (evType === "message_stop") {
+    if (partial) partial.messageId = null;
+    return [];
+  }
+
+  if (evType === "content_block_delta") {
+    const delta =
+      typeof ev["delta"] === "object" && ev["delta"] !== null
+        ? (ev["delta"] as Record<string, unknown>)
+        : null;
+    const blockIndex = typeof ev["index"] === "number" ? ev["index"] : 0;
+    const base = baseFieldsFromEvent(wrapper, partial?.messageId ?? null);
+
+    if (delta?.["type"] === "text_delta" && typeof delta["text"] === "string" && delta["text"]) {
+      return [{ type: "assistant_delta", text: delta["text"], blockIndex, ...base }];
+    }
+    if (
+      delta?.["type"] === "thinking_delta" &&
+      typeof delta["thinking"] === "string" &&
+      delta["thinking"]
+    ) {
+      return [{ type: "thinking_delta", text: delta["thinking"], blockIndex, ...base }];
+    }
+    // signature_delta, empty deltas, input_json_delta, … — scaffolding.
+    return [];
+  }
+
+  if (
+    evType === "content_block_start" ||
+    evType === "content_block_stop" ||
+    evType === "message_delta" ||
+    evType === "ping"
+  ) {
+    return [];
+  }
+
+  // Unrecognized stream_event subtype — forward-compat escape hatch.
+  return [{
+    type: "unknown",
+    subtype: `stream_event:${evType || "unknown"}`,
+    ...baseFieldsFromEvent(wrapper, partial?.messageId ?? null),
+  }];
+}
+
+export function parseStreamLine(line: string, partial?: PartialStreamContext): StreamEvent[] {
   const event = parseJson(line);
   if (!event) return [];
 
   const type = asString(event["type"], "");
+
+  // `--include-partial-messages` wraps raw API streaming events in
+  // `stream_event` lines. Only present when the caller opted in via
+  // `config.includePartialMessages` — with the flag off this branch never
+  // fires and parsing is bit-identical to previous behavior.
+  if (type === "stream_event") {
+    return parsePartialStreamEvent(event, partial);
+  }
 
   if (type === "system" && asString(event["subtype"], "") === "init") {
     return [{

@@ -1077,6 +1077,18 @@ export class CodexSessionImpl implements AgentSession {
   private dispatchEvent(event: StreamEvent): void {
     const cb = this.ctx.onEvent;
     if (!cb) return;
+    // Codex emits no native per-event uuid. Where the v2 components exist,
+    // synthesize a documented, replay-stable identity so hosts get an
+    // idempotency key for live captures:
+    //   codex:<threadId>:<turnId>:<itemId>:<eventType>
+    // This is an UPSERT key, not a uniqueness guarantee — repeated updates to
+    // the same item (e.g. streaming text on one agent_message) intentionally
+    // share an id; the last write wins. It also does NOT match the transcript
+    // reader's `codex:<sessionId>:<offset>` scheme (different wire vocabulary
+    // on disk) — cross-shape dedup remains a host concern.
+    if (!event.eventId && this._threadId && event.turnId && event.messageId) {
+      event.eventId = `codex:${this._threadId}:${event.turnId}:${event.messageId}:${event.type}`;
+    }
     // Enrich synchronously (in stream order) so tool_result events carry the
     // name of the tool_call they answer.
     const enriched = this._trackToolName(event);
