@@ -5,11 +5,12 @@ import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { runChildProcess, deriveErrorCode } from "../../utils/process.js";
 import { detectAuth } from "../../utils/auth.js";
 import { buildSkillsDir, cleanupSkillsDir } from "../../utils/skills.js";
+import { claudeFeatureArgs, cleanupMcpConfig, stageMcpConfig } from "./mcp.js";
 import { createToolNameTracker } from "../../utils/tool-names.js";
 import { uuidv7 } from "../../utils/uuid.js";
 import { prepareWorkspace } from "../../utils/workspace.js";
 import type { PreparedWorkspace } from "../../utils/workspace.js";
-import { parseClaudeStreamJson, parseStreamLine, isClaudeUnknownSessionError, isClaudeAuthRequired, CLAUDE_LOGIN_COMMAND } from "./parse.js";
+import { parseClaudeStreamJson, parseStreamLine, isClaudeUnknownSessionError, isClaudeAuthRequired, CLAUDE_LOGIN_COMMAND, type PartialStreamContext } from "./parse.js";
 
 export async function executeClaudeProvider(ctx: ExecutionContext): Promise<ExecutionResult> {
   const runId = ctx.runId ?? uuidv7();
@@ -73,6 +74,14 @@ export async function executeClaudeProvider(ctx: ExecutionContext): Promise<Exec
     }
   }
 
+  // 3.5 Stage MCP config — attached via `--mcp-config <file>` (mode 0600),
+  // never argv: http server headers can carry bearer tokens and argv is
+  // world-readable via `ps`.
+  let mcpConfigPath: string | null = null;
+  if (config.mcpServers && config.mcpServers.length > 0) {
+    mcpConfigPath = await stageMcpConfig(config.mcpServers);
+  }
+
   // 4. Build args
   const buildArgs = (resumeSessionId: string | null): string[] => {
     const args = [...resolvedBinary.prefixArgs, "--print", "-", "--output-format", "stream-json", "--verbose"];
@@ -88,11 +97,8 @@ export async function executeClaudeProvider(ctx: ExecutionContext): Promise<Exec
     if (config.maxTurns && config.maxTurns > 0) args.push("--max-turns", String(config.maxTurns));
     if (config.instructionsFile) args.push("--append-system-prompt-file", config.instructionsFile);
     if (skillsDir) args.push("--add-dir", skillsDir);
-    if (config.mcpServers) {
-      for (const mcp of config.mcpServers) {
-        args.push("--mcp-server", mcp.name, "--", mcp.command, ...(mcp.args ?? []));
-      }
-    }
+    args.push(...claudeFeatureArgs(config, mcpConfigPath));
+    // extraArgs stay LAST so hosts can override any generated flag.
     if (config.extraArgs) args.push(...config.extraArgs);
     return args;
   };
@@ -117,6 +123,9 @@ export async function executeClaudeProvider(ctx: ExecutionContext): Promise<Exec
     // Correlates tool_call → tool_result so emitted tool_result events carry
     // toolName. One tracker per attempt (a retry restarts the stream).
     const trackToolName = createToolNameTracker();
+    // Tracks the owning message id across --include-partial-messages stream
+    // lines so deltas reconcile with their consolidated assistant event.
+    const partialCtx: PartialStreamContext = { messageId: null };
 
     ctx.onLifecycle?.({ phase: "spawning" });
     const proc = await runChildProcess({
@@ -148,7 +157,7 @@ export async function executeClaudeProvider(ctx: ExecutionContext): Promise<Exec
           for (const line of lines) {
             const trimmed = line.trim();
             if (!trimmed) continue;
-            for (const event of parseStreamLine(trimmed)) {
+            for (const event of parseStreamLine(trimmed, partialCtx)) {
               try { await ctx.onEvent(trackToolName(event)); } catch { /* swallow */ }
             }
           }
@@ -266,9 +275,10 @@ export async function executeClaudeProvider(ctx: ExecutionContext): Promise<Exec
       workspace,
     };
   } finally {
-    // 10. Clean up skills dir
+    // 10. Clean up staged dirs/files
     if (skillsDir) {
       await cleanupSkillsDir(skillsDir);
     }
+    await cleanupMcpConfig(mcpConfigPath);
   }
 }

@@ -465,3 +465,75 @@ describe("readCodexCwd", () => {
     expect(await readCodexCwd(path.join(dir, "missing.jsonl"))).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Replay-stable synthetic eventId (codex:<sessionId>:<lineStartOffset>)
+// ---------------------------------------------------------------------------
+
+describe("readCodexTranscript eventId", () => {
+  let home: string;
+
+  beforeEach(async () => {
+    home = await makeTempCodexHome();
+  });
+  afterEach(async () => {
+    await rm(home, { recursive: true, force: true });
+  });
+
+  it("yields deterministic ids embedding the rollout session id + line offset", async () => {
+    const sessionId = "11111111-2222-3333-4444-555555555555";
+    const file = await placeRollout(home, {
+      year: "2026",
+      month: "05",
+      day: "08",
+      ts: "2026-05-08T22-01-59",
+      sessionId,
+      lines: [SESSION_META_LINE, EVENT_MSG_LINE, RESPONSE_ITEM_LINE],
+    });
+
+    const readAll = async () => {
+      const out: Array<{ eventId: string | null; offset: number }> = [];
+      for await (const y of readCodexTranscript({ filePath: file })) {
+        out.push({ eventId: y.event.eventId, offset: y.offset });
+      }
+      return out;
+    };
+
+    const first = await readAll();
+    expect(first.length).toBe(3);
+    // First line starts at byte 0; each id embeds the session id + START offset.
+    expect(first[0]!.eventId).toBe(`codex:${sessionId}:0`);
+    for (const y of first) {
+      expect(y.eventId).toMatch(new RegExp(`^codex:${sessionId}:\\d+$`));
+    }
+    // Replay-stable: a second full read yields identical ids.
+    expect(await readAll()).toEqual(first);
+  });
+
+  it("a resumed read assigns the same id to the same line", async () => {
+    const sessionId = "11111111-2222-3333-4444-555555555555";
+    const file = await placeRollout(home, {
+      year: "2026",
+      month: "05",
+      day: "08",
+      ts: "2026-05-08T22-01-59",
+      sessionId,
+      lines: [SESSION_META_LINE, EVENT_MSG_LINE],
+    });
+
+    const all: Array<{ eventId: string | null; offset: number }> = [];
+    for await (const y of readCodexTranscript({ filePath: file })) {
+      all.push({ eventId: y.event.eventId, offset: y.offset });
+    }
+    // Resume from after line 1 — line 2's identity must match the full read.
+    const resumed: string[] = [];
+    for await (const y of readCodexTranscript({ filePath: file, fromOffset: all[0]!.offset })) {
+      resumed.push(y.event.eventId!);
+    }
+    expect(resumed).toEqual([all[1]!.eventId]);
+  });
+
+  it("parseCodexLine standalone leaves eventId null (no file context)", () => {
+    expect(parseCodexLine(SESSION_META_LINE)?.eventId).toBeNull();
+  });
+});

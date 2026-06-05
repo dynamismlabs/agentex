@@ -158,15 +158,32 @@ interface ProviderConfig {
   skipPermissions?: boolean;
   skillDirs?: string[];
   instructionsFile?: string;
-  mcpServers?: McpServerConfig[];
-  extraArgs?: string[];
+  mcpServers?: McpServerConfig[];   // stdio | http | sse — staged as a 0600 file, passed via --mcp-config
+  strictMcpConfig?: boolean;        // claude: --strict-mcp-config — MCP surface is exactly what you attach
+  allowedTools?: string[];          // claude: --allowed-tools (patterns verbatim; codex ignores)
+  disallowedTools?: string[];       // claude: --disallowed-tools (deny wins; codex ignores)
+  includePartialMessages?: boolean; // claude: emit assistant_delta/thinking_delta typewriter events
+  extraArgs?: string[];             // always appended LAST — hosts can override any generated flag
   search?: boolean;
   sandbox?: boolean;
   thinking?: string;
   mode?: string;                    // cursor: --mode <mode>; not for plan mode
+  modeId?: string;                  // select an operating mode from listModes() (codex/ACP)
   planMode?: boolean;               // read-only "plan" mode (claude/codex)
   workspace?: { strategy: "worktree"; baseBranch?: string; branchName?: string };
 }
+```
+
+MCP servers attach via a generated config file, never argv — http `headers` can
+carry bearer tokens and argv is world-readable via `ps`:
+
+```typescript
+config.mcpServers = [
+  { name: "files", command: "node", args: ["mcp-files.js"] },              // stdio (default)
+  { name: "orchestrator", type: "http", url: "http://localhost:4100/mcp",  // http/sse
+    headers: { Authorization: "Bearer …" } },
+];
+config.strictMcpConfig = true; // nothing else leaks in
 ```
 
 ## Execution Result
@@ -239,7 +256,7 @@ interface BaseStreamEventFields {
   providerType: string;               // "claude" | "codex" | "cursor" | ...
   sessionId: string | null;           // Stable session/thread ID across turns
   messageId: string | null;           // Provider-native message ID
-  eventId: string | null;             // Per-event-line ID (Claude only — Codex = null)
+  eventId: string | null;             // Per-event ID (Claude: native uuid; Codex: synthetic — see below)
   turnId: string | null;              // Native turn ID (Codex v2 app-server only; NDJSON & Claude = null)
   parentToolCallId: string | null;    // Sub-agent origin — same namespace as tool_call.toolCallId (Claude only)
   raw: Record<string, unknown>;       // Original provider event verbatim
@@ -250,7 +267,9 @@ Variants:
 
 - `system` — Session init (`subtype`, `model`, `cwd`, `tools`, `permissionMode`). Claude init events also include `slashCommands?: string[]` and `skills?: string[]` when Claude Code reports them.
 - `assistant` — Text output from the agent (`text`)
+- `assistant_delta` — Incremental assistant text for typewriter UIs (`text`, `blockIndex`). Opt-in via `config.includePartialMessages` (claude). Purely additive: the consolidated `assistant` event still fires when the block completes, with a matching `messageId` so you can reconcile optimistic delta text against the durable event.
 - `thinking` — Agent's internal reasoning (`text`)
+- `thinking_delta` — Incremental thinking text (`text`, `blockIndex`), same flag, best-effort. On current Claude versions these deltas are the *only* place thinking prose appears — the consolidated thinking block is withheld (signature-only). Treat as advisory UI sugar.
 - `tool_call` — Agent invoked a tool (`toolCallId: string | null`, `name`, `input`)
 - `unknown` — Fallback for unrecognized wire events (`subtype` = the provider's `type` field). Forward-compat access to new CLI events via `raw` without a library update.
 - `tool_result` — Tool returned a result (`toolCallId: string | null`, `toolName: string | null`, `content`, `isError`, `exitCode: number | null`). `toolName` mirrors the matching `tool_call.name` (correlated for you), so you don't need your own `toolCallId → name` cache; null when no preceding `tool_call` was seen on the stream.
@@ -268,7 +287,7 @@ Verified live against `claude 2.1.116` and `codex-cli 0.122.0` (2026-04-21). ACP
 | ---------------------- | -------------------------------------------------- | ------------------------------------------------ |
 | `sessionId`            | `session_id` (UUID, stable across turns + resume)  | `thread_id` (UUIDv7, emitted once on `thread.started`, tracked across lines) |
 | `messageId`            | `message.id` (Anthropic API message, e.g. `msg_*`) | v2 app-server: globally unique (`msg_*`, `rs_*`, `call_*`). NDJSON: `item_N` — **turn-local, not globally unique** |
-| `eventId`              | Top-level per-line `uuid`                          | **null** — Codex doesn't emit a per-event ID     |
+| `eventId`              | Top-level per-line `uuid`                          | Synthetic where derivable (see below); else null |
 | `turnId`               | **null** — Claude doesn't model turns              | v2 app-server: native UUIDv7 from `params.turnId`. NDJSON: **null** — no turn id in legacy format |
 | `parentToolCallId`     | `parent_tool_use_id` (set for sub-agent messages)  | **null** — not emitted                           |
 | Tool correlation       | `tool_use.id` (`toolu_*`) ↔ `tool_result.tool_use_id`; the library stamps `tool_result.toolName` from the matching call | `item.id` reappears on the same item's `item.completed`; `toolName` set directly from the item type |
@@ -295,7 +314,11 @@ On `ExecutionResult`:
 
 For Claude, `eventId` is a safe unique key for a per-event row. `messageId` is a safe key for "one logical assistant message" — multiple event lines can share it when the message contains both thinking and tool_use blocks.
 
-For Codex, `item.id` values like `item_0`, `item_1` **reset every turn** (including on `codex exec resume`). Do not use them as unique keys on their own. Use `(sessionId, turn_index, messageId)` or mint your own UUID at insert time. There is no `eventId` — Codex doesn't emit one.
+For Codex, `item.id` values like `item_0`, `item_1` **reset every turn** (including on `codex exec resume`). Do not use them as unique keys on their own. Codex emits no native per-event uuid, so agentex synthesizes documented, replay-stable identities where the components exist:
+
+- **Live v2 session events:** `eventId = codex:<threadId>:<turnId>:<itemId>:<eventType>` when thread + turn + item are all known; null otherwise. This is an **upsert key**, not a uniqueness guarantee — repeated updates to the same item (e.g. streaming text) intentionally share an id; the last write wins.
+- **Transcript reads** (`transcript.read()` / `readCodexTranscript`): `eventId = codex:<rolloutSessionId>:<lineStartByteOffset>` — deterministic across reads of the same file, so transcript replays are idempotent.
+- The two schemes intentionally **do not match each other** (the live and on-disk wire vocabularies differ — `command_execution` vs `exec_command`). Cross-shape dedup between a live capture and a transcript replay remains a host concern.
 
 When in doubt, `raw` is the verbatim provider event — parse it yourself for anything the normalized fields don't cover.
 
