@@ -1,6 +1,28 @@
 # Changelog
 
+## 0.0.20 — MCP attachment fix, session controls, typewriter deltas, Codex event identity
+
+Driven by consumer feedback from an embedding host wiring an orchestrator onto agentex sessions. All additive — except the MCP fix, which replaces behavior that never worked in any published version.
+
+### Fixed
+
+- **`config.mcpServers` actually attaches MCP servers now.** It previously emitted `--mcp-server <name> -- <command>…` — a flag that does not exist in Claude Code 2.x — so any run/session setting the field died instantly with `error: unknown option '--mcp-server'` (verified against claude 2.1.165; the field has never worked in any published version, so there is no behavior to migrate from). The config is now staged as a **mode-0600 JSON file** in a temp dir and passed via the real `--mcp-config <path>`, cleaned up with the run/session (including spawn-failure paths). Secrets never touch argv — http `headers` (bearer tokens) live only in the 0600 file; argv is world-readable via `ps`.
+
+### Added
+
+- **`McpServerConfig` http/sse transports.** Now a discriminated union: the stdio shape (`{name, command, args?, env?}`) is unchanged (type defaults to `"stdio"`), plus `{name, type: "http"|"sse", url, headers?}` for hosts embedding a local MCP server.
+- **`ProviderConfig.strictMcpConfig`** → `--strict-mcp-config`: the session's MCP surface is *exactly* what you attach — a stray `.mcp.json` in cwd or user-scope servers can't leak into a product-controlled session. Works with or without `mcpServers` (strict + none = no MCP at all).
+- **`ProviderConfig.allowedTools` / `disallowedTools`** → `--allowed-tools` / `--disallowed-tools` (comma-joined; patterns like `Bash(rm *)` and `mcp__server__*` pass through verbatim; deny wins). Silently ignored by codex — documented on the fields (its mechanism is permission profiles, not argv).
+- **`assistant_delta` + `thinking_delta` stream events (typewriter).** Opt-in via `config.includePartialMessages` (claude `--include-partial-messages`). Purely additive: the consolidated `assistant` event still fires when the block completes; `messageId` on deltas matches it so hosts can reconcile optimistic delta text against the durable event; the wrapper's per-line `uuid` becomes `eventId`. Flag off ⇒ parsing is bit-identical to 0.0.19. `thinking_delta` is best-effort — on current Claude versions it is the **only** place thinking prose appears (the consolidated thinking block is withheld, signature-only). Validated live against claude 2.1.165.
+- **Stable Codex event identity.** Transcript reads stamp a replay-stable synthetic `eventId` — `codex:<rolloutSessionId>:<lineStartByteOffset>` — giving hosts an idempotency key for transcript replays. Live v2 session events get `codex:<threadId>:<turnId>:<itemId>:<eventType>` where the components exist (an **upsert** key: repeated updates to one item intentionally share an id). The live and on-disk schemes deliberately differ (different wire vocabularies — `command_execution` vs `exec_command`); cross-shape dedup remains a host concern.
+
+### Notes for consumers
+
+- `extraArgs` remain appended **after** all generated flags (the host-override invariant), so existing `--mcp-config` / `--disallowed-tools` workarounds keep working — and can now be deleted in favor of the typed fields.
+
 ## 0.0.19 — Three-tier provider architecture: ACP tier, config-extend, Codex parity, live sessions
+
+> **Note for npm consumers:** 0.0.18 was never published — its changes ship in this release alongside 0.0.19's. The loudest of them: `ProviderConfig.timeoutSec` now also arms a **per-send deadline on sessions** (previously it applied only to `execute()`). Hosts that set `timeoutSec` for exec-style runs will see session turns interrupted at that deadline too — see the 0.0.18 section below.
 
 A three-tier provider architecture (deep-native · ACP · bespoke). The ACP tier and gemini's migration are validated end-to-end against real agents. See [`internal-docs/spec-provider-architecture.md`](../../internal-docs/spec-provider-architecture.md). Nothing here breaks the existing public surface.
 
