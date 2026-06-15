@@ -693,6 +693,33 @@ await removeSkills(skillDirs, { location: "workspace", cwd: process.cwd() });
 
 Channels and locations follow the emerging `.agents/skills/` + `.claude/skills/` convention — see the `SkillRuntime`, `SkillLocation`, and `SkillChannel` types.
 
+### Install Instruction Files
+
+`installInstructions` is the instruction-file twin of `installSkills`: it drops an orientation brief into the right per-runtime file(s), merging into a **managed region** so any content the user wrote outside the markers is preserved.
+
+```typescript
+import { installInstructions, removeInstructions } from "@agentex/agent";
+
+// Workspace (repo-root) install — the common case.
+// Writes the brief into {cwd}/CLAUDE.md and {cwd}/AGENTS.md (deduped by filename).
+await installInstructions(brief, {
+  location: "workspace",      // or "global"
+  cwd: process.cwd(),         // required for workspace installs
+  includeNativeFiles: false,  // true also writes Gemini's native GEMINI.md
+  managed: true,              // wrap in markers + merge (default); false overwrites the file
+  managedTag: "agentex",      // marker tag → <!-- agentex:managed:start -->
+});
+
+// Global install — per-runtime home files (~/.claude/CLAUDE.md, ~/.codex/AGENTS.md,
+// ~/.gemini/GEMINI.md, ~/.config/opencode/AGENTS.md, ~/.pi/AGENTS.md).
+await installInstructions(brief, { location: "global" });
+
+// Remove only the managed region; user-authored content (and user-owned files) survive.
+await removeInstructions({ location: "workspace", cwd: process.cwd() });
+```
+
+Every runtime except Claude reads `AGENTS.md`; Claude reads `CLAUDE.md`. Gemini reads `GEMINI.md` by default (only reads `AGENTS.md` when configured), so it gets a native escape hatch via `includeNativeFiles`. Re-installing unchanged content is idempotent (reported as `skipped`). Use `resolveInstructionTargets(opts)` to see which files *would* be written without touching disk, and `upsertManagedBlock` / `stripManagedBlock` for the low-level merge.
+
 ### Discover Slash-Invokable Skills
 
 Use `discoverSkillCommands(...)` to parse local `SKILL.md` files into UI-ready descriptors. It reads frontmatter fields such as `description`, `argument-hint`, and `user-invocable`; if no description is present, it falls back to the first non-empty body paragraph.
@@ -901,6 +928,10 @@ registerProvider(myProvider);
 - `renderTemplate(template, ctx)` — `{{var}}` interpolation.
 - `redactEnvForLogs(env)` — redact sensitive values before logging.
 - `resolveInstructions(path?)` — read an instructions file, or `null` if no path.
+- `installInstructions(content, opts?)` / `removeInstructions(opts?)` — write/remove a managed instruction brief across per-runtime files (`CLAUDE.md` / `AGENTS.md` / native `GEMINI.md`), workspace or global.
+- `resolveInstructionTargets(opts?)` — list which instruction files would be written, without touching disk.
+- `upsertManagedBlock(existing, content, opts?)` / `stripManagedBlock(existing, opts?)` — low-level managed-region merge/strip (preserves content outside the markers).
+- `getDefaultRuntimeHome(runtime, homeDir?)` — pass `homeDir` to resolve against a sandboxed base instead of `os.homedir()`.
 - `parseAskUserQuestion(req)` — extract structured question/option data from a `UserInputRequest`.
 - `parseExitPlanMode(req)` — extract the proposed plan text from an `ExitPlanMode` permission request (Claude plan mode).
 

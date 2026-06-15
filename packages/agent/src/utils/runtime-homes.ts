@@ -16,15 +16,15 @@ const ENV_VAR_MAP: Record<SkillRuntime, string | null> = {
 };
 
 /**
- * Default global home directory path for each runtime.
+ * Home directory subpath (relative to the home base) for each runtime.
  */
-const DEFAULT_HOME_MAP: Record<SkillRuntime, string> = {
-  claude: path.join(os.homedir(), ".claude"),
-  codex: path.join(os.homedir(), ".codex"),
-  gemini: path.join(os.homedir(), ".gemini"),
-  cursor: path.join(os.homedir(), ".cursor"),
-  opencode: path.join(os.homedir(), ".config", "opencode"),
-  pi: path.join(os.homedir(), ".pi"),
+const HOME_SUBPATH_MAP: Record<SkillRuntime, string[]> = {
+  claude: [".claude"],
+  codex: [".codex"],
+  gemini: [".gemini"],
+  cursor: [".cursor"],
+  opencode: [".config", "opencode"],
+  pi: [".pi"],
 };
 
 /**
@@ -39,7 +39,11 @@ export function getRuntimeHomeEnvVar(runtime: SkillRuntime): string | null {
 
 /**
  * Returns the default global home directory path for the given runtime.
+ *
+ * Pass `homeDir` to resolve against a base other than the user's real home
+ * directory (useful for sandboxed installs and tests). Defaults to os.homedir().
  */
-export function getDefaultRuntimeHome(runtime: SkillRuntime): string {
-  return DEFAULT_HOME_MAP[runtime] ?? path.join(os.homedir(), `.${runtime}`);
+export function getDefaultRuntimeHome(runtime: SkillRuntime, homeDir: string = os.homedir()): string {
+  const subpath = HOME_SUBPATH_MAP[runtime] ?? [`.${runtime}`];
+  return path.join(homeDir, ...subpath);
 }

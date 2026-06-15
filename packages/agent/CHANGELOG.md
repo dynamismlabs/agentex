@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.0.21 — cross-runtime instruction files (`installInstructions`)
+
+Additive. The instruction-file twin of `installSkills`: install an orientation brief into the right per-runtime file(s), with a managed-region merge that preserves user edits.
+
+### Added
+
+- **`installInstructions(content, opts?)`.** Writes a brief into per-runtime instruction files. Every runtime except Claude reads `AGENTS.md`; Claude reads `CLAUDE.md`. Two locations mirror `installSkills`:
+  - `workspace` ({cwd}/) — deduped by filename, so the default writes `CLAUDE.md` + `AGENTS.md` once each. `includeNativeFiles: true` also writes Gemini's native `GEMINI.md` (Gemini reads `AGENTS.md` only when configured).
+  - `global` — per-runtime home files (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md`, `~/.config/opencode/AGENTS.md`, `~/.pi/AGENTS.md`). Cursor is omitted — its global config is app User Rules, not a file. There is no universal `~/AGENTS.md`, so global is inherently per-runtime.
+- **Managed-region merge.** `content` is wrapped in `<!-- agentex:managed:start hash=… -->` / `…:end` markers; re-install replaces only that region and preserves everything the user wrote outside it. The embedded content hash makes re-installs byte-idempotent (reported `skipped`). `managed: false` overwrites the whole file (escape hatch for fully-owned files). Files are written mode 0644.
+- **`removeInstructions(opts?)`.** Strips the managed region (deletes the file if nothing else remains); never touches user-owned files that have no managed region.
+- **`resolveInstructionTargets(opts?)`.** Lists which files *would* be written, without touching disk.
+- **`upsertManagedBlock` / `stripManagedBlock`.** The low-level merge/strip primitives, exported for hosts with custom layouts.
+- **`getDefaultRuntimeHome(runtime, homeDir?)`** now accepts a base-directory override (defaults to `os.homedir()`) for sandboxed and `global` installs.
+
 ## 0.0.20 — MCP attachment fix, session controls, typewriter deltas, Codex event identity
 
 Driven by consumer feedback from an embedding host wiring an orchestrator onto agentex sessions. All additive — except the MCP fix, which replaces behavior that never worked in any published version.

@@ -21,7 +21,26 @@ export { redactEnvForLogs } from "./utils/env.js";
 export { parseAskUserQuestion } from "./utils/ask-user-question.js";
 export { parseExitPlanMode } from "./utils/exit-plan-mode.js";
 export { aggregateUsage } from "./types.js";
-export { resolveInstructions } from "./utils/instructions.js";
+export {
+  resolveInstructions,
+  installInstructions,
+  removeInstructions,
+  resolveInstructionTargets,
+  upsertManagedBlock,
+  stripManagedBlock,
+} from "./utils/instructions.js";
+export type {
+  InstallInstructionsOptions,
+  InstructionStatus,
+  InstructionInstallEntry,
+  InstructionInstallResult,
+  InstructionTarget,
+  RemoveInstructionsOptions,
+  InstructionRemoveStatus,
+  InstructionRemoveEntry,
+  InstructionRemoveResult,
+  ManagedBlockOptions,
+} from "./utils/instructions.js";
 export { getRuntimeHomeEnvVar, getDefaultRuntimeHome } from "./utils/runtime-homes.js";
 export { findBinary, ensureCommandResolvable, clearBinaryCache } from "./utils/binary.js";
 export type { ResolvedBinary } from "./utils/binary.js";
