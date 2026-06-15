@@ -15,8 +15,9 @@ import type {
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { buildSkillsDir, cleanupSkillsDir } from "../../utils/skills.js";
+import { claudeFeatureArgs, cleanupMcpConfig, stageMcpConfig } from "./mcp.js";
 import { createToolNameTracker } from "../../utils/tool-names.js";
-import { parseStreamLine, classifyClaudeAuthFromResult, CLAUDE_LOGIN_COMMAND } from "./parse.js";
+import { parseStreamLine, classifyClaudeAuthFromResult, CLAUDE_LOGIN_COMMAND, type PartialStreamContext } from "./parse.js";
 
 /** A pending `send()` whose `result` Promise hasn't settled yet. */
 interface PendingResult {
@@ -131,6 +132,14 @@ export async function createClaudeSession(ctx: SessionContext): Promise<AgentSes
     } catch { /* non-fatal */ }
   }
 
+  // Stage MCP config (if any) — attached via `--mcp-config <file>` (mode 0600),
+  // never argv: http server headers can carry bearer tokens and argv is
+  // world-readable via `ps`. Cleaned up in close().
+  let mcpConfigPath: string | null = null;
+  if (config.mcpServers && config.mcpServers.length > 0) {
+    mcpConfigPath = await stageMcpConfig(config.mcpServers);
+  }
+
   // Build CLI args for SDK/headless mode
   const args = [
     ...resolved.prefixArgs,
@@ -169,11 +178,8 @@ export async function createClaudeSession(ctx: SessionContext): Promise<AgentSes
   if (config.maxTurns && config.maxTurns > 0) args.push("--max-turns", String(config.maxTurns));
   if (config.instructionsFile) args.push("--append-system-prompt-file", config.instructionsFile);
   if (skillsDir) args.push("--add-dir", skillsDir);
-  if (config.mcpServers) {
-    for (const mcp of config.mcpServers) {
-      args.push("--mcp-server", mcp.name, "--", mcp.command, ...(mcp.args ?? []));
-    }
-  }
+  args.push(...claudeFeatureArgs(config, mcpConfigPath));
+  // extraArgs stay LAST so hosts can override any generated flag.
   if (config.extraArgs) args.push(...config.extraArgs);
 
   // Spawn persistent process
@@ -184,10 +190,14 @@ export async function createClaudeSession(ctx: SessionContext): Promise<AgentSes
   });
 
   if (!proc.stdin || !proc.stdout || !proc.stderr) {
+    // Don't leak staged dirs/files when the spawn fails before the session
+    // object (whose close() owns cleanup) exists.
+    if (skillsDir) await cleanupSkillsDir(skillsDir);
+    await cleanupMcpConfig(mcpConfigPath);
     throw new Error("Failed to open stdio on Claude process");
   }
 
-  const session = new ClaudeSessionImpl(proc, ctx, skillsDir);
+  const session = new ClaudeSessionImpl(proc, ctx, skillsDir, mcpConfigPath);
 
   // Wire up AbortSignal to close the session
   if (ctx.signal) {
@@ -228,6 +238,9 @@ export class ClaudeSessionImpl implements AgentSession {
   /** Shared promise so concurrent / repeated `drain()` calls coalesce. */
   private _drainPromise: Promise<void> | null = null;
 
+  /** Tracks the owning message id across --include-partial-messages lines. */
+  private readonly _partialCtx: PartialStreamContext = { messageId: null };
+
   /** Stamps `tool_result.toolName` by correlating with prior `tool_call`s. */
   private readonly _trackToolName = createToolNameTracker();
 
@@ -260,6 +273,7 @@ export class ClaudeSessionImpl implements AgentSession {
     private readonly proc: ChildProcess,
     private readonly ctx: SessionContext,
     private readonly skillsDir: string | null,
+    private readonly mcpConfigPath: string | null = null,
   ) {
     // Wire up stdout line-by-line parsing
     proc.stdout!.setEncoding("utf-8");
@@ -498,10 +512,11 @@ export class ClaudeSessionImpl implements AgentSession {
       this.proc.kill("SIGTERM");
     });
 
-    // Clean up skills dir
+    // Clean up staged dirs/files
     if (this.skillsDir) {
       await cleanupSkillsDir(this.skillsDir);
     }
+    await cleanupMcpConfig(this.mcpConfigPath);
   }
 
   // -------------------------------------------------------------------------
@@ -908,7 +923,7 @@ export class ClaudeSessionImpl implements AgentSession {
 
     // Forward as StreamEvent via the serial dispatch chain
     if (this.ctx.onEvent) {
-      for (const event of parseStreamLine(rawLine)) {
+      for (const event of parseStreamLine(rawLine, this._partialCtx)) {
         this.dispatchEvent(event);
       }
     }

@@ -254,6 +254,34 @@ export interface ProviderConfig {
   skillDirs?: string[];
   instructionsFile?: string;
   mcpServers?: McpServerConfig[];
+  /**
+   * Only use MCP servers from `mcpServers` (claude: `--strict-mcp-config`),
+   * ignoring ambient configs (a stray `.mcp.json` in cwd, user-scope servers).
+   * Hosts embedding sessions should set this so the session's MCP surface is
+   * exactly what they attach. Works without `mcpServers` too — strict with no
+   * config blocks all ambient MCP.
+   */
+  strictMcpConfig?: boolean;
+  /**
+   * Tool names/patterns to pre-approve (claude: `--allowed-tools`). Patterns
+   * like `Bash(rm *)` and `mcp__server__*` pass through verbatim. Silently
+   * ignored by providers without argv tool filtering (codex — its mechanism is
+   * permission profiles).
+   */
+  allowedTools?: string[];
+  /**
+   * Tool names/patterns to deny (claude: `--disallowed-tools`). Deny wins over
+   * allow. Silently ignored by providers without argv tool filtering (codex).
+   */
+  disallowedTools?: string[];
+  /**
+   * Emit incremental assistant text as `assistant_delta` stream events
+   * (claude: `--include-partial-messages`). Purely additive — the consolidated
+   * `assistant` event still fires when the block completes, so consumers that
+   * ignore deltas see identical behavior. Off by default; providers without
+   * delta support ignore the flag.
+   */
+  includePartialMessages?: boolean;
   extraArgs?: string[];
   search?: boolean;
   sandbox?: boolean;
@@ -559,6 +587,33 @@ export type StreamEvent =
       skills?: string[];
     } & BaseStreamEventFields)
   | ({ type: "assistant"; text: string } & BaseStreamEventFields)
+  | ({
+      /**
+       * Incremental assistant text (typewriter). Only emitted when
+       * `config.includePartialMessages` is set, and purely additive: the
+       * consolidated `assistant` event still fires when the block completes,
+       * with `messageId` matching these deltas so hosts can reconcile
+       * optimistic delta text against the durable event.
+       */
+      type: "assistant_delta";
+      /** Incremental text chunk — append-only within (messageId, blockIndex). */
+      text: string;
+      /** Content block index within the message, for multi-block replies. */
+      blockIndex: number;
+    } & BaseStreamEventFields)
+  | ({
+      /**
+       * Incremental thinking text (best-effort, same `includePartialMessages`
+       * flag). NOTE: on recent Claude versions the consolidated `thinking`
+       * block is withheld (signature-only), so these deltas can be the ONLY
+       * place thinking prose appears. Don't depend on them being present or
+       * complete — treat as advisory UI sugar.
+       */
+      type: "thinking_delta";
+      text: string;
+      /** Content block index within the message. */
+      blockIndex: number;
+    } & BaseStreamEventFields)
   | ({ type: "thinking"; text: string } & BaseStreamEventFields)
   | ({
       type: "tool_call";
@@ -795,12 +850,31 @@ export interface ProviderModel {
 }
 
 // MCP server configuration
-export interface McpServerConfig {
-  name: string;
-  command: string;
-  args?: string[];
-  env?: Record<string, string>;
-}
+/**
+ * An MCP server to attach to the agent. Two transports:
+ * - **stdio** (default when `type` is omitted): the agent spawns `command`.
+ * - **http / sse**: the agent connects to `url`; `headers` may carry auth
+ *   tokens — agentex stages the config as a 0600 temp file and passes
+ *   `--mcp-config <path>`, never inline argv (argv is world-readable via `ps`).
+ *
+ * Honored by the claude provider. Codex has no MCP wiring yet
+ * (`capabilities.mcp` is `false` there); the field is ignored.
+ */
+export type McpServerConfig =
+  | {
+      name: string;
+      /** stdio transport — the default when `type` is omitted. */
+      type?: "stdio";
+      command: string;
+      args?: string[];
+      env?: Record<string, string>;
+    }
+  | {
+      name: string;
+      type: "http" | "sse";
+      url: string;
+      headers?: Record<string, string>;
+    };
 
 // ---------------------------------------------------------------------------
 // Multi-turn session types

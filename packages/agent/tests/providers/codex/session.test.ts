@@ -714,6 +714,61 @@ describe("CodexSession — permission requests", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Live synthetic eventId (codex:<thread>:<turn>:<item>:<type>)
+// ---------------------------------------------------------------------------
+
+describe("CodexSession — live event identity", () => {
+  it("synthesizes a composite eventId for v2 events when thread+turn+item exist", async () => {
+    const events: StreamEvent[] = [];
+    const { proc } = makeRpcProc({
+      initialize: () => ({}),
+      "thread/start": () => ({ thread: { id: "thr_1" } }),
+    });
+    const session = new CodexSessionImpl(proc, { onEvent: (e) => events.push(e) }, "/tmp", "m", null);
+    await session.handshake();
+
+    const stdout = (proc as unknown as { stdout: EventEmitter }).stdout;
+    stdout.emit(
+      "data",
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: "item/completed",
+        params: { turnId: "turn_1", item: { id: "item_3", type: "agentMessage", text: "hi" } },
+      }) + "\n",
+    );
+    await new Promise((r) => setTimeout(r, 10));
+
+    const ev = events.find((e) => e.type === "assistant");
+    expect(ev?.eventId).toBe("codex:thr_1:turn_1:item_3:assistant");
+  });
+
+  it("leaves eventId null when turnId is missing (no fabricated identity)", async () => {
+    const events: StreamEvent[] = [];
+    const { proc } = makeRpcProc({
+      initialize: () => ({}),
+      "thread/start": () => ({ thread: { id: "thr_1" } }),
+    });
+    const session = new CodexSessionImpl(proc, { onEvent: (e) => events.push(e) }, "/tmp", "m", null);
+    await session.handshake();
+
+    const stdout = (proc as unknown as { stdout: EventEmitter }).stdout;
+    stdout.emit(
+      "data",
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: "item/completed",
+        params: { item: { id: "item_9", type: "agentMessage", text: "hi" } },
+      }) + "\n",
+    );
+    await new Promise((r) => setTimeout(r, 10));
+
+    const ev = events.find((e) => e.type === "assistant");
+    expect(ev).toBeDefined();
+    expect(ev?.eventId).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Collaboration mode selection (config.modeId)
 // ---------------------------------------------------------------------------
 

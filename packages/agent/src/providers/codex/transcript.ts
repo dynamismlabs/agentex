@@ -256,6 +256,20 @@ export interface CodexTranscriptLine {
    * {@link raw} directly.
    */
   payload: Record<string, unknown> | null;
+  /**
+   * Replay-stable synthetic identity, set by {@link readCodexTranscript}:
+   * `codex:<rolloutSessionId>:<lineStartByteOffset>`. Codex emits no native
+   * per-event uuid, so this is the idempotency key hosts use to dedup
+   * transcript replays — deterministic across reads of the same file.
+   *
+   * `null` when a line is parsed standalone via {@link parseCodexLine} (no
+   * file/offset context). NOTE: live app-server events use a different
+   * synthetic scheme (`codex:<threadId>:<turnId>:<itemId>:<eventType>`) over a
+   * different wire vocabulary (`command_execution` vs `exec_command`), so ids
+   * do NOT match across the live and on-disk readers — cross-shape dedup
+   * remains a host concern.
+   */
+  eventId: string | null;
 }
 
 export interface ReadCodexTranscriptOptions {
@@ -304,9 +318,11 @@ export async function* readCodexTranscript(
   stream.on("error", () => {});
   const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
 
+  const fileIdentity = rolloutIdentityFromPath(filePath);
   let pos = fromOffset;
   try {
     for await (const line of rl) {
+      const lineStart = pos;
       pos += Buffer.byteLength(line, "utf8") + 1;
 
       const trimmed = line.trim();
@@ -314,6 +330,11 @@ export async function* readCodexTranscript(
 
       const parsed = parseCodexLine(trimmed);
       if (!parsed) continue;
+
+      // Replay-stable synthetic identity: (rollout identity, line start offset).
+      // Codex emits no native per-event uuid, so this is the idempotency key
+      // hosts use to dedup transcript replays. Deterministic across reads.
+      parsed.eventId = `codex:${fileIdentity}:${lineStart}`;
 
       yield { event: parsed, offset: pos };
     }
@@ -352,7 +373,18 @@ export function parseCodexLine(line: string): CodexTranscriptLine | null {
     payload = rawPayload as Record<string, unknown>;
   }
 
-  return { raw, type, timestamp, payload };
+  return { raw, type, timestamp, payload, eventId: null };
+}
+
+// Rollout filenames are `rollout-<TIMESTAMP>-<sessionId>.jsonl`; the session id
+// is the trailing UUID. Fall back to the bare basename when it doesn't match
+// (still deterministic for the same file).
+const ROLLOUT_UUID_RE =
+  /-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
+
+function rolloutIdentityFromPath(filePath: string): string {
+  const m = path.basename(filePath).match(ROLLOUT_UUID_RE);
+  return m ? m[1]! : path.basename(filePath, ".jsonl");
 }
 
 async function pathExists(filePath: string): Promise<boolean> {
