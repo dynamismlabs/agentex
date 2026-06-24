@@ -294,6 +294,7 @@ export function httpAgentProvider(opts: HttpAgentOptions): ProviderModule {
       planMode: false,
       concurrentSend: false,
       cancelQueuedMessage: false,
+      stopTask: false,
       modes: false,
     },
     execute: (ctx) => runHttpAgent(opts, ctx),

@@ -17,6 +17,7 @@ export const opencodeProvider: ProviderModule = {
     planMode: false,
     concurrentSend: false,
     cancelQueuedMessage: false,
+    stopTask: false,
     modes: false,
   },
   // One-shot `opencode run` for execute(); live HTTP/SSE sessions via the

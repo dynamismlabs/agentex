@@ -16,6 +16,7 @@ export const cursorProvider: ProviderModule = {
     planMode: false,
     concurrentSend: false,
     cancelQueuedMessage: false,
+    stopTask: false,
     modes: false,
   },
   execute: executeCursorProvider,

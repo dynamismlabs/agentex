@@ -185,6 +185,7 @@ export function acpProvider(config: AcpProviderConfig): ProviderModule {
       planMode: false,
       concurrentSend: false,
       cancelQueuedMessage: false,
+      stopTask: false,
       modes: true,
       // Real capability set is negotiated at the ACP initialize handshake.
       dynamicCapabilities: true,

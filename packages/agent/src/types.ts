@@ -53,6 +53,17 @@ export interface ProviderCapabilities {
    */
   cancelQueuedMessage: boolean;
   /**
+   * Descriptive: `session.stopTask(taskId)` can stop a single in-flight
+   * background task (a backgrounded shell, a running async subagent) without
+   * disturbing the session or its other tasks. When `false`, `stopTask()` is
+   * still callable but always returns `{ stopped: false }`.
+   *
+   * Currently `true` only for the Claude provider, whose CLI exposes a
+   * `stop_task` control request the harness fulfills by killing the owning
+   * process — the model is not involved.
+   */
+  stopTask: boolean;
+  /**
    * Provider exposes selectable operating modes via `listModes()` — e.g. Codex
    * collaboration modes, Copilot's allow-all/agent/plan. When `false`,
    * `config.modeId` is ignored and `listModes` is absent.
@@ -968,6 +979,23 @@ export interface CancelResult {
   cancelled: boolean;
 }
 
+/** Outcome of a `stopTask(taskId)` call. */
+export interface StopTaskResult {
+  /**
+   * `true` only when the provider has a per-task stop control and the CLI
+   * acknowledged the request without error. `false` when:
+   *   - the provider doesn't support per-task stop (`capabilities.stopTask === false`)
+   *   - the session is already closed
+   *   - the `taskId` is unknown to the CLI, or the task had already ended
+   *
+   * The terminal status the task settles into is intentionally NOT returned
+   * here — the CLI's stop acknowledgement carries no payload. It arrives
+   * asynchronously on the event stream as the task's next `task_updated` /
+   * `task_notification`.
+   */
+  stopped: boolean;
+}
+
 /** Per-call options for `AgentSession.send()`. */
 export interface SendOptions {
   /**
@@ -1028,6 +1056,18 @@ export interface AgentSession {
    * or when the UUID is unknown.
    */
   cancel(uuid: string): Promise<CancelResult>;
+
+  /**
+   * Stop a single in-flight background task (a backgrounded shell, a running
+   * async subagent) without disturbing the session or its other tasks.
+   *
+   * Always callable. Returns `{ stopped: false }` when the provider has no
+   * per-task stop control (`capabilities.stopTask === false`), the session is
+   * closed, or the `taskId` is unknown / already ended. The kill is performed
+   * by the underlying CLI/harness (which owns the process); the model is not
+   * involved and learns of the stop via the task's next lifecycle event.
+   */
+  stopTask(taskId: string): Promise<StopTaskResult>;
 
   /** Gracefully interrupt the current turn. */
   interrupt(): Promise<void>;

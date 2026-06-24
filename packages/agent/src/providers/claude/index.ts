@@ -32,6 +32,7 @@ export const claudeProvider: ProviderModule = {
     planMode: true,
     concurrentSend: true,
     cancelQueuedMessage: true,
+    stopTask: true,
     modes: false,
   },
   execute: executeClaudeProvider,

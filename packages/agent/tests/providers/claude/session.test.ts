@@ -518,6 +518,70 @@ describe("ClaudeSession — cancel", () => {
 });
 
 // ---------------------------------------------------------------------------
+// stopTask() — control_request {subtype:'stop_task', task_id}
+// ---------------------------------------------------------------------------
+
+describe("ClaudeSession — stopTask", () => {
+  it("builds a stop_task control_request with the given task_id", async () => {
+    const { proc, stdinWrites } = makeFakeProc();
+    const session = new ClaudeSessionImpl(proc, {}, null);
+
+    const taskId = "task_abc123";
+    const stopP = session.stopTask(taskId);
+
+    const lastWrite = stdinWrites.at(-1)!;
+    const parsed = JSON.parse(lastWrite);
+    expect(parsed.type).toBe("control_request");
+    expect(parsed.request.subtype).toBe("stop_task");
+    expect(parsed.request.task_id).toBe(taskId);
+    expect(typeof parsed.request_id).toBe("string");
+    expect(parsed.request_id.length).toBeGreaterThan(0);
+
+    // The CLI acknowledges a successful stop with an EMPTY success response.
+    (session as unknown as { handleLine: (l: string) => void }).handleLine(
+      JSON.stringify({
+        type: "control_response",
+        response: { request_id: parsed.request_id, subtype: "success", response: {} },
+      }),
+    );
+
+    expect(await stopP).toEqual({ stopped: true });
+  });
+
+  it("returns {stopped: false} when the CLI replies with an error (unknown/ended task_id)", async () => {
+    const { proc, stdinWrites } = makeFakeProc();
+    const session = new ClaudeSessionImpl(proc, {}, null);
+
+    const stopP = session.stopTask("task_unknown");
+    const parsed = JSON.parse(stdinWrites.at(-1)!);
+
+    (session as unknown as { handleLine: (l: string) => void }).handleLine(
+      JSON.stringify({
+        type: "control_response",
+        response: {
+          request_id: parsed.request_id,
+          subtype: "error",
+          error: "No task with id task_unknown",
+        },
+      }),
+    );
+
+    expect(await stopP).toEqual({ stopped: false });
+  });
+
+  it("returns {stopped: false} when the session is already closed (no write)", async () => {
+    const { proc, stdinWrites } = makeFakeProc();
+    const session = new ClaudeSessionImpl(proc, {}, null);
+    proc.emit("exit", 0, null);
+
+    const before = stdinWrites.length;
+    expect(await session.stopTask("task_abc")).toEqual({ stopped: false });
+    // No control_request should have been written for a closed session.
+    expect(stdinWrites.length).toBe(before);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Per-send timeout / abort (SendOptions)
 // ---------------------------------------------------------------------------
 

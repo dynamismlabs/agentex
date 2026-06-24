@@ -8,6 +8,7 @@ import type {
   SendOptions,
   SessionContext,
   SessionState,
+  StopTaskResult,
   StreamEvent,
   TurnResult,
   UserInputResponse,
@@ -456,6 +457,38 @@ export class ClaudeSessionImpl implements AgentSession {
     } catch {
       // Process exited / error before response — treat as "not cancelled."
       return { cancelled: false };
+    }
+  }
+
+  async stopTask(taskId: string): Promise<StopTaskResult> {
+    if (this._state === "closed") return { stopped: false };
+
+    const requestId = randomUUID();
+    const responsePromise = new Promise<Record<string, unknown>>((resolve, reject) => {
+      this._pendingControlResponses.set(requestId, { resolve, reject });
+    });
+
+    const stopMsg = ndjsonLine({
+      type: "control_request",
+      request_id: requestId,
+      request: {
+        subtype: "stop_task",
+        task_id: taskId,
+      },
+    });
+
+    this.proc.stdin!.write(stopMsg);
+
+    try {
+      // The CLI acknowledges a stop with an EMPTY success control_response (no
+      // payload), so success alone means "accepted". An unknown / already-ended
+      // task_id — or a CLI build without `stop_task` — comes back as an error
+      // control_response, which rejects here. Either way we settle to a boolean;
+      // the task's terminal status arrives later as a task_updated/notification.
+      await responsePromise;
+      return { stopped: true };
+    } catch {
+      return { stopped: false };
     }
   }
 

@@ -5,6 +5,7 @@ import * as os from "node:os";
 import type {
   AgentSession,
   CancelResult,
+  StopTaskResult,
   SendHandle,
   SendOptions,
   SessionContext,
@@ -302,6 +303,11 @@ export class PiSession implements AgentSession {
 
   async cancel(_uuid: string): Promise<CancelResult> {
     return { cancelled: false };
+  }
+
+  async stopTask(_taskId: string): Promise<StopTaskResult> {
+    // pi has no per-task stop control; capabilities.stopTask is false.
+    return { stopped: false };
   }
 
   async interrupt(): Promise<void> {

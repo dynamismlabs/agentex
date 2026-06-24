@@ -3,6 +3,7 @@ import {
   parseClaudeStreamJson,
   toStreamEvents,
   parseStreamLine,
+  getClaudeTaskDetails,
   isClaudeUnknownSessionError,
   isClaudeAuthRequired,
   isClaudeMaxTurns,
@@ -21,6 +22,7 @@ import {
   CLAUDE_MALFORMED_OUTPUT,
   CLAUDE_TOOL_USE_OUTPUT,
 } from "../../fixtures/stream-json-samples.js";
+import type { StreamEvent } from "../../../src/types.js";
 
 describe("parseClaudeStreamJson", () => {
   it("extracts all fields from success output", () => {
@@ -525,5 +527,158 @@ describe("parseClaudeStreamJson errorCode", () => {
   it("still detects max_turns when both signals could fire", () => {
     const result = parseClaudeStreamJson(CLAUDE_MAX_TURNS_OUTPUT);
     expect(result.errorCode).toBe("max_turns");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getClaudeTaskDetails — typed view of background-task lifecycle events.
+// Wire shapes captured from Claude CLI 2.1.187. These arrive as type:"system"
+// on the wire but surface as type:"unknown" through agentex's escape hatch, so
+// every test drives the real path: parseStreamLine -> unknown event -> accessor.
+// ---------------------------------------------------------------------------
+
+describe("getClaudeTaskDetails", () => {
+  function parseOne(wire: Record<string, unknown>): StreamEvent {
+    const events = parseStreamLine(JSON.stringify(wire));
+    expect(events).toHaveLength(1);
+    return events[0]!;
+  }
+
+  it("surfaces task events as `unknown`, not `system`", () => {
+    const ev = parseOne({ type: "system", subtype: "task_started", task_id: "t1", description: "x" });
+    // The discriminator gotcha consumers must know: NOT type:"system".
+    expect(ev.type).toBe("unknown");
+  });
+
+  it("decodes a task_started local_bash event", () => {
+    const ev = parseOne({
+      type: "system",
+      subtype: "task_started",
+      task_id: "task_abc",
+      tool_use_id: "toolu_1",
+      description: "next dev",
+      task_type: "local_bash",
+    });
+    expect(getClaudeTaskDetails(ev)).toEqual({
+      phase: "started",
+      taskId: "task_abc",
+      toolUseId: "toolu_1",
+      taskType: "local_bash",
+      subagentType: null,
+      workflowName: null,
+      description: "next dev",
+      status: null,
+      usage: null,
+      outputFile: null,
+      summary: null,
+      endTime: null,
+    });
+  });
+
+  it("decodes task_started subagent fields (subagent_type, workflow_name); task_type stays optional", () => {
+    const ev = parseOne({
+      type: "system",
+      subtype: "task_started",
+      task_id: "task_sub",
+      tool_use_id: "toolu_2",
+      description: "research the codebase",
+      subagent_type: "Explore",
+      workflow_name: "review-changes",
+    });
+    const t = getClaudeTaskDetails(ev)!;
+    expect(t.phase).toBe("started");
+    expect(t.subagentType).toBe("Explore");
+    expect(t.workflowName).toBe("review-changes");
+    expect(t.taskType).toBeNull();
+    expect(t.status).toBeNull();
+  });
+
+  it("decodes task_progress usage (snake_case -> camelCase)", () => {
+    const ev = parseOne({
+      type: "system",
+      subtype: "task_progress",
+      task_id: "task_abc",
+      tool_use_id: "toolu_1",
+      description: "running tests",
+      usage: { total_tokens: 1200, tool_uses: 3, duration_ms: 4500 },
+    });
+    const t = getClaudeTaskDetails(ev)!;
+    expect(t.phase).toBe("progress");
+    expect(t.description).toBe("running tests");
+    expect(t.usage).toEqual({ totalTokens: 1200, toolUses: 3, durationMs: 4500 });
+    expect(t.status).toBeNull();
+  });
+
+  it("reads status/description/end_time out of task_updated's `patch` envelope", () => {
+    const ev = parseOne({
+      type: "system",
+      subtype: "task_updated",
+      task_id: "task_abc",
+      patch: { status: "killed", description: "stopped by user", end_time: 1719200000000 },
+    });
+    const t = getClaudeTaskDetails(ev)!;
+    expect(t.phase).toBe("updated");
+    expect(t.taskId).toBe("task_abc");
+    expect(t.status).toBe("killed");
+    expect(t.description).toBe("stopped by user");
+    expect(t.endTime).toBe(1719200000000);
+    expect(t.toolUseId).toBeNull(); // task_updated carries no tool_use_id
+  });
+
+  it("decodes a terminal task_notification (3-value status enum)", () => {
+    const ev = parseOne({
+      type: "system",
+      subtype: "task_notification",
+      task_id: "task_abc",
+      tool_use_id: "toolu_1",
+      status: "stopped",
+      output_file: "/tmp/task_abc.output",
+      summary: "Server stopped",
+      usage: { total_tokens: 50, tool_uses: 0, duration_ms: 12000 },
+    });
+    const t = getClaudeTaskDetails(ev)!;
+    expect(t.phase).toBe("notification");
+    expect(t.status).toBe("stopped");
+    expect(t.outputFile).toBe("/tmp/task_abc.output");
+    expect(t.summary).toBe("Server stopped");
+    expect(t.usage).toEqual({ totalTokens: 50, toolUses: 0, durationMs: 12000 });
+  });
+
+  it("maps an out-of-range status to null (forward-compat; raw keeps the truth)", () => {
+    const ev = parseOne({
+      type: "system",
+      subtype: "task_updated",
+      task_id: "task_abc",
+      patch: { status: "some_future_status" },
+    });
+    expect(getClaudeTaskDetails(ev)!.status).toBeNull();
+  });
+
+  it("returns null for a non-task unknown event", () => {
+    const ev = parseOne({ type: "system", subtype: "compact_boundary" });
+    expect(ev.type).toBe("unknown");
+    expect(getClaudeTaskDetails(ev)).toBeNull();
+  });
+
+  it("returns null for a non-`unknown` event type (e.g. system init)", () => {
+    const ev = parseOne({ type: "system", subtype: "init", session_id: "s", model: "claude" });
+    expect(ev.type).toBe("system");
+    expect(getClaudeTaskDetails(ev)).toBeNull();
+  });
+
+  it("returns null for a task-shaped event from a different provider", () => {
+    const foreign: StreamEvent = {
+      type: "unknown",
+      subtype: "system",
+      timestamp: new Date().toISOString(),
+      providerType: "codex",
+      sessionId: null,
+      messageId: null,
+      eventId: null,
+      turnId: null,
+      parentToolCallId: null,
+      raw: { type: "system", subtype: "task_started", task_id: "x" },
+    };
+    expect(getClaudeTaskDetails(foreign)).toBeNull();
   });
 });

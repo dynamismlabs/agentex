@@ -1,6 +1,6 @@
 {
   "name": "@agentex/agent",
-  "version": "0.0.21",
+  "version": "0.0.22",
   "description": "Programmatic execution of AI coding agents (Claude Code, Codex, OpenClaw)",
   "repository": {
     "type": "git",

@@ -16,6 +16,7 @@ describe("ProviderCapabilities", () => {
       expect(typeof provider.capabilities.planMode).toBe("boolean");
       expect(typeof provider.capabilities.concurrentSend).toBe("boolean");
       expect(typeof provider.capabilities.cancelQueuedMessage).toBe("boolean");
+      expect(typeof provider.capabilities.stopTask).toBe("boolean");
       expect(typeof provider.capabilities.modes).toBe("boolean");
     }
   });
@@ -35,6 +36,7 @@ describe("ProviderCapabilities", () => {
       planMode: true,
       concurrentSend: true,
       cancelQueuedMessage: true,
+      stopTask: true,
       modes: false,
     });
   });
@@ -53,6 +55,16 @@ describe("ProviderCapabilities", () => {
       const caps = getProvider(name).capabilities;
       const expected = name === "claude";
       expect(caps.cancelQueuedMessage).toBe(expected);
+    }
+  });
+
+  it("only claude supports per-task stop", () => {
+    // Claude's CLI exposes a `stop_task` control request; no other provider
+    // does, so stopTask() is a documented no-op ({stopped:false}) elsewhere.
+    for (const name of listProviders()) {
+      const caps = getProvider(name).capabilities;
+      const expected = name === "claude";
+      expect(caps.stopTask).toBe(expected);
     }
   });
 

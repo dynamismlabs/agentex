@@ -21,6 +21,7 @@ export const codexProvider: ProviderModule = {
     planMode: true,
     concurrentSend: true,
     cancelQueuedMessage: false,
+    stopTask: false,
     modes: true,
   },
   execute: executeCodexProvider,

@@ -64,7 +64,7 @@ Providers fall into three tiers:
 
 > `cursor` stays one-shot until `cursor-agent` ships an ACP mode; it can then move to Tier 2 via `extends: "acp"`.
 
-Capabilities (sessions, modes, skills, workspaces, MCP, model discovery, quota probing, instructions, concurrent send, cancel queued messages) are declared on each module's `capabilities` field — check `provider.capabilities` to branch on what's supported. ACP providers set `dynamicCapabilities: true` (their real capability set is negotiated at the ACP `initialize` handshake). Skill-aware providers also report:
+Capabilities (sessions, modes, skills, workspaces, MCP, model discovery, quota probing, instructions, concurrent send, cancel queued messages, stop task) are declared on each module's `capabilities` field — check `provider.capabilities` to branch on what's supported. ACP providers set `dynamicCapabilities: true` (their real capability set is negotiated at the ACP `initialize` handshake). Skill-aware providers also report:
 
 - `skillInventory` — `"provider-init"` for Claude's runtime inventory, `"local-discovery"` for Codex, or `"none"`.
 - `skillInvocation` — `"native-slash"` for Claude, `"expanded-prompt"` for Codex, `"configured-only"`, or `"unsupported"`.
@@ -415,6 +415,31 @@ else console.log("Too late — the agent already drained it.");
 `cancel()` is always callable. For providers with `cancelQueuedMessage = false` (Codex, and any session-less provider), it returns `{ cancelled: false }` immediately. For Claude, it sends a `cancel_async_message` control_request to the CLI, which runs `dequeueAllMatching` against its internal queue and reports whether the message was found.
 
 > **Race note.** Cancellation is best-effort. If the CLI drained the message mid-turn (Claude's `query.ts` between-tool-batches drain) before your `cancel()` request landed, you get `{ cancelled: false }` — and the message will be visible to the model as a `<system-reminder>`. The library does not unmount what the model has already seen.
+
+### Stopping one background task
+
+A turn can spawn work that outlives it — a backgrounded shell (`next dev`, a test watcher) or an async subagent. For providers with `capabilities.stopTask = true` (Claude only), `session.stopTask(taskId)` kills **one** such task without disturbing the session or its other tasks. This is distinct from `interrupt()` (ends the whole active turn, and can't reach a detached background process) and `close()` (kills the entire session).
+
+```typescript
+// taskId comes from a background-task lifecycle event (see below).
+const { stopped } = await session.stopTask(taskId);
+if (stopped) console.log("Asked the CLI to kill that task.");
+```
+
+`stopTask()` is always callable. For providers with `stopTask = false` it returns `{ stopped: false }` immediately. For Claude it sends a `stop_task` control_request; the **CLI/harness** owns the process and performs the kill (the model is never in the loop). The acknowledgement carries no payload, so `stopped: true` just means "accepted" — an unknown or already-ended `taskId` (or a closed session) yields `{ stopped: false }`. The task's terminal status arrives asynchronously on the event stream as its next `task_updated` / `task_notification`.
+
+Background-task lifecycle events (`task_started`, `task_progress`, `task_updated`, `task_notification`) reach you as `type: "unknown"` StreamEvents (Claude emits them as `system` subtypes; only `system`+`init` gets its own typed variant, so the rest fall through the forward-compat escape hatch with the payload on `raw`). Use `getClaudeTaskDetails(event)` to decode one into typed fields — `{ phase, taskId, taskType, status, usage, … }` — or `null` if it isn't a task event. It's a stateless per-event decode, not a reducer: `status` reflects only the event in hand (and `task_updated` is a sparse `patch`), so collapsing a task's events into one current state over its lifetime is the consumer's job.
+
+```typescript
+import { getClaudeTaskDetails } from "@agentex/agent";
+
+createSession({
+  onEvent(event) {
+    const task = getClaudeTaskDetails(event);
+    if (task?.phase === "started") console.log("background task:", task.taskId, task.description);
+  },
+});
+```
 
 ### Graceful shutdown with `drain()`
 

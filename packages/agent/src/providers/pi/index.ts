@@ -17,6 +17,7 @@ export const piProvider: ProviderModule = {
     planMode: false,
     concurrentSend: false,
     cancelQueuedMessage: false,
+    stopTask: false,
     modes: false,
   },
   // One-shot `pi --mode rpc` for execute(); a persistent `pi --mode rpc` process

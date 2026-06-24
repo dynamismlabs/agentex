@@ -642,6 +642,143 @@ export function getClaudeUnknownDetails(
   };
 }
 
+/**
+ * Status values across Claude's two task-status fields:
+ * `task_notification.status` (`completed` | `failed` | `stopped`) and
+ * `task_updated.patch.status` (`pending` | `running` | `completed` | `failed`
+ * | `killed` | `paused`). Surfaced per-event as-is.
+ */
+export type ClaudeTaskStatus =
+  | "pending"
+  | "running"
+  | "paused"
+  | "completed"
+  | "failed"
+  | "killed"
+  | "stopped";
+
+/** Token / activity usage carried on `task_progress` and `task_notification`. */
+export interface ClaudeTaskUsage {
+  totalTokens: number | null;
+  toolUses: number | null;
+  durationMs: number | null;
+}
+
+/**
+ * Typed view of one Claude background-task lifecycle event. Fields not present
+ * on a given `phase` are `null` (e.g. `status` is null on `started`/`progress`;
+ * `outputFile`/`summary` exist only on `notification`).
+ */
+export interface ClaudeTaskDetails {
+  phase: "started" | "progress" | "updated" | "notification";
+  taskId: string;
+  /** Links back to the launching `tool_call` (Task/Bash). Absent on `updated`. */
+  toolUseId: string | null;
+  /** e.g. "local_bash" | a subagent type — optional on the wire. */
+  taskType: string | null;
+  /** Subagent type for Task-tool subagents (`started`/`progress`). */
+  subagentType: string | null;
+  /** Workflow name for workflow tasks (`started`). */
+  workflowName: string | null;
+  description: string | null;
+  /**
+   * This event's status, read from wherever the CLI placed it
+   * (`task_notification.status` or `task_updated.patch.status`). Null on
+   * `started`/`progress`, which carry no status.
+   */
+  status: ClaudeTaskStatus | null;
+  usage: ClaudeTaskUsage | null;
+  /** Path to the task's transcript/output file (`notification`). */
+  outputFile: string | null;
+  /** Final summary text (`notification`). */
+  summary: string | null;
+  /** Completion timestamp from `task_updated.patch.end_time`, when present. */
+  endTime: number | null;
+}
+
+const CLAUDE_TASK_PHASES: Record<string, ClaudeTaskDetails["phase"]> = {
+  task_started: "started",
+  task_progress: "progress",
+  task_updated: "updated",
+  task_notification: "notification",
+};
+
+const CLAUDE_TASK_STATUSES = new Set<string>([
+  "pending",
+  "running",
+  "paused",
+  "completed",
+  "failed",
+  "killed",
+  "stopped",
+]);
+
+function asClaudeTaskStatus(value: unknown): ClaudeTaskStatus | null {
+  return typeof value === "string" && CLAUDE_TASK_STATUSES.has(value)
+    ? (value as ClaudeTaskStatus)
+    : null;
+}
+
+function taskUsageFromRaw(value: unknown): ClaudeTaskUsage | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const u = value as Record<string, unknown>;
+  return {
+    totalTokens: asNullableNumber(u["total_tokens"]),
+    toolUses: asNullableNumber(u["tool_uses"]),
+    durationMs: asNullableNumber(u["duration_ms"]),
+  };
+}
+
+/**
+ * Decode a Claude background-task lifecycle event into typed fields.
+ *
+ * Claude emits `task_started` / `task_progress` / `task_updated` /
+ * `task_notification` as `type:"system"` on the wire; agentex surfaces those as
+ * `type:"unknown"` (the forward-compat escape hatch — only `system`+`init` gets
+ * its own typed variant), with the payload preserved on `event.raw`. This
+ * accessor reads that payload into named fields, returning `null` for any event
+ * that isn't a Claude task lifecycle event. The full payload always remains on
+ * `event.raw` as the backstop, so fields agentex doesn't model yet stay
+ * reachable.
+ *
+ * This is a stateless, per-event decode — NOT a reducer. `status` reflects only
+ * the event in hand (and `task_updated` is a sparse patch). Collapsing a task's
+ * events into one current state over its lifetime is the consumer's job.
+ */
+export function getClaudeTaskDetails(event: StreamEvent): ClaudeTaskDetails | null {
+  if (event.type !== "unknown") return null;
+  if (event.providerType !== PROVIDER_TYPE) return null;
+  const raw = event.raw;
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+
+  const phase = CLAUDE_TASK_PHASES[asString(r["subtype"], "")];
+  if (!phase) return null;
+
+  // `task_updated` is a sparse patch: status/description/end_time live under
+  // `patch`, not at the top level.
+  const patch = phase === "updated" ? parseObject(r["patch"]) : null;
+
+  return {
+    phase,
+    taskId: asString(r["task_id"], ""),
+    toolUseId: asNullableString(r["tool_use_id"]),
+    taskType: asNullableString(r["task_type"]),
+    subagentType: asNullableString(r["subagent_type"]),
+    workflowName: asNullableString(r["workflow_name"]),
+    description: patch
+      ? asNullableString(patch["description"])
+      : asNullableString(r["description"]),
+    status: patch
+      ? asClaudeTaskStatus(patch["status"])
+      : asClaudeTaskStatus(r["status"]),
+    usage: taskUsageFromRaw(r["usage"]),
+    outputFile: asNullableString(r["output_file"]),
+    summary: asNullableString(r["summary"]),
+    endTime: patch ? asNullableNumber(patch["end_time"]) : null,
+  };
+}
+
 export function isClaudeMaxTurns(stdout: string): boolean {
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();

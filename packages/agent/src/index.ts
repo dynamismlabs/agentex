@@ -63,8 +63,14 @@ export { executeAll } from "./utils/execute-all.js";
 export type { ExecuteAllOptions, ExecuteAllTask } from "./utils/execute-all.js";
 export {
   getClaudeUnknownDetails,
+  getClaudeTaskDetails,
   classifyClaudeAuthFromResult,
   CLAUDE_LOGIN_COMMAND,
+} from "./providers/claude/parse.js";
+export type {
+  ClaudeTaskDetails,
+  ClaudeTaskUsage,
+  ClaudeTaskStatus,
 } from "./providers/claude/parse.js";
 export {
   getClaudeTranscriptPath,
@@ -159,6 +165,7 @@ export type {
   SendHandle,
   SendOptions,
   CancelResult,
+  StopTaskResult,
   TurnResult,
   UserInputRequest,
   UserInputResponse,

@@ -6,6 +6,7 @@ import type {
   AgentSession,
   AgentMode,
   CancelResult,
+  StopTaskResult,
   SendHandle,
   SendOptions,
   SessionContext,
@@ -482,6 +483,11 @@ class AcpSession implements AgentSession {
   async cancel(_uuid: string): Promise<CancelResult> {
     // ACP has no per-queued-message cancel — only whole-turn cancel via interrupt().
     return { cancelled: false };
+  }
+
+  async stopTask(_taskId: string): Promise<StopTaskResult> {
+    // ACP has no per-task stop control; capabilities.stopTask is false.
+    return { stopped: false };
   }
 
   async interrupt(): Promise<void> {

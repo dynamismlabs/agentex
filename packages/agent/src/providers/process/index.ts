@@ -44,6 +44,7 @@ export const processProvider: ProviderModule = {
     planMode: false,
     concurrentSend: false,
     cancelQueuedMessage: false,
+    stopTask: false,
     modes: false,
   },
   execute: executeProcessProvider,

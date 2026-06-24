@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import type {
   AgentSession,
   CancelResult,
+  StopTaskResult,
   SendHandle,
   SendOptions,
   SessionContext,
@@ -602,6 +603,11 @@ export class CodexSessionImpl implements AgentSession {
     // turn-wide `turn/cancel` (which is what `interrupt()` calls).
     // capabilities.cancelQueuedMessage is false; this is a documented no-op.
     return { cancelled: false };
+  }
+
+  async stopTask(_taskId: string): Promise<StopTaskResult> {
+    // Codex has no per-task stop control; capabilities.stopTask is false.
+    return { stopped: false };
   }
 
   async interrupt(): Promise<void> {
