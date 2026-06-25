@@ -177,7 +177,39 @@ export type {
   TranscriptYield,
   TranscriptPeek,
   FoundTranscript,
+  GoalStatus,
+  GoalBlockedReason,
+  GoalSource,
+  GoalCapability,
+  GoalState,
+  GoalOptions,
+  SetGoalResult,
+  ClearGoalResult,
+  GoalSentinel,
+  GoalSentinelVerdict,
+  GoalSentinelContext,
 } from "./types.js";
+
+// Goals
+export {
+  GoalController,
+  EMULATED_GOAL_CAPABILITY,
+  GOAL_OBJECTIVE_MAX,
+  CODEX_GOAL_TOOLS,
+  isTerminalGoalStatus,
+  goalStateFromEvent,
+  latestGoalFromEvents,
+  normalizeClaudeGoalAttachment,
+  normalizeCodexGoalStatus,
+  normalizeCodexGoalRecord,
+  createDefaultSentinel,
+  parseAssessment,
+} from "./goals/index.js";
+export type {
+  GoalControllerDeps,
+  GoalStatusEvent,
+  NormalizedGoalFields,
+} from "./goals/index.js";
 
 export type {
   AskUserQuestion,

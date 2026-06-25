@@ -46,6 +46,34 @@ const result = await claude.execute({
 
 Built-in providers: `claude`, `codex`, `gemini`, `cursor`, `opencode`, `pi`, `openclaw`, `process`
 
+#### Goals
+
+Attach a session-scoped **goal** and the library keeps the agent working until it's
+met — using each provider's native mechanism where it exists (Claude's `/goal`
+Stop-hook sentinel, Codex's thread goal) and an emulation loop everywhere else.
+Every transition surfaces as a normalized `goal_status` event.
+
+```typescript
+const session = await getProvider("claude").createSession({
+  cwd,
+  onEvent: (e) => {
+    if (e.type === "goal_status") console.log(e.status, "—", e.objective);
+  },
+});
+
+// Default sentinel works out of the box; pass your own for a deterministic check.
+await session.setGoal("All tests in packages/agent pass under `pnpm test`.", {
+  sentinel: () => runTests().then((code) => ({ met: code === 0 })),
+});
+// → goal_status: active … (agent works) … goal_status: met
+
+session.getGoal();         // { objective, status, met, enforced, … } | null
+await session.clearGoal(); // abort early
+```
+
+`provider.capabilities.goals` tells you how a goal is enforced (`sentinel` /
+`model-tools` / `emulated`). See [`internal-docs/spec-goals.md`](./internal-docs/spec-goals.md).
+
 ### @agentex/workspace
 
 Manage isolated workspaces — bare directories or git worktrees — with status/diff/checkpoint/merge primitives, declarative `agentex.workspace.json` config, and process-group-safe `runScript`.

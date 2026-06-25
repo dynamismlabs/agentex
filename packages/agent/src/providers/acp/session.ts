@@ -6,13 +6,19 @@ import type {
   AgentSession,
   AgentMode,
   CancelResult,
+  ClearGoalResult,
+  GoalOptions,
+  GoalState,
   StopTaskResult,
   SendHandle,
   SendOptions,
   SessionContext,
   SessionState,
+  SetGoalResult,
+  StreamEvent,
   TurnResult,
 } from "../../types.js";
+import { GoalController, EMULATED_GOAL_CAPABILITY } from "../../goals/index.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { uuidv7 } from "../../utils/uuid.js";
 import { extractContentText, mapAcpStopReason, mapAcpUpdate } from "./parse.js";
@@ -120,10 +126,23 @@ class AcpSession implements AgentSession {
   /** toolCallId → tool name, so tool_call_update can report a name. Cleared per turn. */
   private readonly _toolNames = new Map<string, string>();
 
+  /** Goal engine. ACP agents expose no native goal surface — always emulated. */
+  private readonly _goals: GoalController;
+
   constructor(
     private readonly deps: AcpSessionDeps,
     private readonly ctx: SessionContext,
-  ) {}
+  ) {
+    this._goals = new GoalController({
+      providerType: this.deps.provider,
+      capability: EMULATED_GOAL_CAPABILITY,
+      getSessionId: () => this._sessionId,
+      send: (m) => this.send(m),
+      dispatch: (event: StreamEvent) => {
+        if (this.ctx.onEvent) void Promise.resolve(this.ctx.onEvent(event)).catch(() => {});
+      },
+    });
+  }
 
   get sessionId(): string | null {
     return this._sessionId;
@@ -381,6 +400,9 @@ class AcpSession implements AgentSession {
 
     const result = this.runPrompt(message, options);
     this._inFlight = result;
+    // Advance any emulated goal loop once the turn settles (runPrompt calls
+    // finishTurn before resolving, so the session is idle by then).
+    void result.then((r) => this._goals.onTurnSettled(r)).catch(() => {});
     return { uuid, result };
   }
 
@@ -483,6 +505,18 @@ class AcpSession implements AgentSession {
   async cancel(_uuid: string): Promise<CancelResult> {
     // ACP has no per-queued-message cancel — only whole-turn cancel via interrupt().
     return { cancelled: false };
+  }
+
+  setGoal(objective: string, options?: GoalOptions): Promise<SetGoalResult> {
+    return this._goals.setGoal(objective, options);
+  }
+
+  clearGoal(options?: { reason?: "cleared" | "blocked" }): Promise<ClearGoalResult> {
+    return this._goals.clearGoal(options);
+  }
+
+  getGoal(): GoalState | null {
+    return this._goals.getGoal();
   }
 
   async stopTask(_taskId: string): Promise<StopTaskResult> {

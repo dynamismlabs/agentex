@@ -70,6 +70,14 @@ export interface ProviderCapabilities {
    */
   modes: boolean;
   /**
+   * Goal support for this provider. Describes HOW a session-scoped goal
+   * (`AgentSession.setGoal`) is enforced, so hosts can branch on the
+   * enforcement model (an enforced goal can loop and burn budget; an advisory
+   * one can stall — different UI). Absent → the library's emulation engine is
+   * used whenever a host arms a goal. See `GoalState` / `GoalStatus`.
+   */
+  goals?: GoalCapability;
+  /**
    * Capabilities are negotiated at runtime rather than statically known.
    * `true` for ACP providers, whose real capability set comes from the agent's
    * `initialize` handshake — the static flags here are a best-effort default
@@ -77,6 +85,153 @@ export interface ProviderCapabilities {
    * dynamic provider should create a session and read its reported state.
    */
   dynamicCapabilities?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Goals — session-scoped objectives normalized across providers.
+//
+// Two upstream mechanisms are reconciled here: Claude Code's Stop-hook +
+// fast-model "sentinel" (harness-enforced, binary met/not-met) and Codex's
+// durable thread-goal state mutated by model tools (advisory, multi-status).
+// The library also EMULATES the enforced loop on providers with no native
+// support, so `setGoal` works everywhere. See internal-docs/spec-goals.md.
+// ---------------------------------------------------------------------------
+
+/**
+ * Cross-provider goal status. Normalizes Claude's binary `met` flag and Codex's
+ * `active|paused|complete|budget-limited` thread status into one ladder.
+ *
+ *  - "active"  — armed, in progress.            (Claude met:false; Codex active)
+ *  - "paused"  — retained, tracking suspended.  (Codex paused; not native to
+ *                Claude — reachable there only via the emulation engine.)
+ *  - "met"     — satisfied / complete.          (Claude met:true; Codex complete)
+ *  - "blocked" — cannot proceed. Absorbs Codex `budget-limited`, a user-input
+ *                blocker, and the emulation engine's iteration cap. Carries a
+ *                `blockedReason` so consumers can tell budget from stall.
+ *  - "cleared" — aborted before completion. (Claude `/goal clear`; host clearGoal)
+ */
+export type GoalStatus = "active" | "paused" | "met" | "blocked" | "cleared";
+
+/** Why a `blocked` goal is blocked. */
+export type GoalBlockedReason = "budget" | "needs_input" | "max_iterations";
+
+/** Who last changed the goal state. */
+export type GoalSource = "host" | "model" | "sentinel" | "agentex";
+
+/**
+ * How a provider enforces goals. A structured descriptor (not a bare boolean)
+ * because hosts must branch on the enforcement model.
+ */
+export interface GoalCapability {
+  /**
+   * - "sentinel"    — native turn-end gate judged by a fast model (Claude).
+   * - "model-tools" — native durable state the model self-reports (Codex).
+   * - "emulated"    — no native surface; the library drives the loop.
+   */
+  mechanism: "sentinel" | "model-tools" | "emulated";
+  /** Turn-end is gated until met. true for sentinel + emulated; false for model-tools. */
+  enforced: boolean;
+  /** Statuses this provider can actually report. */
+  statuses: GoalStatus[];
+  /** Clearing semantics: "self" (auto on met), "manual", or "both". */
+  clears: "self" | "manual" | "both";
+  /** Whether the provider reports tokensUsed/timeUsedSeconds on transitions. */
+  telemetry: boolean;
+}
+
+/** Live state of the session's active goal. */
+export interface GoalState {
+  /** Normalized objective text (Claude `condition`; Codex `objective`). */
+  objective: string;
+  /** Normalized status. */
+  status: GoalStatus;
+  /** Convenience: status === "met". */
+  met: boolean;
+  /**
+   * How this goal is gated:
+   *  - true  — turn-end is gated until met (Claude sentinel, emulation engine).
+   *  - false — advisory only; the model self-reports (Codex), or a record-only goal.
+   */
+  enforced: boolean;
+  /** Who last changed the state. */
+  source: GoalSource;
+  /** Why a `blocked` goal is blocked. Absent unless status === "blocked". */
+  blockedReason?: GoalBlockedReason;
+  /** Codex telemetry, when the provider reports it (reverse-engineered fields). */
+  tokensUsed?: number;
+  timeUsedSeconds?: number;
+  /** Codex soft budget when set via create_goal / `/goal --tokens`. */
+  tokenBudget?: number;
+  /** Continuation turns the emulation engine has driven. Absent for native goals. */
+  iterations?: number;
+  /** ISO timestamp of the last transition. */
+  updatedAt: string;
+}
+
+/** Per-call options for `AgentSession.setGoal`. */
+export interface GoalOptions {
+  /**
+   * Enforcement strategy. Default: follow the provider's native mechanism.
+   *  - "provider" — native if available, else emulate.
+   *  - "emulate"  — force the library engine even on Claude/Codex (uniform
+   *                 behavior across a heterogeneous fleet).
+   *  - "advisory" — record the goal but never gate turn-end.
+   */
+  enforce?: "provider" | "emulate" | "advisory";
+  /**
+   * Sentinel for enforced/emulated goals — decides whether the objective is met
+   * after a turn ends. If omitted, the default sentinel is used. Providing a
+   * sentinel forces the emulation engine (the native Claude/Codex judges are
+   * not overridable). Return `true`/`{met:true}` to satisfy, or
+   * `{met:false, nudge}` to continue with an optional custom continuation.
+   */
+  sentinel?: GoalSentinel;
+  /**
+   * Max continuation turns the emulation engine drives before giving up and
+   * emitting status "blocked" (`blockedReason: "max_iterations"`). Guards
+   * against infinite loops. Default 12. Ignored for non-enforced goals.
+   */
+  maxIterations?: number;
+}
+
+/** Result of `AgentSession.setGoal`. */
+export interface SetGoalResult {
+  /** True when the goal was armed. */
+  armed: boolean;
+  /** The mechanism actually used (may differ from the request after fallback). */
+  mechanism: "sentinel" | "model-tools" | "emulated";
+}
+
+/** Outcome of `AgentSession.clearGoal`. */
+export interface ClearGoalResult {
+  /** True when an active goal was cleared; false when there was none. */
+  cleared: boolean;
+}
+
+/**
+ * A goal sentinel. Decides, after a turn settles, whether the objective is met.
+ * May call a model, run a command, inspect the transcript — anything. Return a
+ * bare boolean, or `{met, nudge?}` to supply a custom continuation message for
+ * the next turn when unmet.
+ */
+export type GoalSentinel = (
+  ctx: GoalSentinelContext,
+) => boolean | GoalSentinelVerdict | Promise<boolean | GoalSentinelVerdict>;
+
+export interface GoalSentinelVerdict {
+  met: boolean;
+  /** Custom continuation message when unmet. Falls back to a default nudge. */
+  nudge?: string;
+}
+
+export interface GoalSentinelContext {
+  objective: string;
+  /** The TurnResult that just settled. */
+  lastTurn: TurnResult;
+  /** Transcript path for the session, for sentinels that read history. Null when unknown. */
+  transcriptPath: string | null;
+  /** How many continuation turns have run so far against this goal. */
+  iterations: number;
 }
 
 /**
@@ -702,6 +857,34 @@ export type StreamEvent =
       type: "permission_mode";
       permissionMode: string;
     } & BaseStreamEventFields)
+  /**
+   * Goal lifecycle transition — emitted when a session goal is set, judged,
+   * blocked, or cleared. Normalized across providers; `raw` holds the
+   * provider-native record (Claude `goal_status` attachment / Codex
+   * `thread_goal_updated` payload / an emulation-engine synthetic).
+   *
+   * One emitter per mode, so there is no intra-stream double-emit: in native
+   * mode the provider's parser is the sole emitter; in emulation mode the
+   * library's `GoalController` is. Codex's goal *tool* calls
+   * (`get_goal`/`create_goal`/`update_goal`) deliberately surface as ordinary
+   * `tool_call`/`tool_result` events, NOT as `goal_status` (see
+   * `CODEX_GOAL_TOOLS`). The library does not dedup the same transition seen on
+   * two different transports (e.g. a live stream and the on-disk transcript) —
+   * that's a host concern, keyed off `eventId`.
+   */
+  | ({
+      type: "goal_status";
+      objective: string;
+      status: GoalStatus;
+      met: boolean;
+      enforced: boolean;
+      source: GoalSource;
+      blockedReason?: GoalBlockedReason;
+      tokensUsed?: number;
+      timeUsedSeconds?: number;
+      tokenBudget?: number;
+      iterations?: number;
+    } & BaseStreamEventFields)
   | ({
       type: "result";
       text: string;
@@ -1068,6 +1251,39 @@ export interface AgentSession {
    * involved and learns of the stop via the task's next lifecycle event.
    */
   stopTask(taskId: string): Promise<StopTaskResult>;
+
+  /**
+   * Arm a session-scoped goal. The library uses native enforcement where the
+   * provider supports it (Claude's Stop-hook sentinel, Codex's thread goal) and
+   * the emulation engine otherwise. Resolves once the goal is armed — NOT when
+   * it is met; watch for `goal_status` stream events for that.
+   *
+   * Initial turn: Claude native `/goal` and the emulation engine both kick off
+   * a turn directed at the objective (mirroring native `/goal`, which starts
+   * immediately). Codex native goal mode only seeds durable thread state and
+   * starts NO turn — the model works toward it on your next `send()`. Advisory
+   * goals never start a turn.
+   *
+   * Enforcement caveat: Claude's native arm is fire-and-forget — a CLI that
+   * doesn't honor headless `/goal` will report `armed: true` while nothing
+   * actually gates turn-end. If you need *guaranteed* enforcement on any
+   * provider, pass `enforce: "emulate"` (the library drives the loop itself).
+   *
+   * Setting a goal while one is active replaces it (emits `cleared` then
+   * `active`). `objective` is capped at 4,000 chars to match both native
+   * providers; longer input throws `RangeError`.
+   */
+  setGoal(objective: string, options?: GoalOptions): Promise<SetGoalResult>;
+
+  /**
+   * Abort the active goal early. Emits a `goal_status` with status "cleared"
+   * (or "blocked" when `reason: "blocked"`). Resolves `{cleared:false}` when no
+   * goal is active.
+   */
+  clearGoal(options?: { reason?: "cleared" | "blocked" }): Promise<ClearGoalResult>;
+
+  /** Current goal state, or null when none is armed. Reads live in-memory state. */
+  getGoal(): GoalState | null;
 
   /** Gracefully interrupt the current turn. */
   interrupt(): Promise<void>;

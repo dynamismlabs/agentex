@@ -4,15 +4,21 @@ import { randomUUID } from "node:crypto";
 import type {
   AgentSession,
   CancelResult,
+  ClearGoalResult,
+  GoalCapability,
+  GoalOptions,
+  GoalState,
   StopTaskResult,
   SendHandle,
   SendOptions,
   SessionContext,
   SessionState,
+  SetGoalResult,
   StreamEvent,
   TurnResult,
   UserInputResponse,
 } from "../../types.js";
+import { GoalController, normalizeCodexGoalRecord, isTerminalGoalStatus } from "../../goals/index.js";
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { injectWorkspaceSkills } from "../../utils/skills.js";
@@ -280,6 +286,20 @@ export async function createCodexSession(ctx: SessionContext): Promise<AgentSess
 // ---------------------------------------------------------------------------
 
 /** @internal Exported for unit testing — not part of the public API. */
+/**
+ * Codex carries goals as durable thread state mutated by model tools
+ * (create_goal/update_goal/get_goal). Advisory — the model self-reports; no
+ * turn-end gate. Goal mode is experimental and feature-gated upstream, so the
+ * native arm is best-effort and falls back to emulation (see spec §7.2).
+ */
+export const codexGoalCapability: GoalCapability = {
+  mechanism: "model-tools",
+  enforced: false,
+  statuses: ["active", "paused", "met", "blocked", "cleared"],
+  clears: "manual",
+  telemetry: true,
+};
+
 export class CodexSessionImpl implements AgentSession {
   private _state: SessionState = "idle";
   private _threadId: string | null = null;
@@ -330,6 +350,9 @@ export class CodexSessionImpl implements AgentSession {
    */
   private _eventChain: Promise<void> = Promise.resolve();
 
+  /** Session-scoped goal engine (best-effort native thread goal + emulation). */
+  private readonly _goals: GoalController;
+
   constructor(
     private readonly proc: ChildProcess,
     private readonly ctx: SessionContext,
@@ -338,6 +361,40 @@ export class CodexSessionImpl implements AgentSession {
     private readonly instructions: string | null,
   ) {
     this._resumeThreadId = readCodexResumeId(ctx.sessionParams);
+
+    this._goals = new GoalController({
+      providerType: "codex",
+      capability: codexGoalCapability,
+      getSessionId: () => this._threadId,
+      send: (m) => this.send(m),
+      dispatch: (event) => this.dispatchEvent(event),
+      // Best-effort native arm. Goal mode is experimental + feature-gated
+      // (`features.goals=true`); on builds without it the RPC errors and the
+      // controller falls back to emulation. The method name is unconfirmed
+      // (see spec §11) — we try the community spelling.
+      armNative: async (objective) => {
+        if (!this._threadId) return false;
+        try {
+          // Verified against codex 0.130.0 app-server: method + flat
+          // `{threadId, objective}` params, gated on the `experimentalApi`
+          // capability (declared in handshake) AND a build where the
+          // `thread_goals` table exists (goals enabled in config.toml). When the
+          // table is absent the RPC errors and the controller falls back to
+          // emulation.
+          await this.goalRpc("thread/goal/set", {
+            threadId: this._threadId,
+            objective,
+          });
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      clearNative: async () => {
+        if (!this._threadId) return;
+        await this.goalRpc("thread/goal/clear", { threadId: this._threadId }).catch(() => {});
+      },
+    });
 
     proc.stdout!.setEncoding("utf-8");
     proc.stdout!.on("data", (chunk: string) => this.handleStdout(chunk));
@@ -396,6 +453,24 @@ export class CodexSessionImpl implements AgentSession {
     });
   }
 
+  /**
+   * Bounded RPC for experimental, best-effort methods (the `thread/goal/*`
+   * family). An app-server build that doesn't recognize the method may never
+   * reply; without this, `setGoal`/`clearGoal`/resume hydration would hang
+   * forever. On timeout we reject (callers treat that as "unsupported" and fall
+   * back to emulation / skip). A late reply still resolves the pending entry
+   * harmlessly; a never-reply is cleaned up by rejectAllPending on close.
+   */
+  private goalRpc(method: string, params: Record<string, unknown>, timeoutMs = 5000): Promise<Record<string, unknown>> {
+    return Promise.race([
+      this.rpcRequest(method, params),
+      new Promise<never>((_, reject) => {
+        const t = setTimeout(() => reject(new Error(`codex ${method} timed out`)), timeoutMs);
+        if (typeof t.unref === "function") t.unref();
+      }),
+    ]);
+  }
+
   private rpcResponse(id: number, result: Record<string, unknown>): void {
     this.proc.stdin!.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\n");
   }
@@ -405,10 +480,15 @@ export class CodexSessionImpl implements AgentSession {
   // -------------------------------------------------------------------------
 
   async handshake(): Promise<void> {
-    // 1. initialize
+    // 1. initialize. Declare `experimentalApi` so the app-server exposes its
+    // experimental method surface — notably `thread/goal/{set,get,clear}`, which
+    // the server rejects with "requires experimentalApi capability" otherwise
+    // (verified against codex 0.130.0 app-server). This is the same capability
+    // the official VS Code client declares; it gates access to experimental RPC
+    // methods, not turn semantics.
     await this.rpcRequest("initialize", {
       clientInfo: { name: "agentex", version: "1.0.0" },
-      capabilities: {},
+      capabilities: { experimentalApi: true },
     });
 
     // 2. Resume an existing thread when the caller supplied sessionParams,
@@ -425,6 +505,10 @@ export class CodexSessionImpl implements AgentSession {
         // thread/resume may echo the thread back or return {}; fall back to the
         // id we resumed with so `sessionId` is always populated.
         this._threadId = str(thread, "id") || str(thread, "sessionId") || this._resumeThreadId;
+        // Rehydrate a durable Codex goal so getGoal() reflects it immediately
+        // (goals live in SQLite, not the transcript, so a resumed thread would
+        // otherwise report null until the next goal notification).
+        await this.hydrateGoalFromThread();
         return;
       } catch (err) {
         // The thread is unknown to this codex install (different machine, pruned
@@ -610,8 +694,51 @@ export class CodexSessionImpl implements AgentSession {
     return { stopped: false };
   }
 
+  setGoal(objective: string, options?: GoalOptions): Promise<SetGoalResult> {
+    return this._goals.setGoal(objective, options);
+  }
+
+  clearGoal(options?: { reason?: "cleared" | "blocked" }): Promise<ClearGoalResult> {
+    return this._goals.clearGoal(options);
+  }
+
+  getGoal(): GoalState | null {
+    return this._goals.getGoal();
+  }
+
+  /**
+   * Best-effort: read the durable thread goal (`thread/goal/get`) and hydrate the
+   * controller so a resumed session reports it. Silently skips when goals are
+   * disabled, the table is absent, or there's no active goal.
+   */
+  private async hydrateGoalFromThread(): Promise<void> {
+    if (!this._threadId) return;
+    try {
+      const res = await this.goalRpc("thread/goal/get", { threadId: this._threadId });
+      const goal = asObj(res, "goal");
+      if (Object.keys(goal).length === 0) return;
+      const fields = normalizeCodexGoalRecord(goal, "model");
+      if (!fields || isTerminalGoalStatus(fields.status)) return;
+      const state: GoalState = {
+        objective: fields.objective,
+        status: fields.status,
+        met: fields.met,
+        enforced: fields.enforced,
+        source: fields.source,
+        updatedAt: new Date().toISOString(),
+      };
+      if (fields.tokensUsed !== undefined) state.tokensUsed = fields.tokensUsed;
+      if (fields.timeUsedSeconds !== undefined) state.timeUsedSeconds = fields.timeUsedSeconds;
+      if (fields.tokenBudget !== undefined) state.tokenBudget = fields.tokenBudget;
+      this._goals.hydrate(state);
+    } catch {
+      /* goals off / unsupported / no goal — leave getGoal() null */
+    }
+  }
+
   async interrupt(): Promise<void> {
     if (this._state === "idle" || this._state === "closed") return;
+    this._goals.notifyInterrupted(); // don't let an emulated goal auto-continue
     try {
       await this.rpcRequest("turn/cancel", {});
     } catch { /* best effort */ }
@@ -865,6 +992,17 @@ export class CodexSessionImpl implements AgentSession {
       return;
     }
 
+    if (method === "error") {
+      // A request/turn error notification (e.g. a 4xx from the model API).
+      // Capture the message so the trailing `turn/completed` (status "failed")
+      // surfaces it. Don't resolve here: `willRetry: true` means the turn
+      // continues, and either way `turn/completed` is the turn terminus.
+      const msg = str(asObj(params, "error"), "message") || str(params, "message");
+      if (msg) this._turnErrorMessage = msg;
+      this.emitStreamEvent(rawLine);
+      return;
+    }
+
     // Forward unrecognized notifications
     this.emitStreamEvent(rawLine);
   }
@@ -922,7 +1060,10 @@ export class CodexSessionImpl implements AgentSession {
       ? (params["item"] as Record<string, unknown>)
       : params;
 
-    if (str(item, "type") !== "agent_message") return;
+    // v2 app-server items are `agentMessage` (camelCase); legacy NDJSON is
+    // `agent_message`. Accept both or v2 turns return a null TurnResult.summary.
+    const itemType = str(item, "type");
+    if (itemType !== "agent_message" && itemType !== "agentMessage") return;
 
     // Direct text (Codex 0.30+)
     const directText = str(item, "text");
@@ -957,6 +1098,18 @@ export class CodexSessionImpl implements AgentSession {
     const model = str(params, "model");
     if (model) this._turnModel = model;
 
+    // codex 0.130 signals turn failure via `turn/completed` with
+    // `turn.status: "failed"` (carrying `turn.error.message`), not always via a
+    // separate `turn/failed`. Detect it so the TurnResult + result event report
+    // the error instead of a false "completed".
+    const turn = asObj(params, "turn");
+    const turnStatus = str(turn, "status");
+    if (turnStatus === "failed" || turnStatus === "cancelled") {
+      this._turnIsError = true;
+      const msg = str(asObj(turn, "error"), "message");
+      this._turnErrorMessage = msg || this._turnErrorMessage || `Turn ${turnStatus}`;
+    }
+
     // Dispatch the synthesized result event BEFORE resolving the turn, so it
     // is queued onto _eventChain and resolveTurn → deliverTurnResult drains
     // it before the awaiting send() returns. We synthesize here (rather than
@@ -966,11 +1119,11 @@ export class CodexSessionImpl implements AgentSession {
     // payload to carry on the result event.
     this.dispatchEvent({
       type: "result",
-      text: this._turnSummary ?? "",
+      text: this._turnIsError ? (this._turnErrorMessage ?? this._turnSummary ?? "") : (this._turnSummary ?? ""),
       costUsd: null,
       isError: this._turnIsError,
       stopReason: null,
-      terminalReason: null,
+      terminalReason: turnStatus || null,
       numTurns: null,
       durationMs: null,
       timestamp: new Date().toISOString(),
@@ -1063,10 +1216,15 @@ export class CodexSessionImpl implements AgentSession {
       p.cleanup?.();
       p.resolve(result);
     }
+
+    // Advance any emulated goal loop now that the turn has fully settled.
+    void this._goals.onTurnSettled(result);
   }
 
   private emitStreamEvent(rawLine: string): void {
-    if (!this.ctx.onEvent) return;
+    // Parse when there's an onEvent subscriber OR an active goal to observe, so
+    // native goal_status transitions update getGoal() even with no handler.
+    if (!this.ctx.onEvent && !this._goals.isTracking()) return;
     // Pass current threadId so NDJSON-shaped events (via codex/event wrapper)
     // carry sessionId. v2 notifications parse threadId from params directly
     // and ignore this arg.
@@ -1081,6 +1239,8 @@ export class CodexSessionImpl implements AgentSession {
    * throwing handler does not break delivery of subsequent events.
    */
   private dispatchEvent(event: StreamEvent): void {
+    // Track native goal_status transitions (keeps getGoal() accurate).
+    this._goals.observe(event);
     const cb = this.ctx.onEvent;
     if (!cb) return;
     // Codex emits no native per-event uuid. Where the v2 components exist,

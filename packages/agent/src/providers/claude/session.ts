@@ -4,15 +4,22 @@ import { randomUUID } from "node:crypto";
 import type {
   AgentSession,
   CancelResult,
+  ClearGoalResult,
+  GoalCapability,
+  GoalOptions,
+  GoalState,
   SendHandle,
   SendOptions,
   SessionContext,
   SessionState,
+  SetGoalResult,
   StopTaskResult,
   StreamEvent,
   TurnResult,
   UserInputResponse,
 } from "../../types.js";
+import { GoalController, latestGoalFromEvents, isTerminalGoalStatus } from "../../goals/index.js";
+import { claudeTranscriptOps } from "./transcript.js";
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { buildSkillsDir, cleanupSkillsDir } from "../../utils/skills.js";
@@ -152,10 +159,12 @@ export async function createClaudeSession(ctx: SessionContext): Promise<AgentSes
 
   // Resume existing session
   const sessionParams = ctx.sessionParams ?? null;
+  let resumeId: string | null = null;
   if (sessionParams) {
     const id = (sessionParams["sessionId"] as string) ?? (sessionParams["session_id"] as string);
     if (id && typeof id === "string") {
       args.push("--resume", id);
+      resumeId = id;
     }
   }
 
@@ -200,6 +209,10 @@ export async function createClaudeSession(ctx: SessionContext): Promise<AgentSes
 
   const session = new ClaudeSessionImpl(proc, ctx, skillsDir, mcpConfigPath);
 
+  // On resume, restore an unmet native goal from the transcript (best-effort,
+  // non-blocking so session creation isn't delayed by a transcript read).
+  if (resumeId) void session.hydrateGoalFromTranscript(resumeId);
+
   // Wire up AbortSignal to close the session
   if (ctx.signal) {
     if (ctx.signal.aborted) {
@@ -217,6 +230,22 @@ export async function createClaudeSession(ctx: SessionContext): Promise<AgentSes
 // ---------------------------------------------------------------------------
 
 /** @internal Exported for unit testing — not part of the public API. */
+/**
+ * Claude enforces goals natively via a Stop-hook + fast-model sentinel (the
+ * `/goal` command). Binary met/not-met, self-clearing on completion.
+ *
+ * `statuses` describes the NATIVE producible set. A Claude session that falls to
+ * the emulation engine (a custom `sentinel`, or `enforce:"emulate"`) can also
+ * produce `blocked` (`blockedReason:"max_iterations"`) — see GoalController.
+ */
+export const claudeGoalCapability: GoalCapability = {
+  mechanism: "sentinel",
+  enforced: true,
+  statuses: ["active", "met", "cleared"],
+  clears: "both",
+  telemetry: false,
+};
+
 export class ClaudeSessionImpl implements AgentSession {
   private _state: SessionState = "idle";
   private _sessionId: string | null = null;
@@ -270,12 +299,47 @@ export class ClaudeSessionImpl implements AgentSession {
    */
   private _eventChain: Promise<void> = Promise.resolve();
 
+  /** Session-scoped goal engine (native `/goal` passthrough + emulation fallback). */
+  private readonly _goals: GoalController;
+
+  /** Resolved transcript path (shared by the goal poller + sentinel context). */
+  private _transcriptPath: string | null = null;
+  private _transcriptResolving = false;
+  /** Tail state for observing native goal_status (transcript-only, not on stdout). */
+  private _goalScanOffset = 0;
+  private _goalPoll: ReturnType<typeof setInterval> | null = null;
+
   constructor(
     private readonly proc: ChildProcess,
     private readonly ctx: SessionContext,
     private readonly skillsDir: string | null,
     private readonly mcpConfigPath: string | null = null,
   ) {
+    this._goals = new GoalController({
+      providerType: "claude",
+      capability: claudeGoalCapability,
+      getSessionId: () => this._sessionId,
+      send: (m) => this.send(m),
+      dispatch: (event) => this.dispatchEvent(event),
+      // Best-effort transcript path for custom sentinels that read history.
+      // Triggers a lazy async resolve; returns null until it's cached.
+      getTranscriptPath: () => this.peekTranscriptPath(),
+      // Native arm: `/goal <objective>` arms the CLI's Stop-hook sentinel.
+      // Verified against CC 2.1.191: this DOES arm over stream-json stdin, the
+      // Haiku sentinel runs, and goal_status attachments are written — but only
+      // to the on-disk transcript, NOT the live stdout stream. So we tail the
+      // transcript to observe the transitions (startGoalObservation). The
+      // objective is whitespace-collapsed for the single-line slash command;
+      // the controller keeps the original for state.
+      armNative: async (objective) => {
+        await this.send(`/goal ${objective.replace(/\s+/g, " ").trim()}`);
+        this.startGoalObservation();
+        return true;
+      },
+      clearNative: async () => {
+        await this.send("/goal clear");
+      },
+    });
     // Wire up stdout line-by-line parsing
     proc.stdout!.setEncoding("utf-8");
     proc.stdout!.on("data", (chunk: string) => this.handleStdout(chunk));
@@ -492,8 +556,21 @@ export class ClaudeSessionImpl implements AgentSession {
     }
   }
 
+  setGoal(objective: string, options?: GoalOptions): Promise<SetGoalResult> {
+    return this._goals.setGoal(objective, options);
+  }
+
+  clearGoal(options?: { reason?: "cleared" | "blocked" }): Promise<ClearGoalResult> {
+    return this._goals.clearGoal(options);
+  }
+
+  getGoal(): GoalState | null {
+    return this._goals.getGoal();
+  }
+
   async interrupt(): Promise<void> {
     if (this._state === "idle" || this._state === "closed") return;
+    this._goals.notifyInterrupted(); // don't let an emulated goal auto-continue
 
     // Send interrupt control request
     const requestId = randomUUID();
@@ -524,6 +601,10 @@ export class ClaudeSessionImpl implements AgentSession {
   async close(): Promise<void> {
     if (this._state === "closed") return;
     this._state = "closed";
+    // Final transcript scan so a goal_status (e.g. `met`) written since the last
+    // ~800ms poll isn't lost on a fast close. No-op when no goal is observed.
+    await this.scanGoalTranscript().catch(() => { /* best effort */ });
+    this.stopGoalObservation();
 
     // Close stdin to signal the process to exit
     this.proc.stdin!.end();
@@ -932,6 +1013,9 @@ export class ClaudeSessionImpl implements AgentSession {
       p.cleanup?.();
       p.resolve(result);
     }
+
+    // Advance any emulated goal loop now that the turn has fully settled.
+    void this._goals.onTurnSettled(result);
   }
 
   // -------------------------------------------------------------------------
@@ -954,8 +1038,10 @@ export class ClaudeSessionImpl implements AgentSession {
       this._state = "thinking";
     }
 
-    // Forward as StreamEvent via the serial dispatch chain
-    if (this.ctx.onEvent) {
+    // Parse + dispatch when there's an onEvent subscriber OR an active goal to
+    // observe, so native goal_status transitions update getGoal() even with no
+    // handler. dispatchEvent observes unconditionally and gates delivery on cb.
+    if (this.ctx.onEvent || this._goals.isTracking()) {
       for (const event of parseStreamLine(rawLine, this._partialCtx)) {
         this.dispatchEvent(event);
       }
@@ -969,6 +1055,9 @@ export class ClaudeSessionImpl implements AgentSession {
    * throwing handler does not break delivery of subsequent events.
    */
   private dispatchEvent(event: StreamEvent): void {
+    // Let the goal engine track native goal_status transitions even when no
+    // onEvent handler is attached (keeps getGoal() accurate).
+    this._goals.observe(event);
     const cb = this.ctx.onEvent;
     if (!cb) return;
     // Enrich synchronously (in stream order) so tool_result events carry the
@@ -977,6 +1066,107 @@ export class ClaudeSessionImpl implements AgentSession {
     this._eventChain = this._eventChain.then(async () => {
       try { await cb(enriched); } catch { /* swallow */ }
     });
+  }
+
+  // -------------------------------------------------------------------------
+  // Native goal observation
+  //
+  // Claude's `/goal` writes `goal_status` attachments to the on-disk transcript
+  // but NOT to the live stdout stream we parse, so the controller can't observe
+  // native transitions from events. While a native goal is active we tail the
+  // transcript and feed any `goal_status` lines through the normal dispatch
+  // (which runs `_goals.observe` + delivers to onEvent). Self-stops once the
+  // goal reaches a terminal state; also stopped on close().
+  // -------------------------------------------------------------------------
+
+  private startGoalObservation(): void {
+    if (this._goalPoll) return;
+    // NB: do NOT reset _goalScanOffset here. It persists across goals so a second
+    // goal in the same session doesn't replay the first goal's historical
+    // goal_status lines. It starts at 0 (fresh session) and advances as we read.
+    const tick = (): void => { void this.scanGoalTranscript().catch(() => { /* best effort */ }); };
+    this._goalPoll = setInterval(tick, 800);
+    if (typeof this._goalPoll.unref === "function") this._goalPoll.unref();
+    // Defer the first scan: `armNative` calls this BEFORE the controller has
+    // recorded its optimistic `active` state, so a synchronous scan would see
+    // `isTracking() === false` and immediately stop the poller.
+    setTimeout(tick, 0);
+  }
+
+  private stopGoalObservation(): void {
+    if (this._goalPoll) {
+      clearInterval(this._goalPoll);
+      this._goalPoll = null;
+    }
+  }
+
+  private async scanGoalTranscript(): Promise<void> {
+    if (!this._goalPoll) return; // observation already stopped
+    // Stop once the goal is terminal (or was never really native).
+    if (!this._goals.isTracking()) { this.stopGoalObservation(); return; }
+    const filePath = await this.resolveTranscriptPath();
+    if (!filePath) return;
+    for await (const { event, offset } of claudeTranscriptOps.read({
+      filePath,
+      fromOffset: this._goalScanOffset,
+    })) {
+      this._goalScanOffset = offset;
+      if (event.type === "goal_status") this.dispatchEvent(event);
+    }
+  }
+
+  /** Resolve + cache the on-disk transcript path for this session. */
+  private async resolveTranscriptPath(): Promise<string | null> {
+    if (this._transcriptPath) return this._transcriptPath;
+    const sessionId = this._sessionId;
+    if (!sessionId || this._transcriptResolving) return null;
+    this._transcriptResolving = true;
+    try {
+      const found = await claudeTranscriptOps.find({
+        sessionId,
+        cwd: this.ctx.cwd ?? process.cwd(),
+      });
+      if (found) this._transcriptPath = found.filePath;
+    } catch { /* best effort */ } finally {
+      this._transcriptResolving = false;
+    }
+    return this._transcriptPath;
+  }
+
+  /** Sync accessor for the sentinel context; kicks off a lazy resolve. */
+  private peekTranscriptPath(): string | null {
+    if (!this._transcriptPath && this._sessionId) void this.resolveTranscriptPath();
+    return this._transcriptPath;
+  }
+
+  /**
+   * On resume, restore an unmet native goal from the transcript so getGoal()
+   * reflects it and observation continues (Claude persists an unmet goal across
+   * --resume; an achieved/cleared one is not restored).
+   */
+  async hydrateGoalFromTranscript(sessionId: string): Promise<void> {
+    try {
+      const found = await claudeTranscriptOps.find({
+        sessionId,
+        cwd: this.ctx.cwd ?? process.cwd(),
+      });
+      if (!found) return;
+      this._transcriptPath = found.filePath;
+      const events: StreamEvent[] = [];
+      let endOffset = 0;
+      for await (const { event, offset } of claudeTranscriptOps.read({ filePath: found.filePath })) {
+        endOffset = offset;
+        if (event.type === "goal_status") events.push(event);
+      }
+      const last = latestGoalFromEvents(events);
+      if (last && !isTerminalGoalStatus(last.status)) {
+        // Start observing from the END of the historical transcript so the poller
+        // surfaces only post-resume transitions (we already hydrated the state).
+        this._goalScanOffset = endOffset;
+        this._goals.hydrate(last);
+        this.startGoalObservation();
+      }
+    } catch { /* best effort */ }
   }
 
 }

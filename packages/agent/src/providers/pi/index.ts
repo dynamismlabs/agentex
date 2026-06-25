@@ -3,6 +3,7 @@ import { executePiProvider } from "./execute.js";
 import { piSessionCodec } from "./codec.js";
 import { resolveAuthForProvider } from "../../utils/auth.js";
 import { createPiSession } from "./session.js";
+import { EMULATED_GOAL_CAPABILITY } from "../../goals/index.js";
 
 export const piProvider: ProviderModule = {
   type: "pi",
@@ -19,6 +20,7 @@ export const piProvider: ProviderModule = {
     cancelQueuedMessage: false,
     stopTask: false,
     modes: false,
+    goals: EMULATED_GOAL_CAPABILITY,
   },
   // One-shot `pi --mode rpc` for execute(); a persistent `pi --mode rpc` process
   // across turns for createSession().

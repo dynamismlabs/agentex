@@ -1,6 +1,6 @@
 import type { ProviderModule, SessionContext, AgentSession } from "../../types.js";
 import { executeCodexProvider } from "./execute.js";
-import { createCodexSession } from "./session.js";
+import { createCodexSession, codexGoalCapability } from "./session.js";
 import { codexSessionCodec } from "./codec.js";
 import { resolveAuthForProvider } from "../../utils/auth.js";
 import { codexTranscriptOps } from "./transcript.js";
@@ -23,6 +23,7 @@ export const codexProvider: ProviderModule = {
     cancelQueuedMessage: false,
     stopTask: false,
     modes: true,
+    goals: codexGoalCapability,
   },
   execute: executeCodexProvider,
   createSession: (ctx: SessionContext): Promise<AgentSession> => createCodexSession(ctx),

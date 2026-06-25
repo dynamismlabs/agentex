@@ -117,6 +117,69 @@ describe("CodexSession — onEvent dispatch", () => {
     }
   });
 
+  it("treats a v2 turn/completed with status 'failed' as an error (not a false completion)", async () => {
+    const events: StreamEvent[] = [];
+    const { feed, turnResult } = makeDrivenSession({ onEvent: (e) => { events.push(e); } });
+
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "turn/completed",
+      params: { threadId: "t", turn: { id: "x", status: "failed", error: { message: "Unsupported service_tier: flex" }, durationMs: 8153 } },
+    }));
+
+    const tr = await turnResult;
+    expect(tr.status).toBe("failed");
+    expect(tr.errorCode).toBe("execution_error");
+    expect(tr.errorMessage).toContain("Unsupported service_tier");
+
+    const result = events.find((e) => e.type === "result");
+    expect(result?.type === "result" && result.isError).toBe(true);
+    expect(result?.type === "result" && result.terminalReason).toBe("failed");
+  });
+
+  it("captures a v2 `error` notification message into the failed turn (without resolving early)", async () => {
+    const events: StreamEvent[] = [];
+    const { feed, turnResult } = makeDrivenSession({ onEvent: (e) => { events.push(e); } });
+
+    // error notification arrives first; it must NOT resolve the turn.
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "error",
+      params: { error: { message: "boom 400", codexErrorInfo: "other" }, willRetry: false, threadId: "t", turnId: "u" },
+    }));
+    expect(events.filter((e) => e.type === "result")).toHaveLength(0);
+
+    // turn/completed (status failed, no message of its own) resolves the turn,
+    // surfacing the message captured from the error notification.
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "turn/completed",
+      params: { threadId: "t", turn: { status: "failed", error: {} } },
+    }));
+
+    const tr = await turnResult;
+    expect(tr.status).toBe("failed");
+    expect(tr.errorMessage).toBe("boom 400");
+  });
+
+  it("captures TurnResult.summary from a v2 `agentMessage` item (camelCase)", async () => {
+    const { feed, turnResult } = makeDrivenSession({});
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "item/completed",
+      params: { item: { type: "agentMessage", text: "pong" } },
+    }));
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "turn/completed",
+      params: { threadId: "t", turn: { status: "completed" } },
+    }));
+
+    const tr = await turnResult;
+    expect(tr.status).toBe("completed");
+    expect(tr.summary).toBe("pong");
+  });
+
   it("a handler that throws does not block subsequent handlers", async () => {
     const seen: string[] = [];
     const { feed, turnResult } = makeDrivenSession({
@@ -436,6 +499,19 @@ describe("CodexSession — handshake resume", () => {
     expect(session.sessionId).toBe("thr_fresh");
   });
 
+  it("declares the experimentalApi capability so goal methods are reachable", async () => {
+    // codex 0.130.0 rejects thread/goal/{set,get,clear} with "requires
+    // experimentalApi capability" unless this is declared in initialize.
+    const { proc, writes } = makeRpcProc({
+      initialize: () => ({}),
+      "thread/start": () => ({ thread: { id: "thr_x" } }),
+    });
+    const session = new CodexSessionImpl(proc, {}, "/tmp", "test-model", null);
+    await session.handshake();
+    const caps = paramsFor(writes, "initialize")["capabilities"] as Record<string, unknown>;
+    expect(caps?.["experimentalApi"]).toBe(true);
+  });
+
   it("resumes an existing thread (thread/resume) when sessionParams carry a sessionId", async () => {
     const { proc, writes } = makeRpcProc({
       initialize: () => ({}),
@@ -456,6 +532,41 @@ describe("CodexSession — handshake resume", () => {
     expect(methods).not.toContain("thread/start");
     expect(session.sessionId).toBe("thr_existing");
     expect(paramsFor(writes, "thread/resume")["threadId"]).toBe("thr_existing");
+  });
+
+  it("hydrates a durable Codex goal on resume via thread/goal/get", async () => {
+    const { proc, writes } = makeRpcProc({
+      initialize: () => ({}),
+      "thread/resume": (params) => ({ thread: { id: params["threadId"] } }),
+      "thread/goal/get": () => ({ goal: { objective: "ship it", status: "active", tokensUsed: 5, timeUsedSeconds: 2 } }),
+    });
+    const session = new CodexSessionImpl(
+      proc,
+      { sessionParams: { sessionId: "thr_existing" } },
+      "/tmp",
+      "test-model",
+      null,
+    );
+    await session.handshake();
+    expect(methodsWritten(writes)).toContain("thread/goal/get");
+    expect(session.getGoal()).toMatchObject({ objective: "ship it", status: "active", tokensUsed: 5, timeUsedSeconds: 2 });
+  });
+
+  it("leaves getGoal() null on resume when there is no active goal (or goals are off)", async () => {
+    const { proc } = makeRpcProc({
+      initialize: () => ({}),
+      "thread/resume": (params) => ({ thread: { id: params["threadId"] } }),
+      "thread/goal/get": () => ({ goal: {} }),
+    });
+    const session = new CodexSessionImpl(
+      proc,
+      { sessionParams: { sessionId: "thr_existing" } },
+      "/tmp",
+      "test-model",
+      null,
+    );
+    await session.handshake();
+    expect(session.getGoal()).toBeNull();
   });
 
   it("recovers the resume id from the thread_id alias", async () => {

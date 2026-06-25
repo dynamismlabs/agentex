@@ -3,6 +3,7 @@ import { executeOpenCodeProvider } from "./execute.js";
 import { opencodeSessionCodec } from "./codec.js";
 import { resolveAuthForProvider } from "../../utils/auth.js";
 import { createOpenCodeSession } from "./http-session.js";
+import { EMULATED_GOAL_CAPABILITY } from "../../goals/index.js";
 
 export const opencodeProvider: ProviderModule = {
   type: "opencode",
@@ -19,6 +20,7 @@ export const opencodeProvider: ProviderModule = {
     cancelQueuedMessage: false,
     stopTask: false,
     modes: false,
+    goals: EMULATED_GOAL_CAPABILITY,
   },
   // One-shot `opencode run` for execute(); live HTTP/SSE sessions via the
   // `opencode serve` daemon for createSession().

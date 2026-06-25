@@ -1,13 +1,19 @@
 import type {
   AgentSession,
   CancelResult,
+  ClearGoalResult,
+  GoalOptions,
+  GoalState,
   StopTaskResult,
   SendHandle,
   SendOptions,
   SessionContext,
   SessionState,
+  SetGoalResult,
+  StreamEvent,
   TurnResult,
 } from "../../types.js";
+import { GoalController, EMULATED_GOAL_CAPABILITY } from "../../goals/index.js";
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { uuidv7 } from "../../utils/uuid.js";
@@ -74,8 +80,20 @@ class OpenCodeSession implements AgentSession {
   private readonly _emittedToolResult = new Set<string>();
   private _sse: AbortController | null = null;
 
+  /** Goal engine. OpenCode has no native goal surface — always emulated. */
+  private readonly _goals: GoalController;
+
   constructor(private readonly ctx: SessionContext) {
     this.model = parseModel(ctx.config?.model);
+    this._goals = new GoalController({
+      providerType: "opencode",
+      capability: EMULATED_GOAL_CAPABILITY,
+      getSessionId: () => this._sessionId,
+      send: (m) => this.send(m),
+      dispatch: (event: StreamEvent) => {
+        if (this.ctx.onEvent) void Promise.resolve(this.ctx.onEvent(event)).catch(() => {});
+      },
+    });
   }
 
   get sessionId(): string | null {
@@ -240,6 +258,9 @@ class OpenCodeSession implements AgentSession {
     this._state = "thinking";
     const result = this.runTurn(message, options);
     this._inFlight = result;
+    // Advance any emulated goal loop once the turn settles (finishTurn runs in
+    // runTurn's finally, so the session is idle by the time this fires).
+    void result.then((r) => this._goals.onTurnSettled(r)).catch(() => {});
     return { uuid, result };
   }
 
@@ -343,6 +364,18 @@ class OpenCodeSession implements AgentSession {
   async stopTask(_taskId: string): Promise<StopTaskResult> {
     // OpenCode has no per-task stop control; capabilities.stopTask is false.
     return { stopped: false };
+  }
+
+  setGoal(objective: string, options?: GoalOptions): Promise<SetGoalResult> {
+    return this._goals.setGoal(objective, options);
+  }
+
+  clearGoal(options?: { reason?: "cleared" | "blocked" }): Promise<ClearGoalResult> {
+    return this._goals.clearGoal(options);
+  }
+
+  getGoal(): GoalState | null {
+    return this._goals.getGoal();
   }
 
   async interrupt(): Promise<void> {

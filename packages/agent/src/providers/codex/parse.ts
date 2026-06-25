@@ -1,8 +1,10 @@
 import type {
   BaseStreamEventFields,
+  GoalSource,
   StreamEvent,
   TokenUsage,
 } from "../../types.js";
+import { normalizeCodexGoalRecord } from "../../goals/normalize.js";
 
 const PROVIDER_TYPE = "codex";
 
@@ -80,6 +82,34 @@ function baseFields(
     parentToolCallId: null,
     raw: event,
   };
+}
+
+/**
+ * Build a normalized `goal_status` event from a Codex goal record. Returns null
+ * when the record is unusable. Shared by the v2 notification path and the
+ * NDJSON `event_msg`/`thread_goal_updated` path.
+ */
+function buildCodexGoalEvent(
+  goal: Record<string, unknown>,
+  base: BaseStreamEventFields,
+  source: GoalSource = "model",
+): StreamEvent | null {
+  const fields = normalizeCodexGoalRecord(goal, source);
+  if (!fields) return null;
+  const ev: Extract<StreamEvent, { type: "goal_status" }> = {
+    type: "goal_status",
+    objective: fields.objective,
+    status: fields.status,
+    met: fields.met,
+    enforced: fields.enforced,
+    source: fields.source,
+    ...base,
+  };
+  if (fields.blockedReason !== undefined) ev.blockedReason = fields.blockedReason;
+  if (fields.tokensUsed !== undefined) ev.tokensUsed = fields.tokensUsed;
+  if (fields.timeUsedSeconds !== undefined) ev.timeUsedSeconds = fields.timeUsedSeconds;
+  if (fields.tokenBudget !== undefined) ev.tokenBudget = fields.tokenBudget;
+  return ev;
 }
 
 // ---------------------------------------------------------------------------
@@ -261,13 +291,19 @@ function parseV2Notification(event: Record<string, unknown>): StreamEvent | null
   }
 
   if (method === "turn/completed") {
+    // codex 0.130 reports turn failures via `turn/completed` with
+    // `turn.status: "failed"` (+ `turn.error.message`), NOT only `turn/failed`.
+    // Surface that as an errored result instead of a clean completion.
+    const status = asNullableString(turn["status"]);
+    const failed = status === "failed" || status === "cancelled";
+    const turnError = parseObject(turn["error"]);
     return {
       type: "result",
-      text: "",
+      text: failed ? asString(turnError["message"], "") : "",
       costUsd: null,
-      isError: false,
+      isError: failed,
       stopReason: null,
-      terminalReason: asNullableString(turn["status"]),
+      terminalReason: status,
       numTurns: null,
       durationMs: asNullableNumber(turn["durationMs"]),
       ...makeBase(null),
@@ -401,6 +437,26 @@ function parseV2Notification(event: Record<string, unknown>): StreamEvent | null
       resetAt: null,
       overageStatus: null,
       isUsingOverage: null,
+      ...makeBase(null),
+    };
+  }
+
+  // ---- Goal lifecycle (experimental; wire shape unofficial — read loosely) ----
+
+  if (method === "thread/goal/updated" || method === "thread/goal/set") {
+    const ev = buildCodexGoalEvent(parseObject(params["goal"]), makeBase(null));
+    if (ev) return ev;
+  }
+
+  if (method === "thread/goal/cleared") {
+    const goal = parseObject(params["goal"]);
+    return {
+      type: "goal_status",
+      objective: asString(goal["objective"], ""),
+      status: "cleared",
+      met: false,
+      enforced: false,
+      source: "host",
       ...makeBase(null),
     };
   }
@@ -576,6 +632,24 @@ function parseNdjsonEvent(
       durationMs: null,
       ...baseFields(event, sessionId, null, null),
     };
+  }
+
+  // ---- Goal lifecycle (experimental; wire shape unofficial — read loosely) ----
+  // Observed on this machine as an `event_msg` wrapper; also tolerate the bare
+  // `thread_goal_updated` / `thread.goal.updated` spellings.
+  if (type === "event_msg") {
+    const payload = parseObject(event["payload"]);
+    if (asString(payload["type"], "") === "thread_goal_updated") {
+      const tid = asNullableString(payload["threadId"]) ?? sessionId;
+      const ev = buildCodexGoalEvent(parseObject(payload["goal"]), baseFields(event, tid, null, null));
+      if (ev) return ev;
+    }
+  }
+
+  if (type === "thread_goal_updated" || type === "thread.goal.updated") {
+    const tid = asNullableString(event["threadId"]) ?? asNullableString(event["thread_id"]) ?? sessionId;
+    const ev = buildCodexGoalEvent(parseObject(event["goal"]), baseFields(event, tid, null, null));
+    if (ev) return ev;
   }
 
   // Forward-compat: surface unknown event types.

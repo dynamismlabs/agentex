@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.0.23 — Goals: cross-provider session objectives
+
+A session-scoped **goal** primitive. Attach a durable objective and the library tracks it to a terminal state, normalizing Claude Code's Stop-hook sentinel and Codex's thread-goal state behind one event, one capability, and three session methods — with an emulation engine so it works on every provider. Verified end-to-end by driving the real CLIs (claude 2.1.191, codex 0.130.0) through the adapter.
+
+### Added
+
+- **`AgentSession.setGoal(objective, options?)` / `clearGoal(options?)` / `getGoal()`.** Arm a session goal; the library uses native enforcement where the provider has it (Claude's `/goal` Stop-hook + Haiku sentinel; Codex's `thread/goal/*` thread state) and an **emulation loop** (pluggable sentinel + continuation turns + iteration cap) everywhere else. `setGoal` resolves on *arm*, not completion — watch `goal_status` events for that. `objective` is capped at 4,000 chars; `options.enforce` (`provider`/`emulate`/`advisory`) and `options.sentinel` let a host force the engine or supply a deterministic check (e.g. run tests).
+- **`goal_status` StreamEvent.** One normalized transition per real change — `status` (`active|paused|met|blocked|cleared`), `met`, `enforced`, `source`, `blockedReason?`, and Codex telemetry (`tokensUsed`/`timeUsedSeconds`/`tokenBudget`). `raw` keeps the provider-native record. One emitter per mode (parser when native, controller when emulated), so no intra-stream double-emit.
+- **`ProviderCapabilities.goals` descriptor** — `mechanism` (`sentinel`/`model-tools`/`emulated`), `enforced`, `statuses`, `clears`, `telemetry`. claude = sentinel, codex = model-tools, pi/opencode = emulated.
+- **`GoalController` + reconstruction helpers**, exported for hosts: `goalStateFromEvent`, `latestGoalFromEvents`, `normalizeClaudeGoalAttachment`, `normalizeCodexGoalStatus`, `normalizeCodexGoalRecord`, `createDefaultSentinel`, `parseAssessment`, `isTerminalGoalStatus`, `EMULATED_GOAL_CAPABILITY`, `GOAL_OBJECTIVE_MAX`, `CODEX_GOAL_TOOLS`, plus the `GoalState` / `GoalStatus` / `GoalOptions` / `GoalSentinel` / `SetGoalResult` / `ClearGoalResult` types.
+- **Native observability + resume.** Claude writes `goal_status` only to the on-disk transcript (never live stdout), so a native goal session tails its transcript to surface `active`→`met` and restores an unmet goal on `--resume`. Codex rehydrates a durable goal on resume via `thread/goal/get`. Both confirmed live.
+
+### Fixed
+
+- **Codex failed turns are no longer reported as success.** codex 0.130 signals failure via `turn/completed` with `turn.status: "failed"` (carrying `turn.error.message`), not only `turn/failed` — agentex hardcoded `isError:false`, so a failed turn (e.g. a 4xx from the model API) looked `completed`. The parser + session now detect the failed status and the trailing `error` notification, reporting `status:"failed"` with the error text. Verified live.
+- **Codex app-server turns no longer return a null summary.** v2 assistant items are `agentMessage` (camelCase) but the session only matched legacy `agent_message`, so every app-server turn left `TurnResult.summary` null. Both spellings are accepted now.
+
+### Notes for consumers
+
+- **`AgentSession` gained three required methods** (`setGoal`/`clearGoal`/`getGoal`). Additive for *callers*; only an external *implementer* of `AgentSession` would need to add them — the built-in providers already do.
+- **Every Codex session now declares `capabilities.experimentalApi: true`** in its `initialize` handshake. This is required to reach the `thread/goal/*` methods (the app-server rejects them with `-32600 requires experimentalApi capability` otherwise) and is the same capability the official VS Code client declares. It gates access to experimental RPC methods, **not** turn semantics — verified against codex 0.130.0 that a normal turn still streams assistant + result unchanged.
+- **Native Codex goals are experimental + opt-in.** They function only when `[features] goals = true` is persisted in `~/.codex/config.toml` (the `thread_goals` SQLite table is migrated at startup); otherwise the arm falls back to emulation. The `thread/goal/*` RPCs are timeout-bounded so an older app-server that ignores them can't hang `setGoal`/`clearGoal`/resume.
+- A consumer with an exhaustive `switch` over `StreamEvent.type` will get a TypeScript nudge to handle `goal_status`.
+
 ## 0.0.21 — cross-runtime instruction files (`installInstructions`)
 
 Additive. The instruction-file twin of `installSkills`: install an orientation brief into the right per-runtime file(s), with a managed-region merge that preserves user edits.

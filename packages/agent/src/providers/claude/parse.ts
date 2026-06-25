@@ -5,6 +5,7 @@ import type {
   RateLimitInfo,
   StreamEvent,
 } from "../../types.js";
+import { normalizeClaudeGoalAttachment, type NormalizedGoalFields } from "../../goals/normalize.js";
 
 const PROVIDER_TYPE = "claude";
 
@@ -92,6 +93,24 @@ function baseFieldsFromEvent(
     parentToolCallId: asNullableString(event["parent_tool_use_id"]),
     raw: event,
   };
+}
+
+/** Build a normalized `goal_status` event from Claude goal fields + envelope. */
+function goalEventFromFields(
+  fields: NormalizedGoalFields,
+  event: Record<string, unknown>,
+): StreamEvent {
+  const ev: Extract<StreamEvent, { type: "goal_status" }> = {
+    type: "goal_status",
+    objective: fields.objective,
+    status: fields.status,
+    met: fields.met,
+    enforced: fields.enforced,
+    source: fields.source,
+    ...baseFieldsFromEvent(event, null),
+  };
+  if (fields.blockedReason !== undefined) ev.blockedReason = fields.blockedReason;
+  return ev;
 }
 
 function rateLimitFromEvent(event: Record<string, unknown>): RateLimitInfo | null {
@@ -415,6 +434,15 @@ export function parseStreamLine(line: string, partial?: PartialStreamContext): S
       permissionMode: mode,
       ...baseFieldsFromEvent(event, null),
     }];
+  }
+
+  // `/goal` writes a `goal_status` attachment recording the sentinel's view of
+  // the goal (`{type:"goal_status", met, sentinel, condition}`). It appears as a
+  // top-level `attachment` line in both the live stream and the on-disk
+  // transcript. Non-goal attachments fall through to the forward-compat sink.
+  if (type === "attachment") {
+    const fields = normalizeClaudeGoalAttachment(parseObject(event["attachment"]));
+    if (fields) return [goalEventFromFields(fields, event)];
   }
 
   if (type === "assistant") {

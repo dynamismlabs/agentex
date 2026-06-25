@@ -38,7 +38,30 @@ describe("ProviderCapabilities", () => {
       cancelQueuedMessage: true,
       stopTask: true,
       modes: false,
+      goals: {
+        mechanism: "sentinel",
+        enforced: true,
+        statuses: ["active", "met", "cleared"],
+        clears: "both",
+        telemetry: false,
+      },
     });
+  });
+
+  it("claude and codex advertise native goal support; others don't statically", () => {
+    const claude = getProvider("claude").capabilities.goals;
+    expect(claude?.mechanism).toBe("sentinel");
+    expect(claude?.enforced).toBe(true);
+
+    const codex = getProvider("codex").capabilities.goals;
+    expect(codex?.mechanism).toBe("model-tools");
+    expect(codex?.enforced).toBe(false);
+    expect(codex?.telemetry).toBe(true);
+
+    // Sessionless / non-native providers carry no static goal capability;
+    // their sessions (where they exist) still emulate via the GoalController.
+    expect(getProvider("openclaw").capabilities.goals).toBeUndefined();
+    expect(getProvider("process").capabilities.goals).toBeUndefined();
   });
 
   it("claude and codex are the only providers with concurrentSend", () => {

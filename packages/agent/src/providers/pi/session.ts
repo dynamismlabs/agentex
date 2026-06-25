@@ -5,13 +5,18 @@ import * as os from "node:os";
 import type {
   AgentSession,
   CancelResult,
+  ClearGoalResult,
+  GoalOptions,
+  GoalState,
   StopTaskResult,
   SendHandle,
   SendOptions,
   SessionContext,
   SessionState,
+  SetGoalResult,
   TurnResult,
 } from "../../types.js";
+import { GoalController, EMULATED_GOAL_CAPABILITY } from "../../goals/index.js";
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { uuidv7 } from "../../utils/uuid.js";
@@ -70,7 +75,22 @@ export class PiSession implements AgentSession {
   /** Count of `agent_end`s to swallow (from turns force-resolved before their ack). */
   private _staleEnds = 0;
 
-  constructor(private readonly ctx: SessionContext) {}
+  /** Goal engine. pi has no native goal surface — always emulated. */
+  private readonly _goals: GoalController;
+
+  constructor(private readonly ctx: SessionContext) {
+    this._goals = new GoalController({
+      providerType: "pi",
+      capability: EMULATED_GOAL_CAPABILITY,
+      getSessionId: () => this.sessionId,
+      send: (m) => this.send(m),
+      dispatch: (event) => {
+        if (!this.ctx.onEvent) return;
+        const handler = this.ctx.onEvent;
+        this._eventChain = this._eventChain.then(() => handler(event)).catch(() => {});
+      },
+    });
+  }
 
   get sessionId(): string | null {
     return this._sessionPath || null;
@@ -230,13 +250,15 @@ export class PiSession implements AgentSession {
     this._pendingStatus = null;
     this._pendingMessage = null;
     if (this._state !== "closed") this._state = "idle";
-    pending.resolve({
+    const result: TurnResult = {
       summary,
       costUsd: null,
       status,
       errorCode: status === "completed" ? null : status === "failed" ? "error" : status,
       errorMessage: errorMessage ?? null,
-    });
+    };
+    pending.resolve(result);
+    void this._goals.onTurnSettled(result);
   }
 
   private failPending(message: string): void {
@@ -308,6 +330,18 @@ export class PiSession implements AgentSession {
   async stopTask(_taskId: string): Promise<StopTaskResult> {
     // pi has no per-task stop control; capabilities.stopTask is false.
     return { stopped: false };
+  }
+
+  setGoal(objective: string, options?: GoalOptions): Promise<SetGoalResult> {
+    return this._goals.setGoal(objective, options);
+  }
+
+  clearGoal(options?: { reason?: "cleared" | "blocked" }): Promise<ClearGoalResult> {
+    return this._goals.clearGoal(options);
+  }
+
+  getGoal(): GoalState | null {
+    return this._goals.getGoal();
   }
 
   async interrupt(): Promise<void> {

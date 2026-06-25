@@ -363,6 +363,35 @@ describe("parseCodexStreamLine — v2 JSON-RPC (codex --json app-server)", () =>
     }
   });
 
+  it("v2 turn/completed (status completed) → clean result", () => {
+    const line = JSON.stringify({
+      jsonrpc: "2.0",
+      method: "turn/completed",
+      params: { threadId: "t", turn: { id: "x", status: "completed", durationMs: 1200 } },
+    });
+    const event = parseCodexStreamLine(line);
+    expect(event?.type).toBe("result");
+    if (event?.type === "result") {
+      expect(event.isError).toBe(false);
+      expect(event.terminalReason).toBe("completed");
+    }
+  });
+
+  it("v2 turn/completed (status failed) → errored result with the error message", () => {
+    const line = JSON.stringify({
+      jsonrpc: "2.0",
+      method: "turn/completed",
+      params: { threadId: "t", turn: { id: "x", status: "failed", error: { message: "Unsupported service_tier: flex" } } },
+    });
+    const event = parseCodexStreamLine(line);
+    expect(event?.type).toBe("result");
+    if (event?.type === "result") {
+      expect(event.isError).toBe(true);
+      expect(event.terminalReason).toBe("failed");
+      expect(event.text).toContain("Unsupported service_tier");
+    }
+  });
+
   it("v2 item/started command_execution emits tool_call with turnId", () => {
     const line = JSON.stringify({
       jsonrpc: "2.0",

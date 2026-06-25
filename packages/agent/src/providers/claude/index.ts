@@ -1,7 +1,7 @@
 import type { ProviderModule, SessionContext, AgentSession, QuotaContext, QuotaStatus } from "../../types.js";
 import { detectAuth, resolveAuthForProvider } from "../../utils/auth.js";
 import { executeClaudeProvider } from "./execute.js";
-import { createClaudeSession } from "./session.js";
+import { createClaudeSession, claudeGoalCapability } from "./session.js";
 import { claudeSessionCodec } from "./codec.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { claudeTranscriptOps } from "./transcript.js";
@@ -34,6 +34,7 @@ export const claudeProvider: ProviderModule = {
     cancelQueuedMessage: true,
     stopTask: true,
     modes: false,
+    goals: claudeGoalCapability,
   },
   execute: executeClaudeProvider,
   createSession: (ctx: SessionContext): Promise<AgentSession> => createClaudeSession(ctx),
