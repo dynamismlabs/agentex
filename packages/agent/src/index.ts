@@ -18,6 +18,12 @@ export {
 export type { HttpAgentOptions } from "./providers/_shared/http-agent.js";
 export { renderTemplate } from "./utils/template.js";
 export { redactEnvForLogs } from "./utils/env.js";
+export {
+  translateEndpoint,
+  CODEX_CUSTOM_PROVIDER_ID,
+  CODEX_CUSTOM_KEY_ENV,
+} from "./utils/endpoint.js";
+export type { EndpointTranslation } from "./utils/endpoint.js";
 export { parseAskUserQuestion } from "./utils/ask-user-question.js";
 export { parseExitPlanMode } from "./utils/exit-plan-mode.js";
 export { aggregateUsage } from "./types.js";
@@ -140,6 +146,7 @@ export type {
   ExecutionResult,
   ExecutionStatus,
   ProviderConfig,
+  ProviderEndpointConfig,
   McpServerConfig,
   StreamEvent,
   SessionCodec,

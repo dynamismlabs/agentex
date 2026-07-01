@@ -2,6 +2,7 @@ import * as path from "node:path";
 import type { ExecutionContext, ExecutionResult } from "../../types.js";
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
+import { translateEndpoint } from "../../utils/endpoint.js";
 import { runChildProcess, deriveErrorCode } from "../../utils/process.js";
 import { detectAuth } from "../../utils/auth.js";
 import { buildSkillsDir, cleanupSkillsDir } from "../../utils/skills.js";
@@ -59,9 +60,24 @@ export async function executeClaudeProvider(ctx: ExecutionContext): Promise<Exec
   ctx.onLifecycle?.({ phase: "preparing", step: "auth" });
   const env = buildEnv(ctx.env);
   ensurePathInEnv(env);
+  // Custom endpoint (BYOK / gateway / alt model) — env-only for claude. `unset`
+  // clears ambient Anthropic creds that would otherwise leak to a custom baseUrl.
+  const endpointTx = translateEndpoint("claude", config.endpoint);
+  Object.assign(env, endpointTx.env);
+  for (const key of endpointTx.unset) delete env[key];
   const auth = detectAuth("claude", env);
-  const billingType = auth.billingType;
-  const model = rawModel && auth.resolveModelId ? auth.resolveModelId(rawModel) : rawModel;
+  // Any explicit endpoint auth or a custom base URL is external/BYOK billing,
+  // not the local subscription (detectAuth only recognizes ANTHROPIC_API_KEY).
+  const usesCustomEndpoint = !!(
+    config.endpoint?.baseUrl || config.endpoint?.authToken || config.endpoint?.apiKey
+  );
+  const billingType = usesCustomEndpoint ? "api" : auth.billingType;
+  // Skip Bedrock model-id remapping for a custom endpoint: ambient AWS creds
+  // make detectAuth return a Bedrock resolveModelId that would otherwise rewrite
+  // `--model` into a Bedrock id and send it to the wrong place.
+  const model = !usesCustomEndpoint && rawModel && auth.resolveModelId
+    ? auth.resolveModelId(rawModel)
+    : rawModel;
 
   // 3. Build skills dir
   ctx.onLifecycle?.({ phase: "preparing", step: "skills" });

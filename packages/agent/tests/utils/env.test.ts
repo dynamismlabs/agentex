@@ -109,6 +109,15 @@ describe("redactEnvForLogs", () => {
     expect(result["GITHUB_AUTH"]).toBe("[REDACTED]");
   });
 
+  it("redacts custom-endpoint header carriers (values can hold secret headers)", () => {
+    const result = redactEnvForLogs({
+      ANTHROPIC_CUSTOM_HEADERS: "Authorization: Bearer secret",
+      CODEX_CUSTOM_HEADER_0: "Bearer secret",
+    });
+    expect(result["ANTHROPIC_CUSTOM_HEADERS"]).toBe("[REDACTED]");
+    expect(result["CODEX_CUSTOM_HEADER_0"]).toBe("[REDACTED]");
+  });
+
   it("does not redact non-sensitive keys", () => {
     const result = redactEnvForLogs({ PATH: "/usr/bin", HOME: "/home/test" });
     expect(result["PATH"]).toBe("/usr/bin");

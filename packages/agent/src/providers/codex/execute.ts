@@ -4,6 +4,7 @@ import * as path from "node:path";
 import type { ExecutionContext, ExecutionResult } from "../../types.js";
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
+import { translateEndpoint } from "../../utils/endpoint.js";
 import { runChildProcess, deriveErrorCode } from "../../utils/process.js";
 import { detectAuth } from "../../utils/auth.js";
 import { injectWorkspaceSkills } from "../../utils/skills.js";
@@ -69,6 +70,12 @@ export async function executeCodexProvider(ctx: ExecutionContext): Promise<Execu
   ctx.onLifecycle?.({ phase: "preparing", step: "instructions" });
   const env = buildEnv(ctx.env);
   ensurePathInEnv(env);
+  // Custom endpoint (BYOK / gateway / alt model) — codex needs both a
+  // synthesized model_providers block (`-c` args, added in buildArgs) and the
+  // key in env. `unset` is empty for codex (the ambient key never routes here).
+  const endpointTx = translateEndpoint("codex", config.endpoint);
+  Object.assign(env, endpointTx.env);
+  for (const key of endpointTx.unset) delete env[key];
 
   // 3. Resolve instructions. In plan mode, prepend a preamble that tells the
   //    agent to investigate-and-propose rather than attempt-and-fail — Codex
@@ -103,7 +110,10 @@ export async function executeCodexProvider(ctx: ExecutionContext): Promise<Execu
     (s) => s.isFile(),
     () => false,
   );
-  const billingType = hasCodexSubscription
+  // A custom base URL is external/BYOK billing, not the codex subscription.
+  const billingType = config.endpoint?.baseUrl
+    ? "api"
+    : hasCodexSubscription
     ? "subscription"
     : detectAuth("codex", env).billingType;
 
@@ -134,6 +144,8 @@ export async function executeCodexProvider(ctx: ExecutionContext): Promise<Execu
     }
     if (model) args.push("--model", model);
     if (config.effort) args.push("-c", `model_reasoning_effort=${JSON.stringify(config.effort)}`);
+    // Custom endpoint model_providers overrides — before extraArgs so hosts can override.
+    if (endpointTx.args.length > 0) args.push(...endpointTx.args);
     if (config.extraArgs) args.push(...config.extraArgs);
     if (resumeSessionId) {
       args.push("resume", resumeSessionId, "-");

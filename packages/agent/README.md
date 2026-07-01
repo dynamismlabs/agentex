@@ -100,6 +100,64 @@ loadProvidersFromConfig({
 });
 ```
 
+**Per-call endpoint (`config.endpoint`).** When the endpoint is chosen per
+session rather than registered up front — e.g. an app that lets each user bring
+their own model — set `endpoint` on `ProviderConfig`. The library keeps no state
+and stores no config file; you pass the endpoint on the call and it is
+translated into whatever the provider's CLI understands, at spawn:
+
+```ts
+const session = await getProvider("claude").createSession({
+  cwd,
+  config: {
+    model: "sonnet", // tier alias still works — see modelMap
+    endpoint: {
+      baseUrl: "https://api.z.ai/api/anthropic",
+      authToken: "…",                 // → Authorization: Bearer (or `apiKey` → x-api-key)
+      modelMap: { sonnet: "glm-5.1" }, // alias → concrete id on the endpoint
+    },
+  },
+});
+```
+
+Translation is per provider (there is no shared wire format):
+
+| Provider | `baseUrl` / auth | `modelMap` |
+| --- | --- | --- |
+| `claude` | `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_API_KEY` (`headers` → `ANTHROPIC_CUSTOM_HEADERS`) | → `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU,FABLE}_MODEL` |
+| `codex` | synthesized `[model_providers.custom]` block (`base_url`, `wire_api="responses"`, `env_key`) via `-c` overrides; key injected into env. Requires `baseUrl`. | ignored — Codex has no tier aliases; pass a concrete `model` |
+| others | ignored (like `allowedTools` on unsupported providers) | — |
+
+`endpoint` is applied once at spawn, so it is per-session / per-`exec`: change it
+by starting a fresh `createSession`/`exec` (resume re-applies it), never
+mid-session. Set exactly one of `authToken` / `apiKey`.
+
+**Credential hygiene (claude).** When a custom `baseUrl` is set, only the auth in
+`endpoint` reaches it — ambient `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` from the
+host env is not forwarded to the third party, and ambient alternate-routing config
+(Bedrock/Vertex/Foundry) is cleared so it can't steer Claude off the endpoint.
+Pass auth explicitly. One consequence: an observability-proxy pattern (Helicone /
+LangSmith-style, where the proxy forwards using your *own* Anthropic key) no longer
+picks up the ambient key — pass it deliberately, e.g.
+`endpoint: { baseUrl, apiKey: process.env.ANTHROPIC_API_KEY }`.
+
+**Codex header safety.** Codex header values are passed to the child via env
+(`env_http_headers`), never argv, so a secret header (`Authorization`, `X-API-Key`)
+doesn't leak through `ps`. Header *names* must be TOML bare keys.
+
+**Codex speaks the Responses API.** Codex removed the Chat Completions
+(`wire_api="chat"`) protocol in Feb 2026, so a custom endpoint must implement the
+OpenAI Responses API, directly or via a translating gateway (e.g. LiteLLM). Pure
+chat-completions endpoints won't work through Codex. If you're pinned to a
+pre-Feb-2026 Codex that still needs `chat`, override it on the one-shot `exec`
+path with `extraArgs: ["-c", 'model_providers.custom.wire_api="chat"']`.
+
+Prefer derived providers when the same endpoint is reused across many calls (and
+for heavy Codex config customization); prefer `config.endpoint` when it varies
+per session and the host owns storage. To override the synthesized Codex config,
+`extraArgs` is reliable on the one-shot `exec` path (it follows the endpoint
+`-c` flags); for sessions, a derived provider is the robust path.
+
 **ACP agents.** Any agent speaking the [Agent Client Protocol](https://agentclientprotocol.com)
 is a few lines:
 

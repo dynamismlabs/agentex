@@ -393,6 +393,57 @@ export interface ExecutionContext {
   onLifecycle?: (event: LifecycleEvent) => void;
 }
 
+/**
+ * Point a provider at a custom, Anthropic/OpenAI-compatible endpoint (BYOK,
+ * self-hosted gateway, or an alternative model). There is no shared wire
+ * format across CLIs, so this is TRANSLATED per provider at spawn time
+ * (`utils/endpoint.ts`):
+ * - claude: env vars — `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`/
+ *   `ANTHROPIC_API_KEY`, `ANTHROPIC_CUSTOM_HEADERS`, and `modelMap` →
+ *   `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU,FABLE}_MODEL`.
+ * - codex: a synthesized `[model_providers.custom]` block (base_url,
+ *   `wire_api = "responses"`, env_key) via `-c` overrides, with the key injected
+ *   into env. `modelMap` is ignored (Codex has no tier aliases — pass a concrete
+ *   `model`). Codex removed the Chat Completions wire protocol in Feb 2026, so a
+ *   custom endpoint must speak the OpenAI Responses API (directly or via a
+ *   translating gateway such as LiteLLM).
+ * - other providers ignore it (documented per provider), like `allowedTools`.
+ *
+ * Credential hygiene (claude): when a custom `baseUrl` is set, only the auth
+ * declared here reaches it — an ambient `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`
+ * from the host env is NOT forwarded to the third party (pass auth explicitly),
+ * and ambient alternate-routing config (Bedrock/Vertex/Foundry) is cleared so it
+ * can't steer Claude away from the endpoint. Codex header values are passed via
+ * env (`env_http_headers`), never argv, so secrets don't show up in `ps`.
+ *
+ * Applied once at spawn, so it is a per-session / per-`exec` property: change
+ * it by starting a fresh `createSession`/`exec` (resume re-applies it), never
+ * mid-session.
+ */
+export interface ProviderEndpointConfig {
+  /** Base URL of the compatible endpoint. Required for codex. */
+  baseUrl?: string;
+  /** Bearer token — claude: `ANTHROPIC_AUTH_TOKEN` (`Authorization: Bearer`);
+   *  codex: injected as the provider `env_key`. Wins over `apiKey` if both set. */
+  authToken?: string;
+  /** API key — claude: `ANTHROPIC_API_KEY` (`x-api-key`); codex: fallback
+   *  provider `env_key` when `authToken` is absent. Set one of the two. */
+  apiKey?: string;
+  /** Extra headers on every request — claude: `ANTHROPIC_CUSTOM_HEADERS`;
+   *  codex: `model_providers.custom.env_http_headers.*` (values passed via env,
+   *  not argv, so secret headers don't leak to `ps`). */
+  headers?: Record<string, string>;
+  /** Tier alias → concrete endpoint model id (claude only:
+   *  `ANTHROPIC_DEFAULT_*_MODEL`). Lets alias callers (`model: "sonnet"`)
+   *  resolve on a non-Anthropic endpoint. Ignored by codex. */
+  modelMap?: {
+    opus?: string;
+    sonnet?: string;
+    haiku?: string;
+    fable?: string;
+  };
+}
+
 // Provider-specific configuration
 export interface ProviderConfig {
   command?: string;
@@ -487,6 +538,13 @@ export interface ProviderConfig {
     baseBranch?: string;
     branchName?: string;
   };
+  /**
+   * Point the provider at a custom, Anthropic/OpenAI-compatible endpoint
+   * (BYOK / gateway / alternative model). Translated per provider at spawn —
+   * see {@link ProviderEndpointConfig}. Frozen for the process lifetime;
+   * providers without a custom-endpoint mechanism ignore it.
+   */
+  endpoint?: ProviderEndpointConfig;
 }
 
 // ---------------------------------------------------------------------------

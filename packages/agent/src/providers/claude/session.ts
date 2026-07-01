@@ -22,6 +22,7 @@ import { GoalController, latestGoalFromEvents, isTerminalGoalStatus } from "../.
 import { claudeTranscriptOps } from "./transcript.js";
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
+import { translateEndpoint } from "../../utils/endpoint.js";
 import { buildSkillsDir, cleanupSkillsDir } from "../../utils/skills.js";
 import { claudeFeatureArgs, cleanupMcpConfig, stageMcpConfig } from "./mcp.js";
 import { createToolNameTracker } from "../../utils/tool-names.js";
@@ -131,6 +132,11 @@ export async function createClaudeSession(ctx: SessionContext): Promise<AgentSes
   // Build env
   const env = buildEnv(ctx.env);
   ensurePathInEnv(env);
+  // Custom endpoint (BYOK / gateway / alt model) — env-only for claude. `unset`
+  // clears ambient Anthropic creds that would otherwise leak to a custom baseUrl.
+  const endpointTx = translateEndpoint("claude", config.endpoint);
+  Object.assign(env, endpointTx.env);
+  for (const key of endpointTx.unset) delete env[key];
 
   // Build skills dir (if any)
   let skillsDir: string | null = null;

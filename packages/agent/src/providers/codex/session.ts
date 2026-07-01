@@ -21,6 +21,7 @@ import type {
 import { GoalController, normalizeCodexGoalRecord, isTerminalGoalStatus } from "../../goals/index.js";
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
+import { translateEndpoint } from "../../utils/endpoint.js";
 import { injectWorkspaceSkills } from "../../utils/skills.js";
 import { resolveInstructions } from "../../utils/instructions.js";
 import { createToolNameTracker } from "../../utils/tool-names.js";
@@ -223,6 +224,12 @@ export async function createCodexSession(ctx: SessionContext): Promise<AgentSess
   // Build env
   const env = buildEnv(ctx.env);
   ensurePathInEnv(env);
+  // Custom endpoint (BYOK / gateway / alt model) — codex needs both a
+  // synthesized model_providers block (`-c` args, added below) and the key in env.
+  // `unset` is empty for codex (the ambient key never routes to the endpoint).
+  const endpointTx = translateEndpoint("codex", config.endpoint);
+  Object.assign(env, endpointTx.env);
+  for (const key of endpointTx.unset) delete env[key];
 
   // Inject skills
   if (config.skillDirs && config.skillDirs.length > 0) {
@@ -251,6 +258,10 @@ export async function createCodexSession(ctx: SessionContext): Promise<AgentSess
   } else if (config.skipPermissions) {
     args.push("--dangerously-bypass-approvals-and-sandbox");
   }
+  // Custom endpoint model_providers overrides are top-level `-c` options, placed
+  // with the other top-level flags before the `app-server` subcommand (the
+  // position that is always valid for global options).
+  if (endpointTx.args.length > 0) args.push(...endpointTx.args);
   args.push("app-server");
   if (config.extraArgs) args.push(...config.extraArgs);
 
