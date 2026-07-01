@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.0.24 — custom / BYOK endpoints per session (`config.endpoint`)
+
+Additive. Point a provider at a custom, Anthropic/OpenAI-compatible endpoint (BYOK, self-hosted gateway, alternative model) per session, without registering a derived provider. One normalized `ProviderConfig.endpoint` is translated to each CLI's own dialect at spawn — Claude via env vars, Codex via a synthesized `[model_providers.custom]` block. Frozen for the process lifetime, so it is a per-`createSession`/per-`exec` property (resume re-applies it).
+
+### Added
+
+- **`ProviderConfig.endpoint` (`ProviderEndpointConfig`).** `{ baseUrl?, authToken?, apiKey?, headers?, modelMap? }`. Claude maps to `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_API_KEY` + `ANTHROPIC_CUSTOM_HEADERS`, with `modelMap` (tier alias → concrete id) → `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU,FABLE}_MODEL`. Codex synthesizes a `model_provider="custom"` block (`base_url`, `wire_api="responses"`, `env_key`); `modelMap` is ignored (no tier aliases — pass a concrete `model`). Providers without a custom-endpoint mechanism ignore it, like `allowedTools`.
+- **`translateEndpoint(providerType, endpoint)` + `EndpointTranslation`,** exported, plus the `CODEX_CUSTOM_PROVIDER_ID` / `CODEX_CUSTOM_KEY_ENV` / `CODEX_CUSTOM_HEADER_ENV_PREFIX` constants for hosts that need the synthesized names.
+
+### Security
+
+- **No ambient-credential leak to a third party.** When a custom `baseUrl` is set, only the auth declared in `endpoint` reaches it — ambient `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` seeded from the host env are cleared, and so is alternate-routing config (`ANTHROPIC_BEDROCK_BASE_URL`, `CLAUDE_CODE_USE_BEDROCK`/`VERTEX`/`FOUNDRY`) so ambient Bedrock/Vertex can't steer Claude off the endpoint or rewrite the model id. General AWS creds are left intact for tool use.
+- **Codex header values never hit argv.** `headers` route through Codex `env_http_headers` (header name in argv, value in env), so a secret header (`Authorization`, `X-API-Key`) doesn't leak via `ps` — mirroring how the Claude provider stages MCP headers off the command line.
+- **`redactEnvForLogs` masks header carriers.** Added `HEADER` to the sensitive pattern so `ANTHROPIC_CUSTOM_HEADERS` and the generated `CODEX_CUSTOM_HEADER_*` vars are redacted in logs, not just the credential vars.
+
+### Notes for consumers
+
+- **Codex speaks the OpenAI Responses API only.** The Chat Completions (`wire_api="chat"`) protocol was removed from Codex in Feb 2026, so a Codex custom endpoint must implement the Responses API, directly or via a translating gateway (e.g. LiteLLM). A pre-Feb-2026 Codex needing `chat` can override on the `exec` path with `extraArgs: ["-c", 'model_providers.custom.wire_api="chat"']`.
+- **`endpoint` is per-spawn.** It's read once at `createSession`/`exec`; there is no per-turn override. Change it by starting a fresh session (resume re-applies it).
+- Prefer a derived provider when the same endpoint is reused across many calls; prefer `config.endpoint` when it varies per session and the host owns storage.
+
 ## 0.0.23 — Goals: cross-provider session objectives
 
 A session-scoped **goal** primitive. Attach a durable objective and the library tracks it to a terminal state, normalizing Claude Code's Stop-hook sentinel and Codex's thread-goal state behind one event, one capability, and three session methods — with an emulation engine so it works on every provider. Verified end-to-end by driving the real CLIs (claude 2.1.191, codex 0.130.0) through the adapter.
