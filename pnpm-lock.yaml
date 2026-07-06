@@ -13,9 +13,6 @@ importers:
       '@agentclientprotocol/sdk':
         specifier: ^0.24.0
         version: 0.24.0(zod@3.25.76)
-      uuid:
-        specifier: ^13.0.0
-        version: 13.0.0
     devDependencies:
       '@mariozechner/pi-coding-agent':
         specifier: ^0.62.0
@@ -23,6 +20,9 @@ importers:
       '@types/node':
         specifier: ^25.3.5
         version: 25.4.0
+      esbuild:
+        specifier: ^0.27.0
+        version: 0.27.3
       opencode-ai:
         specifier: ^1.3.2
         version: 1.3.2
@@ -2975,10 +2975,6 @@ packages:
 
   util-deprecate@1.0.2:
     resolution: {integrity: sha512-EPD5q1uXyFxJpCrLnCc1nHnq3gOa6DZBocAIiI2TaSCA7VCJ1UJDMagCzIkXNsUYfD1daK//LTEQ8xiIbrHtcw==}
-
-  uuid@13.0.0:
-    resolution: {integrity: sha512-XQegIaBTVUjSHliKqcnFqYypAd4S+WCYt5NIeRs6w/UAry7z8Y9j5ZwRRL4kzq9U3sD6v+85er9FvkEaBpji2w==}
-    hasBin: true
 
   uuid@3.4.0:
     resolution: {integrity: sha512-HjSDRw6gZE5JMggctHBcjVak08+KEVhSIiDzFnT9S9aegmp85S/bReBVTb4QTFaRNptJ9kuYaNhnbNEOkbKb/A==}
@@ -6610,8 +6606,6 @@ snapshots:
       requires-port: 1.0.0
 
   util-deprecate@1.0.2: {}
-
-  uuid@13.0.0: {}
 
   uuid@3.4.0: {}
 

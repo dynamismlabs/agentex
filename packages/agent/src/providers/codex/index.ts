@@ -1,10 +1,8 @@
 import type { ProviderModule, SessionContext, AgentSession } from "../../types.js";
-import { executeCodexProvider } from "./execute.js";
-import { createCodexSession, codexGoalCapability } from "./session.js";
 import { codexSessionCodec } from "./codec.js";
 import { resolveAuthForProvider } from "../../utils/auth.js";
 import { codexTranscriptOps } from "./transcript.js";
-import { listCodexModes } from "./modes.js";
+import { codexGoalCapability } from "./goal-capability.js";
 
 export const codexProvider: ProviderModule = {
   type: "codex",
@@ -24,13 +22,19 @@ export const codexProvider: ProviderModule = {
     stopTask: false,
     modes: true,
     goals: codexGoalCapability,
+    durableSessions: true,
   },
-  execute: executeCodexProvider,
-  createSession: (ctx: SessionContext): Promise<AgentSession> => createCodexSession(ctx),
+  // Heavy machinery (execute.ts, session.ts, modes.ts, attach.ts) loads lazily
+  // on first use — every ProviderModule method is already async.
+  execute: async (ctx) => (await import("./execute.js")).executeCodexProvider(ctx),
+  createSession: async (ctx: SessionContext): Promise<AgentSession> =>
+    (await import("./session.js")).createCodexSession(ctx),
   resolveAuth: (ctx) => resolveAuthForProvider("codex", ctx),
   sessionCodec: codexSessionCodec,
   transcript: codexTranscriptOps,
-  listModes: listCodexModes,
+  listModes: async (opts) => (await import("./modes.js")).listCodexModes(opts),
+  attachSession: async (record, opts) =>
+    (await import("./attach.js")).attachCodexSession(record, opts),
 };
 
 export {
@@ -42,6 +46,7 @@ export {
   parseCodexLine,
   resolveCodexHome,
 } from "./transcript.js";
+export { codexLineToStreamEvents } from "./transcript-normalize.js";
 export type {
   GetCodexTranscriptPathOptions,
   CodexTranscriptLocation,

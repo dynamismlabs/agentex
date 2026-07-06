@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import type { ChildProcess } from "node:child_process";
 import { CodexSessionImpl } from "../../../src/providers/codex/session.js";
 import { parseAskUserQuestion } from "../../../src/index.js";
+import { assertSessionRecord } from "../../../src/sessions/index.js";
 import type {
   SessionContext,
   StreamEvent,
@@ -943,5 +944,28 @@ describe("CodexSession — collaboration mode", () => {
 
     expect(methodsWritten(writes)).toContain("collaborationMode/list"); // it tried to resolve
     expect(paramsFor(writes, "thread/start")["collaborationMode"]).toBeUndefined(); // no match → default
+  });
+});
+
+describe("CodexSession — describe()", () => {
+  it("returns null before Codex assigns a thread id", () => {
+    const { proc } = makeFakeProc();
+    const session = new CodexSessionImpl(proc, {}, "/repo", "gpt-5-codex", null);
+    expect(session.describe()).toBeNull();
+  });
+
+  it("returns a valid SessionRecord once the thread id is known", () => {
+    const { proc } = makeFakeProc();
+    const session = new CodexSessionImpl(proc, {}, "/repo", "gpt-5-codex", null);
+    (session as unknown as { _threadId: string | null })._threadId = "thread-xyz";
+
+    const rec = session.describe();
+    expect(rec).not.toBeNull();
+    expect(() => assertSessionRecord(rec)).not.toThrow();
+    expect(rec!.version).toBe(1);
+    expect(rec!.providerType).toBe("codex");
+    expect(rec!.params).toMatchObject({ sessionId: "thread-xyz", cwd: "/repo" });
+    expect(rec!.cwd).toBe("/repo");
+    expect(rec!.displayId).toBe("thread-xyz");
   });
 });

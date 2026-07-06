@@ -1,5 +1,4 @@
 import type { AuthResolveContext, AuthReport, ProviderModule } from "../../types.js";
-import { executeProcessProvider } from "./execute.js";
 import { ensureCommandResolvable } from "../../utils/binary.js";
 
 async function resolveProcessAuth(ctx?: AuthResolveContext): Promise<AuthReport> {
@@ -47,6 +46,7 @@ export const processProvider: ProviderModule = {
     stopTask: false,
     modes: false,
   },
-  execute: executeProcessProvider,
+  // execute.ts loads lazily on first use.
+  execute: async (ctx) => (await import("./execute.js")).executeProcessProvider(ctx),
   resolveAuth: resolveProcessAuth,
 };

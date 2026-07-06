@@ -5,12 +5,12 @@ import type {
   AgentSession,
   CancelResult,
   ClearGoalResult,
-  GoalCapability,
   GoalOptions,
   GoalState,
   SendHandle,
   SendOptions,
   SessionContext,
+  SessionRecord,
   SessionState,
   SetGoalResult,
   StopTaskResult,
@@ -19,6 +19,9 @@ import type {
   UserInputResponse,
 } from "../../types.js";
 import { GoalController, latestGoalFromEvents, isTerminalGoalStatus } from "../../goals/index.js";
+import { claudeGoalCapability } from "./goal-capability.js";
+import { claudeSessionCodec } from "./codec.js";
+import { createSessionRecord } from "../../sessions/record.js";
 import { claudeTranscriptOps } from "./transcript.js";
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
@@ -235,22 +238,12 @@ export async function createClaudeSession(ctx: SessionContext): Promise<AgentSes
 // Implementation
 // ---------------------------------------------------------------------------
 
-/** @internal Exported for unit testing — not part of the public API. */
 /**
- * Claude enforces goals natively via a Stop-hook + fast-model sentinel (the
- * `/goal` command). Binary met/not-met, self-clearing on completion.
- *
- * `statuses` describes the NATIVE producible set. A Claude session that falls to
- * the emulation engine (a custom `sentinel`, or `enforce:"emulate"`) can also
- * produce `blocked` (`blockedReason:"max_iterations"`) — see GoalController.
+ * @internal Re-exported for existing import sites; the const now lives in the
+ * leaf `goal-capability.ts` so `index.ts` can read it without loading this
+ * heavy session module (spec §5.1).
  */
-export const claudeGoalCapability: GoalCapability = {
-  mechanism: "sentinel",
-  enforced: true,
-  statuses: ["active", "met", "cleared"],
-  clears: "both",
-  telemetry: false,
-};
+export { claudeGoalCapability } from "./goal-capability.js";
 
 export class ClaudeSessionImpl implements AgentSession {
   private _state: SessionState = "idle";
@@ -391,6 +384,27 @@ export class ClaudeSessionImpl implements AgentSession {
 
   get sessionId(): string | null { return this._sessionId; }
   get state(): SessionState { return this._state; }
+
+  /**
+   * Durable identity for persistence + later `attachSession`. Null until Claude
+   * has assigned a session id (the first `system`/init event); serializes
+   * `{sessionId, cwd?}` through the codec so it round-trips back into resume.
+   */
+  describe(): SessionRecord | null {
+    if (!this._sessionId) return null;
+    const cwd = this.ctx.cwd ?? null;
+    const params = claudeSessionCodec.serialize({
+      sessionId: this._sessionId,
+      ...(cwd ? { cwd } : {}),
+    });
+    if (!params) return null;
+    return createSessionRecord({
+      providerType: "claude",
+      params,
+      cwd,
+      displayId: claudeSessionCodec.getDisplayId?.(params) ?? null,
+    });
+  }
 
   // -------------------------------------------------------------------------
   // Public API

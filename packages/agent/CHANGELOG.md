@@ -1,6 +1,153 @@
 # Changelog
 
-## 0.0.24 — custom / BYOK endpoints per session (`config.endpoint`)
+## 0.0.26 — durable sessions: `describe` / `attachSession` / `catchUp`
+
+Additive, **zero breaking changes**. Every addition is an optional interface
+member or a new export; the existing `createSession`/resume flow is untouched
+and remains the only spawn path. Upgrading requires no consumer changes.
+
+The agents underneath agentex are disk-durable (Claude transcripts + `--resume`;
+Codex SQLite threads + `thread/resume`), but the only session abstraction was a
+live in-memory handle — every host had to assemble its own restart-recovery
+layer from the raw parts (`sessionCodec`, `transcript` ops, `ctx.sessionParams`).
+This release ships that composition as three optional additions.
+
+### Added
+
+- **`SessionRecord`** — one blessed, JSON-serializable session identity a host
+  persists (`{version, providerType, params, cwd, displayId, updatedAt}`).
+  Produce it with `session.describe()` (new optional `AgentSession` member —
+  returns null until the provider assigns a session id) or `createSessionRecord(...)`.
+  Helpers `isSessionRecord` / `assertSessionRecord` (throws
+  `MalformedSessionRecordError` naming the offending field) validate one, and a
+  new `./sessions` subpath exports them all.
+- **`provider.attachSession(record, opts?)`** — read-only reattachment (new
+  optional `ProviderModule` member; implemented for Claude + Codex). Locates the
+  on-disk transcript, classifies how the last turn ended
+  (`lastTurn: "completed" | "interrupted" | "unknown"`), and returns a
+  `SessionAttachment` with:
+  - **`catchUp(opts?)`** — replays normalized `StreamEvent`s from the transcript
+    with a byte `offset` per event to checkpoint and pass back as `fromOffset`.
+    Claude yields the stable wire `eventId`; Codex yields `null` (no wire id).
+  - **`resume(ctx?)`** — continue live. Exactly
+    `createSession({ ...ctx, sessionParams: record.params })` — one resume path,
+    **never auto-invoked** (a restart must not spontaneously re-run turns).
+- **`codexLineToStreamEvents(line, ctx)`** — the library now normalizes Codex
+  on-disk rollout lines into `StreamEvent`s (the map/drop table Flow previously
+  hand-maintained in `codex-on-disk.ts`), so `catchUp` yields the same event
+  vocabulary for both providers. Exported from `@agentex/agent` and
+  `@agentex/agent/providers/codex`.
+- **`capabilities.durableSessions`** — honest feature detection: `true` for
+  claude and codex (they implement `attachSession`), absent everywhere else.
+- **`scripts/durable-session-demo.ts`** (`pnpm demo:durable`) — end-to-end
+  proof: start a session, crash the host mid-turn in a separate process,
+  reattach in a fresh one → `interrupted`, `catchUp` replays, `resume` continues.
+
+### Changed
+
+- **`StreamEvent` union-growth policy documented.** The union grows in minor
+  versions (the `goal_status` precedent); consumers MUST keep a `default` branch
+  when switching on `type`. Stated in the `StreamEvent` JSDoc — not a code change.
+
+### Documented limitations (not future promises)
+
+- **Pending user-input requests do not survive a restart** — the CLI process and
+  its stdio died. Attach reports `lastTurn: "interrupted"` so hosts can re-prompt.
+- **Attach for other providers** (acp/gemini/copilot/cursor/opencode/pi/openclaw/
+  process) — no durable on-disk transcript contract today, so `durableSessions`
+  is simply absent for them.
+- **Cross-machine records** — a record references local transcript state; moved
+  to another machine it yields `transcript: null, lastTurn: "unknown"` (attach
+  still works, `catchUp` yields nothing, `resume` may still succeed).
+
+## 0.0.25 — packaging perf: lazy providers + subpath exports
+
+Non-breaking. **Zero API changes** — every exported signature, event shape, and
+session semantic is identical to 0.0.24. This release makes importing the
+package cheap: a consumer that only needs one util no longer pays for the whole
+provider registry, and the registry no longer eagerly evaluates all nine
+providers' heavy machinery.
+
+The lever is that every `ProviderModule` method (`execute`, `createSession`,
+`resolveAuth`, `listModels`, `listModes`, `checkQuota`) was already async, so the
+laziness lives *inside* each provider's method bodies via dynamic `import()` —
+invisible to callers. `getProvider` stays synchronous; only heavy modules
+(`session.ts`, `execute.ts`, parsers, the ACP SDK) load on first use.
+
+### Added
+
+- **Subpath exports.** Beyond `"."`, the package now exports `./registry`,
+  `./derived`, `./types`, `./goals`, `./utils/*` (wildcard), `./providers/*`
+  (wildcard → each light provider index), plus the three blessed deep modules
+  `./providers/claude/parse`, `./providers/claude/transcript`,
+  `./providers/codex/transcript`, and `./package.json`. This unlocks
+  browser-safe entry points — e.g. `@agentex/agent/providers/claude/parse` is
+  pure (type-only imports, no `node:*`), so consumers no longer need a
+  hand-written client-safe mirror. `_shared/` stays private by convention.
+- **`"default"` export condition** on every entry (folds in the old TODO
+  "Package exports — CJS consumer ergonomics"): `require(esm)` now resolves on
+  Node ≥ 20.19, so a CJS/tsx consumer can `require("@agentex/agent")` without
+  the dynamic-`import()` dance. Conditions are ordered `"types"` → `"import"` →
+  `"default"` in every block.
+- **`scripts/measure-import.ts`** — a tool (not a test) that prints import time
+  and dist-module count per entry point. Used to produce the table below.
+- **`tests/packaging/`** — five checks that pin this design: `no-tdz`,
+  `lazy-graph` (a loader-hook module census proving no heavy module loads from
+  the barrel), `exports-map` (every subpath resolves at runtime + under TS
+  `bundler`/`node16`), `tree-shake` (esbuild proof), and `utils/uuid`.
+
+### Changed
+
+- **`sideEffects: false`.** Truthful now that the only cross-module side effect
+  (the ACP factory registration) is gone (see Fixed). Bundlers can tree-shake
+  the package: a one-util import from the barrel bundles to **308 bytes** with
+  the entire provider registry shaken out.
+- **`engines.node` → `>=20.19.0`** (was `>=18`). Support-matrix honesty for the
+  `"default"` / `require(esm)` condition — not a runtime break; the code already
+  targeted modern Node.
+- **Dropped the `uuid` dependency.** `utils/uuid.ts` is now a local RFC 9562
+  UUIDv7 (48-bit ms timestamp + 74 random bits via `crypto.getRandomValues`),
+  removing 22 runtime modules and leaving `@agentclientprotocol/sdk` as the sole
+  runtime dependency. Callers need uniqueness + rough time-sortability, both
+  covered by `tests/utils/uuid.test.ts`.
+- **Ship `src` in the package** (`files: ["dist", "src"]`) so the published
+  `*.js.map` / `*.d.ts.map` `sources` paths resolve — go-to-definition and
+  debugger stepping into the package now work (~0.5 MB larger tarball).
+- **`registerAcpFactory` is no longer required before `loadProvidersFromConfig`.**
+  The loader defaults to the built-in `acpProvider`; `registerAcpFactory` stays
+  exported and honored as an override hook.
+
+### Fixed
+
+- **TDZ crash on direct provider import.** `import("@agentex/agent/providers/gemini")`
+  (and `copilot`) threw `ReferenceError: Cannot access 'geminiProvider' before
+  initialization` via the cycle `gemini → acp → derived → registry → gemini`.
+  Masked previously because the barrel was the only entry point; a hard blocker
+  for subpath exports. The cycle is broken by making `derived.ts` import the ACP
+  provider directly and dropping the registry's bare ACP side-effect import. All
+  ten provider modules now import clean as an entry point.
+
+### Perf (measured via `scripts/measure-import.ts`, Node 24.2, warm FS cache)
+
+| Metric | Before (0.0.24) | After (0.0.25) | Target |
+| --- | --- | --- | --- |
+| Runtime import, barrel (`.`) | ~80–100 ms | **~26 ms** (min of 5) | ≤ 40 ms |
+| Runtime dist-module graph, barrel | ~90 modules | **46 modules** | — |
+| Runtime import, `./utils/ask-user-question` | 7 ms (unreachable) | **~8 ms, 1 module, reachable** | ≤ 8 ms |
+| esbuild inputs, one-util subpath import | 159 | **2** | ≤ 3 |
+| esbuild one-util barrel import (tree-shaken output) | 881 KB | **308 bytes** | — |
+| Bundler barrel import with code-splitting (initial chunk) | ~881 KB (one chunk) | **~22 KB** initial + lazy provider chunks | — |
+| Direct import of each provider module | 2 crash | **0 crash** | 0 |
+| Breaking API changes | — | **0** | 0 |
+
+**Bundler note (per the design's risk analysis).** The runtime and subpath wins
+are unconditional. For a bundler that ingests the *whole barrel*, the provider
+bodies drop out of the initial load only when the bundler **code-splits**
+dynamic `import()` (Next/webpack/turbopack do — see the ~22 KB initial chunk
+above) or when the consumer marks the package external
+(`serverExternalPackages` in Next). An esbuild bundle with splitting *disabled*
+inlines dynamic imports, so its raw `metafile.inputs` count only drops by the
+`uuid` modules (~141); split or external, the heavy bodies become lazy.
 
 Additive. Point a provider at a custom, Anthropic/OpenAI-compatible endpoint (BYOK, self-hosted gateway, alternative model) per session, without registering a derived provider. One normalized `ProviderConfig.endpoint` is translated to each CLI's own dialect at spawn — Claude via env vars, Codex via a synthesized `[model_providers.custom]` block. Frozen for the process lifetime, so it is a per-`createSession`/per-`exec` property (resume re-applies it).
 

@@ -85,6 +85,14 @@ export interface ProviderCapabilities {
    * dynamic provider should create a session and read its reported state.
    */
   dynamicCapabilities?: boolean;
+  /**
+   * Session identity survives the host process: `session.describe()` produces a
+   * `SessionRecord` and `provider.attachSession(record)` rebuilds read-only
+   * access to it (locate transcript, classify last turn, `catchUp`, `resume`).
+   * `true` for providers with a durable on-disk transcript contract (Claude,
+   * Codex); absent elsewhere. See internal-docs/spec-durable-sessions.md.
+   */
+  durableSessions?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +304,19 @@ export interface ProviderModule {
    * runtime-dispatched recovery flows.
    */
   transcript?: TranscriptOps<unknown>;
+  /**
+   * Rebuild read-only access to a durable session from a `SessionRecord` (as
+   * produced by `session.describe()` / `createSessionRecord`). Present only on
+   * providers with `capabilities.durableSessions === true` (Claude, Codex).
+   *
+   * Attach is read-only: it spawns nothing. It locates the on-disk transcript,
+   * classifies how the last turn ended (`lastTurn`), exposes `catchUp()` to
+   * replay normalized events with checkpointable offsets, and `resume()` to
+   * continue the session live — where `resume` is exactly
+   * `createSession({ ...ctx, sessionParams: record.params })` (one resume path,
+   * never auto-invoked). See internal-docs/spec-durable-sessions.md.
+   */
+  attachSession?(record: SessionRecord, opts?: AttachOptions): Promise<SessionAttachment>;
 }
 
 // Result of looking up a transcript for a given session.
@@ -363,6 +384,104 @@ export interface TranscriptOps<TEvent> {
   }): AsyncIterable<TranscriptYield<TEvent>>;
   /** Cheap "what's the last event + total size?" probe — reads only the tail of the file. */
   peek(filePath: string): Promise<TranscriptPeek<TEvent>>;
+}
+
+// ---------------------------------------------------------------------------
+// Durable sessions — persist/reattach a session across a host restart.
+//
+// The agents underneath agentex are disk-durable and resumable (Claude:
+// transcripts + `--resume`; Codex: SQLite threads + `thread/resume`). These
+// types are the blessed composition of the existing primitives (`sessionCodec`,
+// `transcript` ops, `ctx.sessionParams` resume) so a host persists ONE object
+// (`SessionRecord`) and gets back to a session with `provider.attachSession`.
+// See internal-docs/spec-durable-sessions.md.
+// ---------------------------------------------------------------------------
+
+/**
+ * Durable, JSON-serializable identity of a session — the one object a host
+ * persists to get back to a session after a restart. Produce with
+ * `session.describe()` or `createSessionRecord(...)`; consume with
+ * `provider.attachSession(record)`.
+ */
+export interface SessionRecord {
+  version: 1;
+  /** Provider type (registry key) that owns this session. */
+  providerType: string;
+  /** Codec-serialized session params (e.g. `{sessionId, cwd?}`). */
+  params: Record<string, unknown>;
+  /** Working directory the session ran in — transcript-lookup hint. */
+  cwd: string | null;
+  /** Human-facing id (`sessionCodec.getDisplayId`), for UIs/logs. */
+  displayId: string | null;
+  /** ISO timestamp of when this record was produced/refreshed. */
+  updatedAt: string;
+}
+
+/** How the last *persisted* turn of an attached session ended. */
+export type LastTurnStatus =
+  /** Terminal marker present (Claude `result`; Codex `task_complete`). */
+  | "completed"
+  /**
+   * Transcript ends without a terminal marker. Either the turn was cut off
+   * (host died mid-turn) OR another process is driving the session right
+   * now — attach cannot distinguish; hosts gate on their own running flag.
+   */
+  | "interrupted"
+  /** No transcript found, or it was empty/unreadable. */
+  | "unknown";
+
+/** One replayed event from `SessionAttachment.catchUp()`. */
+export interface CatchUpYield {
+  /** Normalized event (same vocabulary as live `onEvent`). */
+  event: StreamEvent;
+  /**
+   * Byte offset just past the transcript LINE this event came from — pass back
+   * as `fromOffset` to resume. NOTE: it is **line-granular**, not per-event: a
+   * single Claude line (e.g. an assistant message with a text block + a
+   * `tool_use` block) yields multiple events that all share this one offset. So
+   * an offset is a safe resume point only once EVERY event carrying it has been
+   * consumed — resuming from it re-opens the file at the *next* line. Checkpoint
+   * at line boundaries (persist an offset only after it advances vs the previous
+   * yield, or once the loop drains); persisting mid-line-group and crashing
+   * would skip that group's remaining events on resume. (Codex is currently 1:1
+   * here — each normalizer branch happens to return one event — so today this
+   * only bites Claude tool-call turns.)
+   */
+  offset: number;
+  /** Stable wire id for dedup vs live events (Claude); null when the provider has none (Codex). */
+  eventId: string | null;
+}
+
+export interface CatchUpOptions {
+  /** Resume reading from a previously checkpointed offset. */
+  fromOffset?: number;
+  /** Claude only: additionally skip events up to this wire id (defensive dedup). */
+  sinceEventId?: string;
+}
+
+export interface AttachOptions {
+  /** Env overlay for home-dir resolution (same vars the transcript helpers honor). */
+  env?: Record<string, string>;
+}
+
+/** Read-only reattachment to a session's durable state. See `attachSession`. */
+export interface SessionAttachment {
+  /** The input record, normalized through the provider's `sessionCodec`. */
+  record: SessionRecord;
+  /** Located on-disk transcript, or null (then `lastTurn` is "unknown"). */
+  transcript: FoundTranscript | null;
+  lastTurn: LastTurnStatus;
+  /** Replay normalized events from the transcript. Never spawns anything. */
+  catchUp(opts?: CatchUpOptions): AsyncIterable<CatchUpYield>;
+  /**
+   * Continue the session live. Exactly equivalent to
+   * `provider.createSession({ ...ctx, sessionParams: record.params })` —
+   * same resume path, nothing new. Never called automatically.
+   * NOTE: pending user-input requests from before the restart are gone
+   * (the old process's stdio died); if `lastTurn === "interrupted"`,
+   * re-prompt or re-send as appropriate.
+   */
+  resume(ctx?: SessionContext): Promise<AgentSession>;
 }
 
 // Execution input
@@ -798,6 +917,15 @@ export type AuthRequiredReason =
   | "routines_disabled"
   | "unknown";
 
+/**
+ * Normalized streaming events, discriminated on `type`.
+ *
+ * Union-growth policy: this union grows in minor versions as new provider
+ * events are modeled (the `goal_status` variant is the precedent). Consumers
+ * MUST keep a `default` branch when switching on `type` — an unmodeled wire
+ * event surfaces as `type: "unknown"` today, and a future first-class variant
+ * you don't yet handle must not break your dispatch.
+ */
 // Stream events — discriminated union
 export type StreamEvent =
   | ({
@@ -1357,6 +1485,15 @@ export interface AgentSession {
 
   /** Terminate the session and kill the underlying process. */
   close(): Promise<void>;
+
+  /**
+   * Produce a durable, JSON-serializable `SessionRecord` a host can persist to
+   * reattach after a restart (via `provider.attachSession`). Returns null until
+   * the provider has assigned a session id (watch for the first `system` /
+   * session event). Present only on providers with
+   * `capabilities.durableSessions === true`.
+   */
+  describe?(): SessionRecord | null;
 }
 
 /** Result of a single turn within a session. */

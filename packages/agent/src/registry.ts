@@ -8,10 +8,6 @@ import { cursorProvider } from "./providers/cursor/index.js";
 import { opencodeProvider } from "./providers/opencode/index.js";
 import { piProvider } from "./providers/pi/index.js";
 import { copilotProvider } from "./providers/copilot/index.js";
-// Side-effect import: registers the ACP factory so `loadProvidersFromConfig`
-// can build `extends: "acp"` providers. Cheap — the ACP SDK is only loaded when
-// an ACP session actually runs.
-import "./providers/acp/index.js";
 
 const providers = new Map<string, ProviderModule>();
 

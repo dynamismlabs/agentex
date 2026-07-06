@@ -1,8 +1,6 @@
 import type { ProviderModule, SessionContext, AgentSession } from "../../types.js";
-import { executePiProvider } from "./execute.js";
 import { piSessionCodec } from "./codec.js";
 import { resolveAuthForProvider } from "../../utils/auth.js";
-import { createPiSession } from "./session.js";
 import { EMULATED_GOAL_CAPABILITY } from "../../goals/index.js";
 
 export const piProvider: ProviderModule = {
@@ -23,9 +21,10 @@ export const piProvider: ProviderModule = {
     goals: EMULATED_GOAL_CAPABILITY,
   },
   // One-shot `pi --mode rpc` for execute(); a persistent `pi --mode rpc` process
-  // across turns for createSession().
-  execute: executePiProvider,
-  createSession: (ctx: SessionContext): Promise<AgentSession> => createPiSession(ctx),
+  // across turns for createSession(). Both load lazily on first use.
+  execute: async (ctx) => (await import("./execute.js")).executePiProvider(ctx),
+  createSession: async (ctx: SessionContext): Promise<AgentSession> =>
+    (await import("./session.js")).createPiSession(ctx),
   resolveAuth: (ctx) => resolveAuthForProvider("pi", ctx),
   sessionCodec: piSessionCodec,
 };

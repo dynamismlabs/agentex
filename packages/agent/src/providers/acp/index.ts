@@ -1,25 +1,13 @@
 import type {
   AuthReport,
   AuthResolveContext,
-  ExecutionContext,
-  ExecutionResult,
-  ExecutionStatus,
   ListModesOptions,
   ProviderModel,
   ProviderModule,
   SessionContext,
-  TurnResult,
-  AgentSession,
 } from "../../types.js";
 import { ensureCommandResolvable } from "../../utils/binary.js";
-import { uuidv7 } from "../../utils/uuid.js";
-import { registerAcpFactory } from "../../derived.js";
-import {
-  createAcpSession,
-  listAcpModes,
-  type AcpSessionDeps,
-  type AcpTransformers,
-} from "./session.js";
+import type { AcpSessionDeps, AcpTransformers } from "./session.js";
 
 /**
  * Configuration for a generic ACP-backed provider. The canonical use is the
@@ -44,99 +32,6 @@ export interface AcpProviderConfig {
   modeId?: string;
   /** Per-agent quirk transformers (modes / modeId). */
   transformers?: AcpTransformers;
-}
-
-function mapTurnStatus(status: TurnResult["status"]): ExecutionStatus {
-  switch (status) {
-    case "completed":
-    case "max_turns":
-    case "max_budget":
-      return "completed";
-    case "failed":
-      return "failed";
-    case "aborted":
-      return "aborted";
-    case "timeout":
-      return "timeout";
-    default:
-      return "completed";
-  }
-}
-
-async function runAcpExecute(
-  deps: AcpSessionDeps,
-  ctx: ExecutionContext,
-): Promise<ExecutionResult> {
-  const runId = ctx.runId ?? uuidv7();
-  const startedAt = new Date().toISOString();
-  const startMs = Date.now();
-  const model = ctx.model ?? ctx.config?.model ?? null;
-
-  const sessionCtx: SessionContext = {
-    ...(ctx.cwd !== undefined ? { cwd: ctx.cwd } : {}),
-    ...(ctx.env !== undefined ? { env: ctx.env } : {}),
-    ...(ctx.config !== undefined ? { config: ctx.config } : {}),
-    ...(ctx.onEvent ? { onEvent: ctx.onEvent } : {}),
-    ...(ctx.onOutput ? { onOutput: ctx.onOutput } : {}),
-    ...(ctx.signal ? { signal: ctx.signal } : {}),
-  };
-
-  const base = {
-    runId,
-    startedAt,
-    signal: null as string | null,
-    model,
-    summary: null as string | null,
-    sessionParams: null as Record<string, unknown> | null,
-    sessionDisplayId: null as string | null,
-    clearSession: false,
-    billingType: null,
-  };
-
-  let session: AgentSession | null = null;
-  try {
-    session = await createAcpSession(deps, sessionCtx);
-    const handle = await session.send(ctx.prompt, {
-      ...(ctx.config?.timeoutSec ? { timeoutSec: ctx.config.timeoutSec } : {}),
-      ...(ctx.signal ? { signal: ctx.signal } : {}),
-    });
-    const turn = await handle.result;
-    const sessionId = session.sessionId;
-    await session.close();
-    return {
-      ...base,
-      completedAt: new Date().toISOString(),
-      durationMs: Date.now() - startMs,
-      exitCode: turn.status === "completed" ? 0 : 1,
-      status: mapTurnStatus(turn.status),
-      errorMessage: turn.errorMessage,
-      errorCode: turn.errorCode,
-      summary: turn.summary,
-      ...(turn.usage ? { usage: turn.usage as ExecutionResult["usage"] } : {}),
-      costUsd: turn.costUsd,
-      sessionParams: sessionId ? { sessionId } : null,
-      sessionDisplayId: sessionId,
-    };
-  } catch (err) {
-    if (session) {
-      try {
-        await session.close();
-      } catch {
-        /* ignore */
-      }
-    }
-    return {
-      ...base,
-      completedAt: new Date().toISOString(),
-      durationMs: Date.now() - startMs,
-      exitCode: 1,
-      signal: null,
-      status: "failed",
-      errorMessage: err instanceof Error ? err.message : String(err),
-      errorCode: "acp_error",
-      costUsd: null,
-    };
-  }
 }
 
 async function resolveAcpAuth(
@@ -190,10 +85,13 @@ export function acpProvider(config: AcpProviderConfig): ProviderModule {
       // Real capability set is negotiated at the ACP initialize handshake.
       dynamicCapabilities: true,
     },
-    execute: (ctx) => runAcpExecute(deps, ctx),
-    createSession: (ctx) => createAcpSession(deps, ctx),
+    // Session machinery (+ the ACP SDK it dynamically imports) loads only when
+    // an ACP provider is actually invoked — index.ts stays a light leaf.
+    execute: async (ctx) => (await import("./session.js")).runAcpExecute(deps, ctx),
+    createSession: async (ctx) => (await import("./session.js")).createAcpSession(deps, ctx),
     resolveAuth: (authCtx) => resolveAcpAuth(config, authCtx),
-    listModes: (opts?: ListModesOptions) => listAcpModes(deps, opts as SessionContext | undefined),
+    listModes: async (opts?: ListModesOptions) =>
+      (await import("./session.js")).listAcpModes(deps, opts as SessionContext | undefined),
   };
 
   if (config.models) {
@@ -203,8 +101,3 @@ export function acpProvider(config: AcpProviderConfig): ProviderModule {
 
   return provider;
 }
-
-// Register the factory so `loadProvidersFromConfig({ extends: "acp" })` can
-// build ACP providers. Importing this module is cheap — the SDK is only loaded
-// when a session/execute actually runs (dynamic import in session.ts).
-registerAcpFactory(acpProvider);

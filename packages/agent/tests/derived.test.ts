@@ -5,7 +5,9 @@ import {
   MalformedProviderConfigError,
   getProvider,
   registerProvider,
+  registerAcpFactory,
   listProviders,
+  acpProvider,
 } from "../src/index.js";
 import type {
   ProviderModule,
@@ -204,5 +206,57 @@ describe("loadProvidersFromConfig", () => {
       { register: false },
     );
     expect(built).toHaveLength(1);
+  });
+
+  it("builds an extends:'acp' provider via the default factory (no registerAcpFactory needed)", () => {
+    // The cycle fix (spec §5.3) makes the built-in acpProvider the default ACP
+    // factory, so ACP configs load without any prior import/registration.
+    const built = loadProvidersFromConfig(
+      { providers: { myacp: { extends: "acp", command: ["gemini", "--acp"] } } },
+      { register: false },
+    );
+    expect(built).toHaveLength(1);
+    expect(built[0]!.type).toBe("myacp");
+    // ACP providers are session-capable and negotiate real capabilities at
+    // handshake — a cheap structural proof the acpProvider factory built it.
+    expect(built[0]!.capabilities.sessions).toBe(true);
+    expect(typeof built[0]!.execute).toBe("function");
+  });
+
+  it("honors a custom registerAcpFactory override for extends:'acp'", () => {
+    const calls: Array<{ id: string; command: string[] }> = [];
+    const custom = (cfg: { id: string; command: string[] }): ProviderModule => {
+      calls.push({ id: cfg.id, command: cfg.command });
+      return {
+        type: cfg.id,
+        capabilities: {
+          sessions: true,
+          modelDiscovery: false,
+          quotaProbing: false,
+          mcp: false,
+          skills: false,
+          instructions: false,
+          workspace: false,
+          planMode: false,
+          concurrentSend: false,
+          cancelQueuedMessage: false,
+          modes: false,
+        },
+        execute: async () => fakeResult,
+        resolveAuth: async () => ({ ...fakeAuth, providerType: cfg.id }),
+      };
+    };
+    try {
+      registerAcpFactory(custom as never);
+      const built = loadProvidersFromConfig(
+        { providers: { ov: { extends: "acp", command: ["x", "--acp"] } } },
+        { register: false },
+      );
+      expect(built).toHaveLength(1);
+      expect(calls).toEqual([{ id: "ov", command: ["x", "--acp"] }]);
+    } finally {
+      // Restore the default factory so other tests see the built-in path.
+      registerAcpFactory(acpProvider as never);
+    }
   });
 });

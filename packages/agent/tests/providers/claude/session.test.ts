@@ -5,6 +5,7 @@ import {
   ClaudeSessionImpl,
   buildPermissionResponse,
 } from "../../../src/providers/claude/session.js";
+import { assertSessionRecord } from "../../../src/sessions/index.js";
 import type {
   SessionContext,
   StreamEvent,
@@ -779,5 +780,51 @@ describe("ClaudeSession — tool_result.toolName", () => {
     await turnResult;
     const tr = events.find((e) => e.type === "tool_result");
     expect(tr?.type === "tool_result" && tr.toolName).toBeNull();
+  });
+});
+
+describe("ClaudeSession — describe()", () => {
+  function make(ctx: SessionContext) {
+    const { proc } = makeFakeProc();
+    const session = new ClaudeSessionImpl(proc, ctx, null);
+    const feed = (line: string): void =>
+      (session as unknown as { handleLine: (l: string) => void }).handleLine(line);
+    return { session, feed };
+  }
+
+  it("returns null before Claude assigns a session id", () => {
+    const { session } = make({ cwd: "/work" });
+    expect(session.describe()).toBeNull();
+  });
+
+  it("returns a valid SessionRecord after the session id event", () => {
+    const { session, feed } = make({ cwd: "/work" });
+    feed(ndjson({
+      type: "system",
+      subtype: "init",
+      session_id: "sess-abc",
+      cwd: "/work",
+      model: "claude-sonnet",
+      tools: [],
+      permissionMode: "default",
+    }));
+
+    const rec = session.describe();
+    expect(rec).not.toBeNull();
+    expect(() => assertSessionRecord(rec)).not.toThrow();
+    expect(rec!.version).toBe(1);
+    expect(rec!.providerType).toBe("claude");
+    expect(rec!.params).toMatchObject({ sessionId: "sess-abc", cwd: "/work" });
+    expect(rec!.cwd).toBe("/work");
+    expect(rec!.displayId).toBe("sess-abc");
+    expect(typeof rec!.updatedAt).toBe("string");
+  });
+
+  it("omits cwd from params/record when the session had none", () => {
+    const { session, feed } = make({});
+    feed(ndjson({ type: "system", subtype: "init", session_id: "s2", model: "m", tools: [], permissionMode: "default" }));
+    const rec = session.describe();
+    expect(rec!.cwd).toBeNull();
+    expect(rec!.params).toEqual({ sessionId: "s2" });
   });
 });

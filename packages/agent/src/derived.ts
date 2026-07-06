@@ -5,6 +5,7 @@ import type {
   ProviderModule,
 } from "./types.js";
 import { getProvider, registerProvider } from "./registry.js";
+import { acpProvider } from "./providers/acp/index.js";
 
 /**
  * Declarative configuration for a *derived* provider — a new provider id that
@@ -60,9 +61,11 @@ export type AcpFactory = (config: {
 let acpFactory: AcpFactory | null = null;
 
 /**
- * Registered by `@agentex/agent`'s ACP provider module on import, so the
- * config-file loader can build `extends: "acp"` providers without a hard
- * dependency on the ACP SDK at the top of the module graph.
+ * Override the factory used to build `extends: "acp"` providers. Optional — the
+ * loader defaults to the built-in `acpProvider` (imported statically here, which
+ * is cheap: the ACP SDK is only loaded when a session/execute actually runs).
+ * Kept for tests/hosts that need to swap in a custom ACP factory; it is no
+ * longer required before `loadProvidersFromConfig`.
  */
 export function registerAcpFactory(factory: AcpFactory): void {
   acpFactory = factory;
@@ -269,13 +272,11 @@ export function loadProvidersFromConfig(
 
     let provider: ProviderModule;
     if (entry.extends === "acp") {
-      if (!acpFactory) {
-        throw new MalformedProviderConfigError(
-          `${path}: ACP providers require the ACP module — import it (e.g. \`@agentex/agent\`'s acp provider) before loading ACP configs`,
-          path,
-        );
-      }
-      provider = acpFactory({
+      // The ACP provider module is imported statically above, so `acpProvider`
+      // is always the default factory. `registerAcpFactory` stays supported as
+      // an override hook (tests/hosts can swap in a custom factory).
+      const factory = acpFactory ?? acpProvider;
+      provider = factory({
         id,
         command: toCommandArray(entry.command, path),
         ...(env ? { env } : {}),

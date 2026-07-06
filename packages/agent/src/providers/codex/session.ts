@@ -5,13 +5,13 @@ import type {
   AgentSession,
   CancelResult,
   ClearGoalResult,
-  GoalCapability,
   GoalOptions,
   GoalState,
   StopTaskResult,
   SendHandle,
   SendOptions,
   SessionContext,
+  SessionRecord,
   SessionState,
   SetGoalResult,
   StreamEvent,
@@ -19,6 +19,8 @@ import type {
   UserInputResponse,
 } from "../../types.js";
 import { GoalController, normalizeCodexGoalRecord, isTerminalGoalStatus } from "../../goals/index.js";
+import { codexGoalCapability } from "./goal-capability.js";
+import { createSessionRecord } from "../../sessions/record.js";
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { translateEndpoint } from "../../utils/endpoint.js";
@@ -296,20 +298,12 @@ export async function createCodexSession(ctx: SessionContext): Promise<AgentSess
 // Implementation
 // ---------------------------------------------------------------------------
 
-/** @internal Exported for unit testing — not part of the public API. */
 /**
- * Codex carries goals as durable thread state mutated by model tools
- * (create_goal/update_goal/get_goal). Advisory — the model self-reports; no
- * turn-end gate. Goal mode is experimental and feature-gated upstream, so the
- * native arm is best-effort and falls back to emulation (see spec §7.2).
+ * @internal Re-exported for existing import sites; the const now lives in the
+ * leaf `goal-capability.ts` so `index.ts` can read it without loading this
+ * heavy session module (spec §5.1).
  */
-export const codexGoalCapability: GoalCapability = {
-  mechanism: "model-tools",
-  enforced: false,
-  statuses: ["active", "paused", "met", "blocked", "cleared"],
-  clears: "manual",
-  telemetry: true,
-};
+export { codexGoalCapability } from "./goal-capability.js";
 
 export class CodexSessionImpl implements AgentSession {
   private _state: SessionState = "idle";
@@ -448,6 +442,23 @@ export class CodexSessionImpl implements AgentSession {
 
   get sessionId(): string | null { return this._threadId; }
   get state(): SessionState { return this._state; }
+
+  /**
+   * Durable identity for persistence + later `attachSession`. Null until Codex
+   * has assigned a thread id; serializes `{sessionId, cwd}` through the codec so
+   * it round-trips back into `thread/resume`.
+   */
+  describe(): SessionRecord | null {
+    if (!this._threadId) return null;
+    const params = codexSessionCodec.serialize({ sessionId: this._threadId, cwd: this.cwd });
+    if (!params) return null;
+    return createSessionRecord({
+      providerType: "codex",
+      params,
+      cwd: this.cwd,
+      displayId: codexSessionCodec.getDisplayId?.(params) ?? null,
+    });
+  }
 
   // -------------------------------------------------------------------------
   // JSON-RPC send helpers

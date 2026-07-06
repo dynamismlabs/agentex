@@ -45,6 +45,7 @@ describe("ProviderCapabilities", () => {
         clears: "both",
         telemetry: false,
       },
+      durableSessions: true,
     });
   });
 
@@ -115,6 +116,21 @@ describe("ProviderCapabilities", () => {
     const codex = getProvider("codex").capabilities;
     expect(codex.skillInventory).toBe("local-discovery");
     expect(codex.skillInvocation).toBe("expanded-prompt");
+  });
+
+  it("advertises durableSessions only where attachSession is implemented", () => {
+    // Honest capability detection (spec §2): true for claude/codex, absent
+    // elsewhere — and the flag must match the presence of `attachSession`.
+    for (const type of ["claude", "codex"]) {
+      const p = getProvider(type);
+      expect(p.capabilities.durableSessions).toBe(true);
+      expect(typeof p.attachSession).toBe("function");
+    }
+    for (const type of ["openclaw", "cursor", "process", "opencode", "pi", "gemini", "copilot"]) {
+      const p = getProvider(type);
+      expect(p.capabilities.durableSessions).toBeUndefined();
+      expect(p.attachSession).toBeUndefined();
+    }
   });
 
   it("openclaw has no capabilities", () => {

@@ -511,6 +511,58 @@ process.on("SIGTERM", async () => {
 
 `drain()` is idempotent. Bump `ProviderConfig.graceSec` for sessions running legitimately long tools (test suites, long Bash) so `close()`/`drain()` don't hard-kill them prematurely.
 
+### Reattach after a restart (durable sessions)
+
+Claude and Codex sessions are disk-durable and resumable. Persist one blessed identity object — a `SessionRecord` from `session.describe()` — and after your host restarts, `provider.attachSession(record)` gets you back to it: it locates the on-disk transcript, tells you how the last turn ended, replays the events with checkpointable offsets, and (only when you ask) resumes the session live. Attach is **read-only** — it spawns nothing, and `resume()` is never called automatically. Check `provider.capabilities.durableSessions` first (`true` for `claude`/`codex`).
+
+```typescript
+import { getProvider } from "@agentex/agent";
+import type { SessionRecord } from "@agentex/agent";
+
+// --- While the session runs: persist its identity once the id is known ---
+const provider = getProvider("claude");
+const session = await provider.createSession({ cwd, onEvent });
+await session.send("start the task");
+const record = session.describe();      // null until the session id arrives
+if (record) await store.save(record);   // your DB / JSON file — it's plain JSON
+
+// ... host process restarts ...
+
+// --- After restart: reattach from the stored record ---
+const saved: SessionRecord = await store.load();
+const attachment = await provider.attachSession(saved);
+
+console.log(attachment.lastTurn);       // "completed" | "interrupted" | "unknown"
+
+// Replay what happened while you were gone, checkpointing the offset so the
+// next catch-up resumes where this one stopped. The offset is LINE-granular: a
+// single Claude line (assistant text + a `tool_use`) yields several events that
+// share one offset, so checkpoint only at line boundaries — after a line is
+// fully drained — else a crash mid-line would skip that line's remaining events
+// on resume. (Codex currently emits one event per line, so today this only bites Claude.)
+let checkpoint = store.lastOffset ?? 0;
+let lineEnd: number | undefined;        // offset of the line currently being drained
+for await (const { event, offset } of attachment.catchUp({ fromOffset: checkpoint })) {
+  if (lineEnd !== undefined && offset !== lineEnd) {
+    checkpoint = lineEnd;               // a new line started → prior line fully ingested
+    await store.saveOffset(checkpoint);
+  }
+  await ingest(event);                  // same normalized StreamEvent as live onEvent
+  lineEnd = offset;
+}
+if (lineEnd !== undefined) await store.saveOffset(lineEnd); // final line drained
+
+// Continue live only when you decide to — this is exactly createSession + the
+// record's params (one resume path). Pending user-input from before the crash
+// is gone, so re-prompt when lastTurn === "interrupted".
+if (attachment.lastTurn === "interrupted") {
+  const live = await attachment.resume({ cwd, onEvent });
+  await live.send("continue where we left off");
+}
+```
+
+Dedup replayed events against anything you saw live: Claude events carry a stable wire `eventId` (upsert on it); Codex has none (`eventId: null`), so gate replay on your own "not currently running" flag. A runnable end-to-end proof — start a session, crash the host mid-turn, reattach in a fresh process — lives in `scripts/durable-session-demo.ts` (`pnpm demo:durable`).
+
 ## Plan Mode
 
 Run an agent in read-only "plan" mode — it investigates and proposes a plan but cannot edit files or run mutating commands. Same goal in both providers, **different mechanism** in each. Check `provider.capabilities.planMode` before relying on it.

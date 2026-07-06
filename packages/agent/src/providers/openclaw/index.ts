@@ -1,5 +1,4 @@
 import type { ProviderModule } from "../../types.js";
-import { executeOpenclawProvider } from "./execute.js";
 import { openclawSessionCodec } from "./codec.js";
 
 export const openclawProvider: ProviderModule = {
@@ -18,7 +17,8 @@ export const openclawProvider: ProviderModule = {
     stopTask: false,
     modes: false,
   },
-  execute: executeOpenclawProvider,
+  // execute.ts loads lazily on first use.
+  execute: async (ctx) => (await import("./execute.js")).executeOpenclawProvider(ctx),
   resolveAuth: async () => ({
     providerType: "openclaw",
     binary: { installed: true }, // openclaw is a gateway URL, not a local binary

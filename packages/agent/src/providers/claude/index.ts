@@ -1,10 +1,9 @@
 import type { ProviderModule, SessionContext, AgentSession, QuotaContext, QuotaStatus } from "../../types.js";
 import { detectAuth, resolveAuthForProvider } from "../../utils/auth.js";
-import { executeClaudeProvider } from "./execute.js";
-import { createClaudeSession, claudeGoalCapability } from "./session.js";
 import { claudeSessionCodec } from "./codec.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { claudeTranscriptOps } from "./transcript.js";
+import { claudeGoalCapability } from "./goal-capability.js";
 
 async function checkQuota(ctx: QuotaContext): Promise<QuotaStatus> {
   const env = buildEnv(ctx.env);
@@ -35,13 +34,20 @@ export const claudeProvider: ProviderModule = {
     stopTask: true,
     modes: false,
     goals: claudeGoalCapability,
+    durableSessions: true,
   },
-  execute: executeClaudeProvider,
-  createSession: (ctx: SessionContext): Promise<AgentSession> => createClaudeSession(ctx),
+  // Heavy machinery (execute.ts, session.ts, attach.ts) loads lazily on first
+  // use — every ProviderModule method is already async, so this is invisible to
+  // callers.
+  execute: async (ctx) => (await import("./execute.js")).executeClaudeProvider(ctx),
+  createSession: async (ctx: SessionContext): Promise<AgentSession> =>
+    (await import("./session.js")).createClaudeSession(ctx),
   resolveAuth: (ctx) => resolveAuthForProvider("claude", ctx),
   sessionCodec: claudeSessionCodec,
   checkQuota,
   transcript: claudeTranscriptOps,
+  attachSession: async (record, opts) =>
+    (await import("./attach.js")).attachClaudeSession(record, opts),
 };
 
 export {

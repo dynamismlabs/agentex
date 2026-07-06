@@ -107,6 +107,7 @@ export {
   parseCodexLine,
   resolveCodexHome,
 } from "./providers/codex/transcript.js";
+export { codexLineToStreamEvents } from "./providers/codex/transcript-normalize.js";
 export type {
   GetCodexTranscriptPathOptions,
   CodexTranscriptLocation,
@@ -217,6 +218,24 @@ export type {
   GoalStatusEvent,
   NormalizedGoalFields,
 } from "./goals/index.js";
+
+// Durable sessions
+export {
+  SESSION_RECORD_VERSION,
+  MalformedSessionRecordError,
+  createSessionRecord,
+  isSessionRecord,
+  assertSessionRecord,
+} from "./sessions/index.js";
+export type { CreateSessionRecordInput } from "./sessions/index.js";
+export type {
+  SessionRecord,
+  LastTurnStatus,
+  CatchUpYield,
+  CatchUpOptions,
+  AttachOptions,
+  SessionAttachment,
+} from "./types.js";
 
 export type {
   AskUserQuestion,

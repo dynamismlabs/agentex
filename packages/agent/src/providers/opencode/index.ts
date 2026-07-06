@@ -1,8 +1,6 @@
 import type { ProviderModule, SessionContext, AgentSession } from "../../types.js";
-import { executeOpenCodeProvider } from "./execute.js";
 import { opencodeSessionCodec } from "./codec.js";
 import { resolveAuthForProvider } from "../../utils/auth.js";
-import { createOpenCodeSession } from "./http-session.js";
 import { EMULATED_GOAL_CAPABILITY } from "../../goals/index.js";
 
 export const opencodeProvider: ProviderModule = {
@@ -23,9 +21,10 @@ export const opencodeProvider: ProviderModule = {
     goals: EMULATED_GOAL_CAPABILITY,
   },
   // One-shot `opencode run` for execute(); live HTTP/SSE sessions via the
-  // `opencode serve` daemon for createSession().
-  execute: executeOpenCodeProvider,
-  createSession: (ctx: SessionContext): Promise<AgentSession> => createOpenCodeSession(ctx),
+  // `opencode serve` daemon for createSession(). Both load lazily on first use.
+  execute: async (ctx) => (await import("./execute.js")).executeOpenCodeProvider(ctx),
+  createSession: async (ctx: SessionContext): Promise<AgentSession> =>
+    (await import("./http-session.js")).createOpenCodeSession(ctx),
   resolveAuth: (ctx) => resolveAuthForProvider("opencode", ctx),
   sessionCodec: opencodeSessionCodec,
 };

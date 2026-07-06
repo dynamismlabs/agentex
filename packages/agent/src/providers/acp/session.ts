@@ -7,6 +7,9 @@ import type {
   AgentMode,
   CancelResult,
   ClearGoalResult,
+  ExecutionContext,
+  ExecutionResult,
+  ExecutionStatus,
   GoalOptions,
   GoalState,
   StopTaskResult,
@@ -638,4 +641,104 @@ export function parseAcpModes(modeState: unknown): AgentMode[] {
     });
   }
   return out;
+}
+
+/** Map a session `TurnResult.status` to the one-shot `ExecutionStatus`. */
+function mapTurnStatus(status: TurnResult["status"]): ExecutionStatus {
+  switch (status) {
+    case "completed":
+    case "max_turns":
+    case "max_budget":
+      return "completed";
+    case "failed":
+      return "failed";
+    case "aborted":
+      return "aborted";
+    case "timeout":
+      return "timeout";
+    default:
+      return "completed";
+  }
+}
+
+/**
+ * One-shot ACP execute: open a session, send the prompt, await the turn, close.
+ * Lives here (not `index.ts`) so `index.ts` stays a light leaf — this and the
+ * session machinery load only when an ACP provider is actually invoked
+ * (spec §5.1).
+ */
+export async function runAcpExecute(
+  deps: AcpSessionDeps,
+  ctx: ExecutionContext,
+): Promise<ExecutionResult> {
+  const runId = ctx.runId ?? uuidv7();
+  const startedAt = new Date().toISOString();
+  const startMs = Date.now();
+  const model = ctx.model ?? ctx.config?.model ?? null;
+
+  const sessionCtx: SessionContext = {
+    ...(ctx.cwd !== undefined ? { cwd: ctx.cwd } : {}),
+    ...(ctx.env !== undefined ? { env: ctx.env } : {}),
+    ...(ctx.config !== undefined ? { config: ctx.config } : {}),
+    ...(ctx.onEvent ? { onEvent: ctx.onEvent } : {}),
+    ...(ctx.onOutput ? { onOutput: ctx.onOutput } : {}),
+    ...(ctx.signal ? { signal: ctx.signal } : {}),
+  };
+
+  const base = {
+    runId,
+    startedAt,
+    signal: null as string | null,
+    model,
+    summary: null as string | null,
+    sessionParams: null as Record<string, unknown> | null,
+    sessionDisplayId: null as string | null,
+    clearSession: false,
+    billingType: null,
+  };
+
+  let session: AgentSession | null = null;
+  try {
+    session = await createAcpSession(deps, sessionCtx);
+    const handle = await session.send(ctx.prompt, {
+      ...(ctx.config?.timeoutSec ? { timeoutSec: ctx.config.timeoutSec } : {}),
+      ...(ctx.signal ? { signal: ctx.signal } : {}),
+    });
+    const turn = await handle.result;
+    const sessionId = session.sessionId;
+    await session.close();
+    return {
+      ...base,
+      completedAt: new Date().toISOString(),
+      durationMs: Date.now() - startMs,
+      exitCode: turn.status === "completed" ? 0 : 1,
+      status: mapTurnStatus(turn.status),
+      errorMessage: turn.errorMessage,
+      errorCode: turn.errorCode,
+      summary: turn.summary,
+      ...(turn.usage ? { usage: turn.usage as ExecutionResult["usage"] } : {}),
+      costUsd: turn.costUsd,
+      sessionParams: sessionId ? { sessionId } : null,
+      sessionDisplayId: sessionId,
+    };
+  } catch (err) {
+    if (session) {
+      try {
+        await session.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    return {
+      ...base,
+      completedAt: new Date().toISOString(),
+      durationMs: Date.now() - startMs,
+      exitCode: 1,
+      signal: null,
+      status: "failed",
+      errorMessage: err instanceof Error ? err.message : String(err),
+      errorCode: "acp_error",
+      costUsd: null,
+    };
+  }
 }
