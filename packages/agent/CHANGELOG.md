@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.0.27 — Codex session reasoning effort
+
+### Fixed
+
+- **Codex session reasoning effort.** Multi-turn Codex sessions now forward
+  `ProviderConfig.effort` through the app-server `turn/start.effort` field.
+  The one-shot `execute()` path already mapped effort to
+  `model_reasoning_effort`; `createSession()` now honors the same provider
+  contract for both fresh and resumed threads.
+
 ## 0.0.26 — durable sessions: `describe` / `attachSession` / `catchUp`
 
 Additive, **zero breaking changes**. Every addition is an optional interface

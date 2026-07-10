@@ -485,6 +485,50 @@ function paramsFor(writes: Array<Record<string, unknown>>, method: string): Reco
   return (msg?.["params"] as Record<string, unknown>) ?? {};
 }
 
+describe("CodexSession — reasoning effort", () => {
+  it("forwards ProviderConfig.effort to turn/start", async () => {
+    const { proc, writes } = makeRpcProc({
+      initialize: () => ({}),
+      "thread/start": () => ({ thread: { id: "thr_effort" } }),
+      "turn/start": () => ({ turn: { id: "turn_effort", status: "inProgress" } }),
+    });
+    const session = new CodexSessionImpl(
+      proc,
+      { config: { effort: "xhigh" } },
+      "/tmp",
+      "test-model",
+      null,
+    );
+    await session.handshake();
+
+    const handle = await session.send("Solve carefully");
+    expect(paramsFor(writes, "turn/start")["effort"]).toBe("xhigh");
+
+    (session as unknown as { handleLine: (line: string) => void }).handleLine(
+      ndjson({ type: "turn.completed" }),
+    );
+    await handle.result;
+  });
+
+  it("omits effort when the provider config does not override it", async () => {
+    const { proc, writes } = makeRpcProc({
+      initialize: () => ({}),
+      "thread/start": () => ({ thread: { id: "thr_default_effort" } }),
+      "turn/start": () => ({ turn: { id: "turn_default_effort", status: "inProgress" } }),
+    });
+    const session = new CodexSessionImpl(proc, {}, "/tmp", "test-model", null);
+    await session.handshake();
+
+    const handle = await session.send("Use the configured default");
+    expect(paramsFor(writes, "turn/start")["effort"]).toBeUndefined();
+
+    (session as unknown as { handleLine: (line: string) => void }).handleLine(
+      ndjson({ type: "turn.completed" }),
+    );
+    await handle.result;
+  });
+});
+
 describe("CodexSession — handshake resume", () => {
   it("starts a fresh thread (thread/start) when no sessionParams are given", async () => {
     const { proc, writes } = makeRpcProc({

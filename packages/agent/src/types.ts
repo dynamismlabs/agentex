@@ -567,6 +567,8 @@ export interface ProviderEndpointConfig {
 export interface ProviderConfig {
   command?: string;
   model?: string;
+  /** Provider reasoning effort. Claude maps this to `--effort`; Codex sends
+   *  it as the app-server `turn/start.effort` override. */
   effort?: string;
   maxTurns?: number;
   /**
