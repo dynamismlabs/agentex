@@ -89,7 +89,7 @@ export function detectAuth(providerType: string, env: Record<string, string>): R
       return { method: "subscription", billingType: "subscription" };
     }
     case "cursor": {
-      if (hasEnv(env, "CURSOR_API_KEY") || hasEnv(env, "OPENAI_API_KEY")) {
+      if (hasEnv(env, "CURSOR_API_KEY")) {
         return { method: "api_key", billingType: "api" };
       }
       return { method: "subscription", billingType: "subscription" };
@@ -435,21 +435,50 @@ async function resolveGeminiAuth(ctx?: AuthResolveContext): Promise<AuthReport> 
 }
 
 // ---------------------------------------------------------------------------
-// Cursor / OpenCode / Pi / OpenClaw / Process — no CLI auth commands;
-// straightforward env-only reports with binary status when applicable.
+// Cursor uses its selected binary's `status` command. Other providers in this
+// section use environment or native-store presence reports.
 // ---------------------------------------------------------------------------
 
 async function resolveCursorAuth(ctx?: AuthResolveContext): Promise<AuthReport> {
   const env = buildEnv(ctx?.env);
   const binary = await checkBinary("agent", ctx?.command, env);
+  const apiKey = {
+    method: "api_key" as const,
+    source: { kind: "env" as const, var: "CURSOR_API_KEY" },
+    present: hasEnv(env, "CURSOR_API_KEY"),
+  };
+  let nativePresent = false;
+  let usedCli = false;
+  if (binary.installed && binary.resolvedPath) {
+    try {
+      const result = await runChildProcess({
+        runId: "cursor-auth-status",
+        command: binary.resolvedPath,
+        args: [...binary.prefixArgs, "status"],
+        cwd: process.cwd(),
+        env,
+        timeoutSec: 10,
+      });
+      const output = `${result.stdout}\n${result.stderr}`;
+      nativePresent = result.exitCode === 0 && /logged\s+in|authenticated|account\s*:/i.test(output)
+        && !/not\s+logged\s+in|unauthenticated/i.test(output);
+      usedCli = true;
+    } catch {
+      // Presence remains unknown and false for an unsupported old binary.
+    }
+  }
   return {
     providerType: "cursor",
     binary: stripPrefixArgs(binary),
     options: [
-      { method: "api_key", source: { kind: "env", var: "CURSOR_API_KEY" }, present: hasEnv(env, "CURSOR_API_KEY") },
-      { method: "api_key", source: { kind: "env", var: "OPENAI_API_KEY" }, present: hasEnv(env, "OPENAI_API_KEY") },
+      apiKey,
+      {
+        method: "subscription",
+        source: { kind: "cli", command: "agent status" },
+        present: nativePresent,
+      },
     ],
-    source: "filesystem",
+    source: usedCli ? "cli" : "filesystem",
   };
 }
 

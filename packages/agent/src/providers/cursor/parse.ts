@@ -281,7 +281,7 @@ export function isCursorUnknownSessionError(stdout: string, stderr: string): boo
   return CURSOR_UNKNOWN_SESSION_RE.test(stdout) || CURSOR_UNKNOWN_SESSION_RE.test(stderr);
 }
 
-const CURSOR_AUTH_RE = /CURSOR_API_KEY\s+is\s+not\s+set|OPENAI_API_KEY\s+is\s+not\s+set|unauthorized|authentication.*required/i;
+const CURSOR_AUTH_RE = /CURSOR_API_KEY\s+is\s+not\s+set|unauthorized|authentication.*required|not\s+logged\s+in/i;
 
 export function isCursorAuthRequired(stdout: string, stderr: string): boolean {
   return CURSOR_AUTH_RE.test(stdout) || CURSOR_AUTH_RE.test(stderr);

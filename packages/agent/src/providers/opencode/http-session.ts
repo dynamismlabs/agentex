@@ -12,13 +12,17 @@ import type {
   SetGoalResult,
   StreamEvent,
   TurnResult,
+  UserInputResponse,
 } from "../../types.js";
 import { GoalController, EMULATED_GOAL_CAPABILITY } from "../../goals/index.js";
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { uuidv7 } from "../../utils/uuid.js";
 import { acquireOpenCodeServer, type OpenCodeServerHandle } from "./server.js";
+import type { OpenCodeClient } from "./client.js";
+import { createSessionRecord } from "../../sessions/record.js";
 import { opencodeSessionCodec } from "./codec.js";
+import { prepareOpenCodeSkillConfig } from "./skill-config.js";
 import {
   assistantTextFromParts,
   mapOpenCodePart,
@@ -63,7 +67,8 @@ class OpenCodeSession implements AgentSession {
   private _state: SessionState = "idle";
   private _sessionId: string | null = null;
   private server: OpenCodeServerHandle | null = null;
-  private url = "";
+  private client: OpenCodeClient | null = null;
+  private cwd = "";
   private readonly model: { providerID: string; modelID: string } | null;
 
   private _turnActive = false;
@@ -79,6 +84,12 @@ class OpenCodeSession implements AgentSession {
   private readonly _emittedToolCall = new Set<string>();
   private readonly _emittedToolResult = new Set<string>();
   private _sse: AbortController | null = null;
+  private readonly _handledInput = new Set<string>();
+  private readonly _inputInFlight = new Set<string>();
+  private readonly _inputReplies = new Map<string, { path: string; body?: Record<string, unknown> }>();
+  private readonly _inputAbort = new AbortController();
+  private _pendingPoll: ReturnType<typeof setInterval> | null = null;
+  private _skillConfigCleanup: (() => Promise<void>) | null = null;
 
   /** Goal engine. OpenCode has no native goal surface — always emulated. */
   private readonly _goals: GoalController;
@@ -106,12 +117,22 @@ class OpenCodeSession implements AgentSession {
   async connect(): Promise<void> {
     const config = this.ctx.config ?? {};
     const resolved = await findBinary("opencode", config.command);
-    const env = buildEnv(this.ctx.env);
-    ensurePathInEnv(env);
+    const baseEnv = buildEnv(this.ctx.env);
+    ensurePathInEnv(baseEnv);
+    const skillConfig = await prepareOpenCodeSkillConfig(baseEnv, config.skillDirs);
+    const env = skillConfig.env;
+    this._skillConfigCleanup = skillConfig.cleanup;
     const cwd = this.ctx.cwd ?? process.cwd();
+    this.cwd = cwd;
 
-    this.server = await acquireOpenCodeServer(resolved.bin, resolved.prefixArgs, env, cwd);
-    this.url = this.server.url;
+    try {
+      this.server = await acquireOpenCodeServer(resolved.bin, resolved.prefixArgs, env, cwd);
+    } catch (error) {
+      await this._skillConfigCleanup();
+      this._skillConfigCleanup = null;
+      throw error;
+    }
+    this.client = this.server.client;
 
     // Everything after acquiring the server must release it on failure, or the
     // pooled `opencode serve` process leaks (refCount stuck at 1 forever).
@@ -120,7 +141,7 @@ class OpenCodeSession implements AgentSession {
       if (resumeId) {
         this._sessionId = resumeId;
       } else {
-        const res = await fetch(`${this.url}/session`, {
+        const res = await this.client.request("/session", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({}),
@@ -132,7 +153,8 @@ class OpenCodeSession implements AgentSession {
 
       // Live event stream (global; filtered to our session).
       this._sse = new AbortController();
-      void this.readSse(this._sse.signal);
+      await this.startSse(this._sse.signal);
+      await this.reconcilePendingInput();
     } catch (err) {
       if (this._sse) {
         try {
@@ -144,6 +166,8 @@ class OpenCodeSession implements AgentSession {
       }
       this.server.release();
       this.server = null;
+      await this._skillConfigCleanup?.();
+      this._skillConfigCleanup = null;
       this._state = "closed";
       throw err;
     }
@@ -158,9 +182,17 @@ class OpenCodeSession implements AgentSession {
   // SSE live stream
   // -------------------------------------------------------------------------
 
-  private async readSse(signal: AbortSignal): Promise<void> {
+  private async startSse(signal: AbortSignal): Promise<void> {
+    if (!this.client) throw new Error("OpenCode client is unavailable");
+    const response = await this.client.request("/global/event", { signal });
+    if (!response.ok || !response.body) {
+      throw new Error(`opencode: failed to establish event stream (${response.status})`);
+    }
+    void this.readSse(response, signal);
+  }
+
+  private async readSse(res: Response, signal: AbortSignal): Promise<void> {
     try {
-      const res = await fetch(`${this.url}/global/event`, { signal });
       if (!res.body) return;
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
@@ -180,7 +212,17 @@ class OpenCodeSession implements AgentSession {
         }
       }
     } catch {
-      // Stream closed/aborted — the POST /message response remains authoritative.
+      // Reconciliation polling remains authoritative while a turn is active.
+    } finally {
+      if (!signal.aborted && this._state !== "closed") {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        try {
+          await this.startSse(signal);
+          await this.reconcilePendingInput();
+        } catch {
+          // The active-turn polling path will keep pending input visible.
+        }
+      }
     }
   }
 
@@ -192,11 +234,169 @@ class OpenCodeSession implements AgentSession {
       return;
     }
     const payload = rec(rec(parsed)?.["payload"]);
-    if (!payload || payload["type"] !== "message.part.updated") return;
+    if (!payload) return;
+    if (payload["type"] === "permission.asked" || payload["type"] === "permission.updated") {
+      const request = rec(rec(payload["properties"])?.["request"]) ?? rec(payload["properties"]);
+      if (request) await this.handlePermission(request);
+      return;
+    }
+    if (payload["type"] === "question.asked") {
+      const request = rec(rec(payload["properties"])?.["request"]) ?? rec(payload["properties"]);
+      if (request) await this.handleQuestion(request);
+      return;
+    }
+    if (payload["type"] !== "message.part.updated") return;
     const props = rec(payload["properties"]);
     const part = rec(props?.["part"]);
     if (!part || str(part["sessionID"]) !== this._sessionId) return;
     await this.emitPart(part);
+  }
+
+  private async reconcilePendingInput(): Promise<void> {
+    if (!this.client || !this._sessionId || this._state === "closed") return;
+    const [permissions, questions] = await Promise.all([
+      this.client.json<unknown[]>("/permission").catch(() => []),
+      this.client.json<unknown[]>("/question").catch(() => []),
+    ]);
+    for (const value of permissions) {
+      const request = rec(value);
+      if (request && str(request["sessionID"]) === this._sessionId) await this.handlePermission(request);
+    }
+    for (const value of questions) {
+      const request = rec(value);
+      if (request && str(request["sessionID"]) === this._sessionId) await this.handleQuestion(request);
+    }
+  }
+
+  private async hostInput(
+    request: Parameters<NonNullable<SessionContext["onUserInputRequest"]>>[0],
+  ): Promise<UserInputResponse> {
+    const fallback: UserInputResponse = {
+      allow: (this.ctx.config?.unattendedPermissionPolicy ?? "allow") === "allow",
+    };
+    if (!this.ctx.onUserInputRequest) return fallback;
+    const timeoutSec = this.ctx.config?.inputRequestTimeoutSec ?? 300;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let abortListener: (() => void) | null = null;
+    try {
+      const timeout = new Promise<typeof fallback>((resolve) => {
+        timer = setTimeout(() => resolve(fallback), Math.max(0, timeoutSec) * 1000);
+      });
+      const closed = new Promise<typeof fallback>((resolve) => {
+        abortListener = () => resolve(fallback);
+        this._inputAbort.signal.addEventListener("abort", abortListener, { once: true });
+      });
+      return await Promise.race([
+        Promise.resolve(this.ctx.onUserInputRequest(request)).catch(() => fallback),
+        timeout,
+        closed,
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (abortListener) this._inputAbort.signal.removeEventListener("abort", abortListener);
+    }
+  }
+
+  private restoreAfterInput(): void {
+    if (this._state !== "closed") this._state = this._turnActive ? "thinking" : "idle";
+  }
+
+  private async handlePermission(request: Record<string, unknown>): Promise<void> {
+    const id = str(request["id"]);
+    if (!id || this._handledInput.has(id) || this._inputInFlight.has(id)
+      || str(request["sessionID"]) !== this._sessionId || !this.client) return;
+    this._inputInFlight.add(id);
+    try {
+      let reply = this._inputReplies.get(id);
+      if (!reply) {
+        this._state = "waiting_for_approval";
+        const permission = str(request["permission"]) ?? "Tool";
+        const response = await this.hostInput({
+          toolName: permission,
+          input: rec(request["metadata"]) ?? {},
+          toolUseId: id,
+          title: permission,
+          description: Array.isArray(request["patterns"])
+            ? request["patterns"].filter((item): item is string => typeof item === "string").join(", ")
+            : undefined,
+        });
+        reply = {
+          path: `/permission/${encodeURIComponent(id)}/reply`,
+          body: {
+            reply: response.allow ? "once" : "reject",
+            ...(response.message ? { message: response.message } : {}),
+          },
+        };
+        this._inputReplies.set(id, reply);
+      }
+      await this.client.ok(reply.path, {
+        method: "POST",
+        body: JSON.stringify(reply.body ?? {}),
+      });
+      this._handledInput.add(id);
+      this._inputReplies.delete(id);
+    } catch {
+      // Keep the cached host decision so reconciliation retries only the reply.
+    } finally {
+      this._inputInFlight.delete(id);
+      this.restoreAfterInput();
+    }
+  }
+
+  private async handleQuestion(request: Record<string, unknown>): Promise<void> {
+    const id = str(request["id"]);
+    if (!id || this._handledInput.has(id) || this._inputInFlight.has(id)
+      || str(request["sessionID"]) !== this._sessionId || !this.client) return;
+    this._inputInFlight.add(id);
+    try {
+      let reply = this._inputReplies.get(id);
+      if (!reply) {
+        this._state = "waiting_for_input";
+        const questions = (Array.isArray(request["questions"]) ? request["questions"] : []).map((value) => {
+          const question = rec(value) ?? {};
+          return {
+            question: str(question["question"]) ?? str(question["header"]) ?? "Question",
+            header: str(question["header"]) ?? "Question",
+            options: (Array.isArray(question["options"]) ? question["options"] : []).map((raw) => {
+              const option = rec(raw) ?? {};
+              return {
+                label: str(option["label"]) ?? "",
+                description: str(option["description"]) ?? "",
+              };
+            }).filter((option) => option.label),
+            ...(question["multiple"] === true ? { multiSelect: true } : {}),
+          };
+        });
+        const response = await this.hostInput({
+          toolName: "AskUserQuestion",
+          input: { questions },
+          toolUseId: id,
+        });
+        if (!response.allow) {
+          reply = { path: `/question/${encodeURIComponent(id)}/reject` };
+        } else {
+          const answerMap = rec(response.updatedInput?.["answers"]) ?? {};
+          const answers = questions.map((question) => {
+            const raw = answerMap[question.question] ?? answerMap[question.header];
+            if (Array.isArray(raw)) return raw.filter((item): item is string => typeof item === "string");
+            return typeof raw === "string" ? [raw] : [];
+          });
+          reply = { path: `/question/${encodeURIComponent(id)}/reply`, body: { answers } };
+        }
+        this._inputReplies.set(id, reply);
+      }
+      await this.client.ok(reply.path, {
+        method: "POST",
+        ...(reply.body ? { body: JSON.stringify(reply.body) } : {}),
+      });
+      this._handledInput.add(id);
+      this._inputReplies.delete(id);
+    } catch {
+      // Keep the cached host decision so reconciliation retries only the reply.
+    } finally {
+      this._inputInFlight.delete(id);
+      this.restoreAfterInput();
+    }
   }
 
   private async emitPart(part: Record<string, unknown>): Promise<void> {
@@ -233,7 +433,7 @@ class OpenCodeSession implements AgentSession {
     }
   }
 
-  private async emit(ev: ReturnType<typeof mapOpenCodePart>): Promise<void> {
+  private async emit(ev: StreamEvent | null): Promise<void> {
     if (ev && this.ctx.onEvent) {
       try {
         await this.ctx.onEvent(ev);
@@ -271,15 +471,18 @@ class OpenCodeSession implements AgentSession {
   }
 
   private async runTurn(message: string, options?: SendOptions): Promise<TurnResult> {
+    const startedAt = Date.now();
     if (!this._sessionId) {
-      this.finishTurn();
-      return {
+      const outcome: TurnResult = {
         summary: null,
         costUsd: null,
         status: "failed",
         errorCode: "not_initialized",
         errorMessage: "OpenCode session is not initialized",
       };
+      await this.emitTerminal(outcome, {}, startedAt);
+      this.finishTurn();
+      return outcome;
     }
 
     // Fresh per-turn live-stream dedup so a previous turn's part ids can't
@@ -298,63 +501,113 @@ class OpenCodeSession implements AgentSession {
 
     const body: Record<string, unknown> = { parts: [{ type: "text", text: message }] };
     if (this.model) body["model"] = this.model;
+    if (this.ctx.config?.modelVariant) body["variant"] = this.ctx.config.modelVariant;
+    const agent = this.ctx.config?.planMode ? "plan" : (this.ctx.config?.modeId ?? this.ctx.config?.mode);
+    if (agent) body["agent"] = agent;
 
+    let outcome: TurnResult;
+    let terminalRaw: Record<string, unknown> = {};
     try {
-      const res = await fetch(`${this.url}/session/${this._sessionId}/message`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-        signal: ac.signal,
-      });
-      if (!res.ok) {
-        const text = await res.text().catch(() => "");
-        return {
+      if (!this.server?.isCurrent()) {
+        outcome = {
           summary: null,
           costUsd: null,
           status: "failed",
-          errorCode: "http_error",
-          errorMessage: `opencode message failed: ${res.status} ${text}`.trim(),
+          errorCode: "runtime_reconfigured",
+          errorMessage: "OpenCode runtime configuration changed. Start a fresh session.",
         };
+      } else {
+        this._pendingPoll = setInterval(() => void this.reconcilePendingInput(), 750);
+        const res = await this.client!.request(`/session/${this._sessionId}/message`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+          signal: ac.signal,
+        });
+        if (!res.ok) {
+          outcome = {
+            summary: null,
+            costUsd: null,
+            status: "failed",
+            errorCode: "http_error",
+            errorMessage: `OpenCode message request failed (${res.status})`,
+          };
+          terminalRaw = { status: res.status };
+        } else {
+          const data = (await res.json()) as Record<string, unknown>;
+          terminalRaw = data;
+          const info = rec(data["info"]);
+          const status = turnStatusFromMessage(info);
+          const usage = usageFromMessage(info);
+          const summary = assistantTextFromParts(data["parts"]) || null;
+          const costUsd = info ? num(info["cost"]) : null;
+          const errorMessage = status === "failed" ? JSON.stringify(info?.["error"] ?? null) : null;
+          outcome = {
+            summary,
+            ...(usage ? { usage } : {}),
+            costUsd,
+            status,
+            errorCode: status === "failed" ? "agent_error" : null,
+            errorMessage,
+          };
+        }
       }
-      const data = (await res.json()) as Record<string, unknown>;
-      const info = rec(data["info"]);
-      const status = turnStatusFromMessage(info);
-      const usage = usageFromMessage(info);
-      return {
-        summary: assistantTextFromParts(data["parts"]) || null,
-        ...(usage ? { usage } : {}),
-        costUsd: info ? num(info["cost"]) : null,
-        status,
-        errorCode: status === "failed" ? "agent_error" : null,
-        errorMessage: status === "failed" ? JSON.stringify(info?.["error"] ?? null) : null,
-      };
     } catch (err) {
       if (ac.signal.aborted) {
-        // Don't POST /abort if we're tearing the whole session down (close()
-        // already killed the server); only interrupt on timeout/caller-abort.
-        const reason = ac.signal.reason === "timeout" ? "timeout" : ac.signal.reason === "closed" ? "aborted" : "aborted";
+        const reason = ac.signal.reason === "timeout" ? "timeout" : "aborted";
         if (ac.signal.reason !== "closed") await this.interrupt().catch(() => {});
-        return {
+        outcome = {
           summary: null,
           costUsd: null,
           status: reason,
           errorCode: reason,
           errorMessage: reason === "timeout" ? "Turn exceeded its timeout" : "Turn aborted",
         };
+      } else {
+        outcome = {
+          summary: null,
+          costUsd: null,
+          status: "failed",
+          errorCode: "request_error",
+          errorMessage: err instanceof Error ? err.message : String(err),
+        };
       }
-      return {
-        summary: null,
-        costUsd: null,
-        status: "failed",
-        errorCode: "request_error",
-        errorMessage: err instanceof Error ? err.message : String(err),
-      };
     } finally {
+      if (this._pendingPoll) clearInterval(this._pendingPoll);
+      this._pendingPoll = null;
       if (timer) clearTimeout(timer);
       options?.signal?.removeEventListener("abort", onAbort);
       if (this._activeController === ac) this._activeController = null;
-      this.finishTurn();
     }
+    await this.emitTerminal(outcome, terminalRaw, startedAt);
+    this.finishTurn();
+    return outcome;
+  }
+
+  private async emitTerminal(
+    outcome: TurnResult,
+    raw: Record<string, unknown>,
+    startedAt: number,
+  ): Promise<void> {
+    const info = rec(raw["info"]);
+    await this.emit({
+      type: "result",
+      text: outcome.summary ?? outcome.errorMessage ?? "",
+      costUsd: outcome.costUsd,
+      isError: outcome.status !== "completed",
+      stopReason: null,
+      terminalReason: outcome.status,
+      numTurns: 1,
+      durationMs: Date.now() - startedAt,
+      timestamp: new Date().toISOString(),
+      providerType: "opencode",
+      sessionId: this._sessionId,
+      messageId: info ? str(info["id"]) : null,
+      eventId: info ? str(info["id"]) : null,
+      turnId: null,
+      parentToolCallId: null,
+      raw,
+    });
   }
 
   async cancel(_uuid: string): Promise<CancelResult> {
@@ -381,7 +634,7 @@ class OpenCodeSession implements AgentSession {
   async interrupt(): Promise<void> {
     if (!this._sessionId) return;
     try {
-      await fetch(`${this.url}/session/${this._sessionId}/abort`, { method: "POST" });
+      await this.client?.ok(`/session/${this._sessionId}/abort`, { method: "POST" });
     } catch {
       /* best effort */
     }
@@ -401,6 +654,7 @@ class OpenCodeSession implements AgentSession {
 
   async close(): Promise<void> {
     this._state = "closed";
+    this._inputAbort.abort("closed");
     // Abort an in-flight POST /message so close() doesn't leave it racing a
     // killed server (and so the turn settles as aborted, not a confusing error).
     if (this._activeController) {
@@ -419,9 +673,24 @@ class OpenCodeSession implements AgentSession {
       }
       this._sse = null;
     }
+    if (this._pendingPoll) clearInterval(this._pendingPoll);
+    this._pendingPoll = null;
     if (this.server) {
       this.server.release();
       this.server = null;
     }
+    await this._skillConfigCleanup?.();
+    this._skillConfigCleanup = null;
+    this.client = null;
+  }
+
+  describeHistory() {
+    if (!this._sessionId) return null;
+    return createSessionRecord({
+      providerType: "opencode",
+      params: { sessionId: this._sessionId, cwd: this.cwd },
+      cwd: this.cwd,
+      displayId: this._sessionId,
+    });
   }
 }

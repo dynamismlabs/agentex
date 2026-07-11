@@ -159,31 +159,11 @@ export function parseOpenCodeStreamLine(line: string): StreamEvent | null {
   }
 
   if (type === "step_finish") {
-    return {
-      type: "result",
-      text: "",
-      costUsd: null,
-      isError: false,
-      stopReason: null,
-      terminalReason: null,
-      numTurns: null,
-      durationMs: null,
-      ...base,
-    };
+    return { type: "unknown", subtype: "step_finish", ...base };
   }
 
   if (type === "error") {
-    return {
-      type: "result",
-      text: asString(event["message"], ""),
-      costUsd: null,
-      isError: true,
-      stopReason: null,
-      terminalReason: null,
-      numTurns: null,
-      durationMs: null,
-      ...base,
-    };
+    return { type: "unknown", subtype: "error", ...base };
   }
 
   // Forward-compat: surface unknown wire events rather than dropping them.

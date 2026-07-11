@@ -1,5 +1,77 @@
 # Changelog
 
+## 0.0.28 — OpenCode and Cursor integration contracts
+
+Additive release. OpenCode is now a fully managed session provider and Cursor
+is a runtime-probed, exec-backed session provider. Existing provider APIs are
+unchanged. New provider and session members are optional so current consumers
+remain source-compatible.
+
+### Added
+
+- **OpenCode authenticated session runtime.** `createSession()` owns a pooled
+  password-authenticated loopback `opencode serve` process, consumes SSE, maps
+  model, variant, and agent independently, resumes provider session IDs, and
+  shuts the daemon down when its final handle closes. Runtime generations are
+  retired after credential changes so stale processes cannot keep old auth.
+- **OpenCode permission and question handling.** Pending requests reconcile at
+  startup and while a turn runs. Host decisions are cached across failed reply
+  attempts, so a transient HTTP failure does not ask the user twice. Allowed
+  permissions reply `once`, never persistent `always`. Observed requests use
+  the new `inputRequestTimeoutSec` deadline (300 seconds by default) and
+  `unattendedPermissionPolicy` controls the no-callback fallback.
+- **OpenCode provider and model management.** `listModels()` returns qualified
+  `provider/model` IDs, limits, prices, modalities, tool support, and separate
+  provider-native variants. `listModes()` returns primary OpenCode agents.
+  `upstreamProviders` lists providers and auth methods, writes API keys, runs
+  OAuth, and capability-gates credential removal against the running schema.
+- **OpenCode durable service history.** `session.describeHistory()` and
+  `provider.attachHistory()` provide chronological, bounded, opaque-cursor
+  pagination with stable message/part checkpoints. Event ordinals prevent
+  duplicate replay when one OpenCode part normalizes into multiple events.
+- **Cursor sessions and discovery.** `createSession()` promotes the session ID
+  emitted by one turn into `--resume` for the next. `listModels()` uses the
+  installed Cursor catalog, including Grok when Cursor exposes it, while
+  `listModes()` only returns modes proven by the selected CLI help profile.
+- **Effective runtime probing.** OpenCode and Cursor implement
+  `probeCapabilities()` and return binary status, version, protocol profile,
+  and per-capability status. Unsupported older Cursor installations report
+  `upgrade_required`.
+- **Provider-neutral capability growth.** Added optional runtime capability
+  reports, model variants, resumability, permission/question support,
+  service-backed durable history, session mutation flags, and the upstream
+  provider manager types.
+- **Legacy durable-history bridge.** Claude and Codex implement
+  `attachHistory()` adapters over their existing durable session attachment.
+
+### Changed
+
+- OpenCode `skillDirs` are staged in an isolated `OPENCODE_CONFIG_DIR` seeded
+  from native config. One-shot and session execution no longer mutate the
+  user's global skill directories.
+- OpenCode one-shot and session turns emit exactly one normalized terminal
+  `result`. Wire `step_finish` records remain non-terminal unknown events.
+- Cursor output is quarantined until the supported `system:init` acceptance
+  marker. A failed resume may roll over once only before acceptance. Output is
+  never replayed or retried after acceptance, and unsupported marker ordering
+  fails explicitly with `protocol_degraded`.
+- Cursor authentication checks only `CURSOR_API_KEY` for API billing and uses
+  the selected binary's native `status` command for subscription state.
+
+### Compatibility and limits
+
+- OpenCode 1.3.2 is the release-tested server schema. Safe disconnect uses
+  `DELETE /auth/{providerID}`. A newer credential-ID schema remains disabled
+  until its provider-to-credential mapping can be proved.
+- OpenCode MCP attachment remains disabled. Agentex does not claim it until it
+  can exclude ambient OpenCode MCP configuration reliably.
+- Cursor requires a CLI profile with model discovery and the validated
+  stream-json `system:init` marker. Older installed binaries remain usable for
+  direct one-shot calls where their protocol matches, but runtime probing asks
+  the host to upgrade before exposing the new catalog and session UI.
+- Cursor has no permission/question bridge and no mid-session model or mode
+  mutation. Changing those selections starts a new host session.
+
 ## 0.0.27 — Codex session reasoning effort
 
 ### Fixed

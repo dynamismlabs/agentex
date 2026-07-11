@@ -10,6 +10,31 @@ import * as fs from "node:fs";
 const behavior = process.env.MOCK_BEHAVIOR ?? "success";
 const format = process.env.MOCK_FORMAT ?? "claude";
 const dumpStdinTo = process.env.MOCK_DUMP_STDIN_TO;
+const dumpArgsTo = process.env.MOCK_DUMP_ARGS_TO;
+
+if (dumpArgsTo) {
+  try { fs.appendFileSync(dumpArgsTo, JSON.stringify(process.argv.slice(2)) + "\n"); } catch { /* swallow */ }
+}
+
+const cliArgs = process.argv.slice(2);
+if (format === "cursor" && process.env.MOCK_CURSOR_PROFILE === "supported") {
+  if (cliArgs.includes("--version")) {
+    console.log("cursor-agent 2.0.0");
+    process.exit(0);
+  }
+  if (cliArgs.includes("models")) {
+    console.log(JSON.stringify({ models: ["gpt-5", "grok-4.5"] }));
+    process.exit(0);
+  }
+  if (cliArgs.includes("--help")) {
+    console.log("Options:\n  --mode <agent|plan|ask>");
+    process.exit(0);
+  }
+}
+if (format === "cursor" && cliArgs.includes("status") && process.env.MOCK_CURSOR_STATUS) {
+  console.log(process.env.MOCK_CURSOR_STATUS);
+  process.exit(0);
+}
 
 // Read stdin (prompt)
 let stdin = "";
@@ -197,6 +222,51 @@ function emitCursor() {
         is_error: false, total_cost_usd: 0.0025,
         usage: { input_tokens: 90, output_tokens: 25, cached_input_tokens: 3 },
         model: "gpt-4o",
+      }));
+      process.exit(0);
+      break;
+
+    case "unknown_then_success": {
+      const stateFile = process.env.MOCK_ATTEMPT_FILE;
+      if (stateFile && !fs.existsSync(stateFile)) {
+        fs.writeFileSync(stateFile, "attempted");
+        console.log(JSON.stringify({
+          type: "result", result: "unknown session mock-old", is_error: true,
+        }));
+        process.exit(1);
+      }
+      console.log(JSON.stringify({
+        type: "system", subtype: "init", session_id: "mock-cursor-new", model: "gpt-4o",
+      }));
+      console.log(JSON.stringify({
+        type: "assistant", session_id: "mock-cursor-new",
+        message: { content: [{ type: "text", text: "Recovered" }] },
+      }));
+      console.log(JSON.stringify({
+        type: "result", session_id: "mock-cursor-new", result: "Recovered",
+        is_error: false, usage: {}, model: "gpt-4o",
+      }));
+      process.exit(0);
+      break;
+    }
+
+    case "unknown_after_init":
+      console.log(JSON.stringify({
+        type: "system", subtype: "init", session_id: "mock-old", model: "gpt-4o",
+      }));
+      console.log(JSON.stringify({
+        type: "result", session_id: "mock-old", result: "unknown session mock-old", is_error: true,
+      }));
+      process.exit(1);
+      break;
+
+    case "bad_marker_order":
+      console.log(JSON.stringify({
+        type: "assistant", session_id: "mock-bad",
+        message: { content: [{ type: "text", text: "too early" }] },
+      }));
+      console.log(JSON.stringify({
+        type: "system", subtype: "init", session_id: "mock-bad", model: "gpt-4o",
       }));
       process.exit(0);
       break;

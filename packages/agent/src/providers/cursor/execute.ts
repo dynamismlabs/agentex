@@ -1,6 +1,5 @@
 import * as path from "node:path";
-import type { ExecutionContext, ExecutionResult } from "../../types.js";
-import { findBinary } from "../../utils/binary.js";
+import type { ExecutionContext, ExecutionResult, StreamEvent } from "../../types.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { runChildProcess, deriveErrorCode } from "../../utils/process.js";
 import { detectAuth } from "../../utils/auth.js";
@@ -16,6 +15,7 @@ import {
   isCursorUnknownSessionError,
   isCursorAuthRequired,
 } from "./parse.js";
+import { findCursorBinary } from "./runtime.js";
 
 export async function executeCursorProvider(ctx: ExecutionContext): Promise<ExecutionResult> {
   const runId = ctx.runId ?? uuidv7();
@@ -28,7 +28,7 @@ export async function executeCursorProvider(ctx: ExecutionContext): Promise<Exec
   ctx.onLifecycle?.({ phase: "preparing", step: "binary" });
   let resolvedBinary;
   try {
-    resolvedBinary = await findBinary("agent", config.command);
+    resolvedBinary = await findCursorBinary({ cwd, env: ctx.env, config });
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : "Binary not found";
     ctx.onLifecycle?.({ phase: "error", message: errorMessage });
@@ -96,11 +96,12 @@ export async function executeCursorProvider(ctx: ExecutionContext): Promise<Exec
 
   // 5. Build args
   const buildArgs = (resumeSessionId: string | null): string[] => {
-    const args = [...resolvedBinary.prefixArgs, "-p", "--output-format", "stream-json", "--workspace", cwd];
+    const args = [...resolvedBinary.prefixArgs, "-p", "--output-format", "stream-json"];
     if (resumeSessionId) args.push("--resume", resumeSessionId);
     if (model) args.push("--model", model);
-    if (config.mode) args.push("--mode", config.mode);
-    if (config.skipPermissions) args.push("--yolo");
+    const selectedMode = config.planMode ? "plan" : (config.modeId ?? config.mode);
+    if (selectedMode) args.push("--mode", selectedMode);
+    if (config.skipPermissions) args.push("--force");
     if (config.extraArgs) args.push(...config.extraArgs);
     return args;
   };
@@ -109,6 +110,49 @@ export async function executeCursorProvider(ctx: ExecutionContext): Promise<Exec
   const runAttempt = async (resumeSessionId: string | null) => {
     const args = buildArgs(resumeSessionId);
     let stdoutLineBuffer = "";
+    let accepted = false;
+    let protocolViolation = false;
+    const bufferedEvents: StreamEvent[] = [];
+    const bufferedOutput: Array<{ stream: "stdout" | "stderr"; chunk: string }> = [];
+
+    const flushOutput = async (): Promise<void> => {
+      if (!ctx.onOutput) return;
+      for (const output of bufferedOutput.splice(0)) {
+        try { await ctx.onOutput(output.stream, output.chunk); } catch { /* swallow */ }
+      }
+    };
+
+    const dispatchOutput = async (stream: "stdout" | "stderr", chunk: string): Promise<void> => {
+      if (!accepted) {
+        bufferedOutput.push({ stream, chunk });
+        return;
+      }
+      if (ctx.onOutput) {
+        try { await ctx.onOutput(stream, chunk); } catch { /* swallow */ }
+      }
+    };
+
+    const dispatch = async (event: StreamEvent): Promise<void> => {
+      if (!accepted) {
+        bufferedEvents.push(event);
+        if (event.type !== "system" || event.subtype !== "init") {
+          if (event.type !== "unknown") protocolViolation = true;
+          return;
+        }
+        if (protocolViolation) return;
+        accepted = true;
+        await flushOutput();
+        if (ctx.onEvent) {
+          for (const buffered of bufferedEvents.splice(0)) {
+            try { await ctx.onEvent(buffered); } catch { /* swallow */ }
+          }
+        }
+        return;
+      }
+      if (ctx.onEvent) {
+        try { await ctx.onEvent(event); } catch { /* swallow */ }
+      }
+    };
 
     ctx.onLifecycle?.({ phase: "spawning" });
     const proc = await runChildProcess({
@@ -127,9 +171,7 @@ export async function executeCursorProvider(ctx: ExecutionContext): Promise<Exec
       signal: ctx.signal,
       onOutput: async (stream, chunk) => {
         if (stream !== "stdout") {
-          if (ctx.onOutput) {
-            try { await ctx.onOutput(stream, chunk); } catch { /* swallow */ }
-          }
+          await dispatchOutput(stream, chunk);
           return;
         }
 
@@ -142,16 +184,10 @@ export async function executeCursorProvider(ctx: ExecutionContext): Promise<Exec
           const normalized = normalizeCursorStreamLine(rawLine);
           if (!normalized.line) continue;
 
-          if (ctx.onOutput) {
-            try { await ctx.onOutput(normalized.stream ?? "stdout", `${normalized.line}\n`); } catch { /* swallow */ }
-          }
+          await dispatchOutput(normalized.stream ?? "stdout", `${normalized.line}\n`);
 
-          if (ctx.onEvent) {
-            const event = parseCursorStreamLine(rawLine);
-            if (event) {
-              try { await ctx.onEvent(event); } catch { /* swallow */ }
-            }
-          }
+          const event = parseCursorStreamLine(rawLine);
+          if (event) await dispatch(event);
         }
       },
     });
@@ -159,22 +195,17 @@ export async function executeCursorProvider(ctx: ExecutionContext): Promise<Exec
     // Flush remaining buffer
     if (stdoutLineBuffer.trim()) {
       const normalized = normalizeCursorStreamLine(stdoutLineBuffer);
-      if (normalized.line && ctx.onOutput) {
-        try { await ctx.onOutput(normalized.stream ?? "stdout", `${normalized.line}\n`); } catch { /* swallow */ }
-      }
-      if (ctx.onEvent) {
-        const event = parseCursorStreamLine(stdoutLineBuffer);
-        if (event) {
-          try { await ctx.onEvent(event); } catch { /* swallow */ }
-        }
-      }
+      if (normalized.line) await dispatchOutput(normalized.stream ?? "stdout", `${normalized.line}\n`);
+      const event = parseCursorStreamLine(stdoutLineBuffer);
+      if (event) await dispatch(event);
     }
 
-    return proc;
+    return { proc, accepted, protocolViolation: protocolViolation || (!accepted && proc.exitCode === 0) };
   };
 
   // 7. Initial attempt
-  let proc = await runAttempt(sessionId);
+  let attempt = await runAttempt(sessionId);
+  let proc = attempt.proc;
   let clearSession = false;
 
   // 8. Check for unknown session — retry once
@@ -182,9 +213,11 @@ export async function executeCursorProvider(ctx: ExecutionContext): Promise<Exec
     sessionId &&
     !proc.timedOut &&
     (proc.exitCode ?? 0) !== 0 &&
+    !attempt.accepted &&
     isCursorUnknownSessionError(proc.stdout, proc.stderr)
   ) {
-    proc = await runAttempt(null);
+    attempt = await runAttempt(null);
+    proc = attempt.proc;
     clearSession = true;
   }
 
@@ -193,6 +226,7 @@ export async function executeCursorProvider(ctx: ExecutionContext): Promise<Exec
   const processErrorCode = deriveErrorCode(proc);
 
   let errorCode = processErrorCode;
+  if (attempt.protocolViolation) errorCode = "protocol_degraded";
   if (!errorCode && isCursorAuthRequired(proc.stdout, proc.stderr)) {
     errorCode = "auth_required";
     if (ctx.onEvent) {
@@ -219,6 +253,9 @@ export async function executeCursorProvider(ctx: ExecutionContext): Promise<Exec
   const errorMessage = (() => {
     if (proc.timedOut) return `Timed out after ${config.timeoutSec ?? 0}s`;
     if (errorCode === "auth_required") return "Cursor requires authentication.";
+    if (errorCode === "protocol_degraded") {
+      return "Cursor did not emit the supported stream-json acceptance marker before visible output.";
+    }
     if (parsed.errorMessage) return parsed.errorMessage;
     if ((proc.exitCode ?? 0) !== 0 && !parsed.summary) {
       const stderrLine = proc.stderr.split(/\r?\n/).map((l) => l.trim()).find(Boolean);

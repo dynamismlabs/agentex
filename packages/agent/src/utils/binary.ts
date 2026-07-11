@@ -28,8 +28,11 @@ const COMMON_PATHS_UNIX: Record<string, string[]> = {
   ],
   agent: [
     path.join(os.homedir(), ".local", "bin", "agent"),
+    path.join(os.homedir(), ".local", "bin", "cursor-agent"),
     "/usr/local/bin/agent",
+    "/usr/local/bin/cursor-agent",
     path.join(os.homedir(), ".npm-global", "bin", "agent"),
+    path.join(os.homedir(), ".npm-global", "bin", "cursor-agent"),
   ],
   opencode: [
     path.join(os.homedir(), ".local", "bin", "opencode"),

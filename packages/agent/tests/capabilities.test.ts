@@ -46,6 +46,7 @@ describe("ProviderCapabilities", () => {
         telemetry: false,
       },
       durableSessions: true,
+      durableHistory: true,
     });
   });
 
@@ -92,10 +93,10 @@ describe("ProviderCapabilities", () => {
     }
   });
 
-  it("only claude and codex advertise native plan mode", () => {
+  it("claude, codex, Cursor, and OpenCode advertise plan mode", () => {
     for (const name of listProviders()) {
       const caps = getProvider(name).capabilities;
-      const expected = name === "claude" || name === "codex";
+      const expected = name === "claude" || name === "codex" || name === "cursor" || name === "opencode";
       expect(caps.planMode).toBe(expected);
     }
   });

@@ -172,24 +172,23 @@ describe("parseOpenCodeStreamLine", () => {
     }
   });
 
-  it("returns result from step_finish", () => {
+  it("keeps step_finish non-terminal", () => {
     const line = JSON.stringify({ type: "step_finish" });
     const event = parseOpenCodeStreamLine(line);
     expect(event).not.toBeNull();
-    expect(event!.type).toBe("result");
-    if (event?.type === "result") {
-      expect(event.isError).toBe(false);
+    expect(event!.type).toBe("unknown");
+    if (event?.type === "unknown") {
+      expect(event.subtype).toBe("step_finish");
     }
   });
 
-  it("returns error result from error", () => {
+  it("keeps wire error non-terminal so execution owns the terminal result", () => {
     const line = JSON.stringify({ type: "error", message: "Something broke" });
     const event = parseOpenCodeStreamLine(line);
     expect(event).not.toBeNull();
-    expect(event!.type).toBe("result");
-    if (event?.type === "result") {
-      expect(event.isError).toBe(true);
-      expect(event.text).toBe("Something broke");
+    expect(event!.type).toBe("unknown");
+    if (event?.type === "unknown") {
+      expect(event.subtype).toBe("error");
     }
   });
 

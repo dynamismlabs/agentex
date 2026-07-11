@@ -1,5 +1,7 @@
 import { describe, it, expect } from "vitest";
 import * as path from "node:path";
+import { mkdtemp, readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { executeOpenCodeProvider } from "../../../src/providers/opencode/execute.js";
 import type { ExecutionContext, StreamEvent } from "../../../src/types.js";
 
@@ -35,6 +37,8 @@ describe("executeOpenCodeProvider", () => {
     expect(result.errorCode).toBeNull();
     expect(result.billingType).toBe("api");
     expect(events.length).toBeGreaterThan(0);
+    expect(events.filter((event) => event.type === "result")).toHaveLength(1);
+    expect(events.some((event) => event.type === "unknown" && event.subtype === "step_finish")).toBe(true);
     expect(outputs.length).toBeGreaterThan(0);
   });
 
@@ -67,10 +71,28 @@ describe("executeOpenCodeProvider", () => {
   });
 
   it("handles binary not found", async () => {
+    const events: StreamEvent[] = [];
     const result = await executeOpenCodeProvider(makeCtx({
       config: { command: "/nonexistent/opencode-binary" },
+      onEvent: (event) => events.push(event),
     }));
 
     expect(result.errorCode).toBe("binary_not_found");
+    expect(events.filter((event) => event.type === "result")).toHaveLength(1);
+  });
+
+  it("passes variant and agent separately from the model", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "agentex-opencode-args-"));
+    const argsFile = path.join(dir, "args.jsonl");
+    await executeOpenCodeProvider(makeCtx({
+      cwd: dir,
+      model: "anthropic/claude",
+      config: { command: MOCK_OPENCODE, modelVariant: "high", modeId: "build" },
+      env: { MOCK_BEHAVIOR: "success", MOCK_DUMP_ARGS_TO: argsFile },
+    }));
+    const args = JSON.parse((await readFile(argsFile, "utf8")).trim()) as string[];
+    expect(args).toEqual(expect.arrayContaining([
+      "--model", "anthropic/claude", "--variant", "high", "--agent", "build",
+    ]));
   });
 });

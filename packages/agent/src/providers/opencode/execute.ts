@@ -3,7 +3,6 @@ import type { ExecutionContext, ExecutionResult } from "../../types.js";
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { runChildProcess, deriveErrorCode } from "../../utils/process.js";
-import { injectHomeSkills } from "../../utils/skills.js";
 import { resolveInstructions } from "../../utils/instructions.js";
 import { prepareWorkspace } from "../../utils/workspace.js";
 import type { PreparedWorkspace } from "../../utils/workspace.js";
@@ -14,6 +13,7 @@ import {
   isOpenCodeUnknownSessionError,
   isOpenCodeAuthRequired,
 } from "./parse.js";
+import { prepareOpenCodeSkillConfig } from "./skill-config.js";
 
 export async function executeOpenCodeProvider(ctx: ExecutionContext): Promise<ExecutionResult> {
   const runId = ctx.runId ?? uuidv7();
@@ -29,6 +29,31 @@ export async function executeOpenCodeProvider(ctx: ExecutionContext): Promise<Ex
     resolvedBinary = await findBinary("opencode", config.command);
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : "Binary not found";
+    const completedAt = new Date().toISOString();
+    if (ctx.onEvent) {
+      try {
+        await ctx.onEvent({
+          type: "result",
+          text: errorMessage,
+          costUsd: null,
+          isError: true,
+          stopReason: null,
+          terminalReason: "failed",
+          numTurns: null,
+          durationMs: new Date(completedAt).getTime() - new Date(startedAt).getTime(),
+          timestamp: completedAt,
+          providerType: "opencode",
+          sessionId: null,
+          messageId: null,
+          eventId: null,
+          turnId: null,
+          parentToolCallId: null,
+          raw: {},
+        });
+      } catch {
+        // A host event handler cannot fail the execution.
+      }
+    }
     ctx.onLifecycle?.({ phase: "error", message: errorMessage });
     return {
       runId,
@@ -36,7 +61,7 @@ export async function executeOpenCodeProvider(ctx: ExecutionContext): Promise<Ex
       signal: null,
       status: "failed" as const,
       startedAt,
-      completedAt: new Date().toISOString(),
+      completedAt,
       durationMs: Date.now() - new Date(startedAt).getTime(),
       errorMessage,
       errorCode: "binary_not_found",
@@ -59,24 +84,20 @@ export async function executeOpenCodeProvider(ctx: ExecutionContext): Promise<Ex
   }
 
   // 3. Build env
-  const env = buildEnv(ctx.env);
-  ensurePathInEnv(env);
+  const baseEnv = buildEnv(ctx.env);
+  ensurePathInEnv(baseEnv);
 
   // 3. Resolve instructions
   ctx.onLifecycle?.({ phase: "preparing", step: "instructions" });
   const instructions = await resolveInstructions(config.instructionsFile);
   const fullPrompt = instructions ? `${instructions}\n\n${ctx.prompt}` : ctx.prompt;
 
-  // 4. Inject skills into ~/.claude/skills/ (OpenCode shares Claude's skills dir)
+  // 4. Inject skills through an isolated OpenCode config directory.
   ctx.onLifecycle?.({ phase: "preparing", step: "skills" });
-  if (config.skillDirs && config.skillDirs.length > 0) {
-    try {
-      await injectHomeSkills(config.skillDirs, "opencode");
-    } catch {
-      // Non-fatal
-    }
-  }
+  const skillConfig = await prepareOpenCodeSkillConfig(baseEnv, config.skillDirs);
+  const env = skillConfig.env;
 
+  try {
   // 4. Determine session resume
   const sessionParams = ctx.sessionParams ?? null;
   const sessionId = (() => {
@@ -96,6 +117,9 @@ export async function executeOpenCodeProvider(ctx: ExecutionContext): Promise<Ex
     const args = [...resolvedBinary.prefixArgs, "run", "--format", "json"];
     if (resumeSessionId) args.push("--session", resumeSessionId);
     if (model) args.push("--model", model);
+    if (config.modelVariant) args.push("--variant", config.modelVariant);
+    const agent = config.planMode ? "plan" : (config.modeId ?? config.mode);
+    if (agent) args.push("--agent", agent);
     if (config.extraArgs) args.push(...config.extraArgs);
     return args;
   };
@@ -217,6 +241,31 @@ export async function executeOpenCodeProvider(ctx: ExecutionContext): Promise<Ex
     : (errorCode || errorMessage) ? "failed" as const
     : "completed" as const;
 
+  if (ctx.onEvent) {
+    try {
+      await ctx.onEvent({
+        type: "result",
+        text: parsed.summary ?? errorMessage ?? "",
+        costUsd: parsed.costUsd,
+        isError: status !== "completed",
+        stopReason: null,
+        terminalReason: status,
+        numTurns: null,
+        durationMs: new Date(completedAt).getTime() - new Date(startedAt).getTime(),
+        timestamp: completedAt,
+        providerType: "opencode",
+        sessionId: resolvedSessionId,
+        messageId: null,
+        eventId: null,
+        turnId: null,
+        parentToolCallId: null,
+        raw: {},
+      });
+    } catch {
+      // A host event handler cannot fail the execution.
+    }
+  }
+
   if (status === "completed") {
     ctx.onLifecycle?.({ phase: "completed" });
   } else if (status === "aborted") {
@@ -248,4 +297,7 @@ export async function executeOpenCodeProvider(ctx: ExecutionContext): Promise<Ex
     raw: null,
     workspace,
   };
+  } finally {
+    await skillConfig.cleanup();
+  }
 }

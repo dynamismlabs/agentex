@@ -35,6 +35,7 @@ export const claudeProvider: ProviderModule = {
     modes: false,
     goals: claudeGoalCapability,
     durableSessions: true,
+    durableHistory: true,
   },
   // Heavy machinery (execute.ts, session.ts, attach.ts) loads lazily on first
   // use — every ProviderModule method is already async, so this is invisible to
@@ -48,6 +49,13 @@ export const claudeProvider: ProviderModule = {
   transcript: claudeTranscriptOps,
   attachSession: async (record, opts) =>
     (await import("./attach.js")).attachClaudeSession(record, opts),
+  attachHistory: async (record, opts) => {
+    const [{ attachClaudeSession }, { historyFromSessionAttachment }] = await Promise.all([
+      import("./attach.js"),
+      import("../../sessions/history.js"),
+    ]);
+    return historyFromSessionAttachment("claude", await attachClaudeSession(record, opts));
+  },
 };
 
 export {

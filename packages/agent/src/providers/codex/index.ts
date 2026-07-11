@@ -23,6 +23,7 @@ export const codexProvider: ProviderModule = {
     modes: true,
     goals: codexGoalCapability,
     durableSessions: true,
+    durableHistory: true,
   },
   // Heavy machinery (execute.ts, session.ts, modes.ts, attach.ts) loads lazily
   // on first use — every ProviderModule method is already async.
@@ -35,6 +36,13 @@ export const codexProvider: ProviderModule = {
   listModes: async (opts) => (await import("./modes.js")).listCodexModes(opts),
   attachSession: async (record, opts) =>
     (await import("./attach.js")).attachCodexSession(record, opts),
+  attachHistory: async (record, opts) => {
+    const [{ attachCodexSession }, { historyFromSessionAttachment }] = await Promise.all([
+      import("./attach.js"),
+      import("../../sessions/history.js"),
+    ]);
+    return historyFromSessionAttachment("codex", await attachCodexSession(record, opts));
+  },
 };
 
 export {

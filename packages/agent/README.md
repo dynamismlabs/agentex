@@ -8,7 +8,7 @@ Programmatic execution of AI coding agents. Spawn and manage Claude Code, Codex,
 npm install @agentex/agent
 ```
 
-Node.js >= 18. Each provider requires its CLI to be installed and on `$PATH`. The Codex session adapter additionally requires **codex-cli 0.130.0 or newer** (the `app-server` subcommand); older CLIs will fail with `unexpected argument '--json'`.
+Node.js >= 20.19. Each provider requires its CLI to be installed and on `$PATH`. The Codex session adapter additionally requires **codex-cli 0.130.0 or newer** (the `app-server` subcommand); older CLIs will fail with `unexpected argument '--json'`.
 
 ## Quick Start
 
@@ -48,7 +48,7 @@ Providers fall into three tiers:
 
 - **Tier 1 — deep native:** `claude`, `codex`. Hand-built adapters over each CLI's richest protocol (Claude's stream-json, Codex's `app-server` JSON-RPC). Subscription-native, fullest feature set.
 - **Tier 2 — ACP:** `gemini`, `copilot`, plus any agent registered via [`acpProvider`](#custom--byok-providers) or `extends: "acp"` config. One shared, tested base over the open [Agent Client Protocol](https://agentclientprotocol.com) (JSON-RPC over stdio).
-- **Tier 3 — bespoke escape hatches:** `opencode` (HTTP/SSE daemon), `pi` (persistent RPC), `cursor` (one-shot), `openclaw` (HTTP gateway), `process` (any executable).
+- **Tier 3 — bespoke escape hatches:** `opencode` (authenticated HTTP/SSE daemon), `pi` (persistent RPC), `cursor` (exec-backed resume), `openclaw` (HTTP gateway), `process` (any executable).
 
 | Provider   | Transport                              | Tier | Sessions  | Modes | Permissions |
 | ---------- | -------------------------------------- | ---- | --------- | ----- | ----------- |
@@ -56,13 +56,49 @@ Providers fall into three tiers:
 | `codex`    | `codex app-server` JSON-RPC            | 1    | ✅ resume | ✅    | ✅          |
 | `gemini`   | `gemini --acp` (ACP)                   | 2    | ✅        | ✅    | ✅          |
 | `copilot`  | `copilot --acp` (ACP)                  | 2    | ✅        | ✅    | ✅          |
-| `opencode` | `opencode serve` HTTP + SSE            | 3    | ✅ resume | —     | —           |
+| `opencode` | authenticated `opencode serve` HTTP + SSE | 3 | ✅ resume | ✅ | ✅ |
 | `pi`       | persistent `pi --mode rpc`             | 3    | ✅ resume | —     | —           |
-| `cursor`   | `cursor-agent` stream-json (one-shot)  | 3    | —         | —     | —           |
+| `cursor`   | `cursor-agent` stream-json per turn    | 3    | ✅ resume | probed | —          |
 | `openclaw` | HTTP gateway                           | 3    | —         | —     | —           |
 | `process`  | any executable                         | 3    | —         | —     | —           |
 
-> `cursor` stays one-shot until `cursor-agent` ships an ACP mode; it can then move to Tier 2 via `extends: "acp"`.
+Cursor sessions are exec-backed. Each `send()` starts one CLI process and promotes the returned Cursor session ID into `--resume` for the next turn. `probeCapabilities()` verifies the selected binary's model catalog and advertised modes. Each execution independently validates the supported stream-json acceptance marker before releasing output. Older Cursor CLIs report `upgrade_required` instead of silently advertising discovery features they do not expose.
+
+OpenCode sessions use a password-authenticated loopback server, SSE events, permission and question reconciliation, durable service-backed history, runtime model and agent discovery, and upstream provider authentication. `config.mcpServers` remains unsupported for OpenCode because strict isolation from ambient OpenCode MCP configuration is not yet proven.
+
+### OpenCode and Cursor discovery
+
+The static `capabilities` object describes the maximum adapter surface. Use the runtime probe before presenting controls that depend on a particular installed CLI version.
+
+```ts
+const opencode = getProvider("opencode");
+const runtime = await opencode.probeCapabilities?.({ cwd });
+const models = runtime?.capabilities.modelDiscovery?.supported
+  ? await opencode.listModels?.({ cwd })
+  : [];
+const modes = runtime?.capabilities.modes?.supported
+  ? await opencode.listModes?.({ cwd })
+  : [];
+
+const cursor = getProvider("cursor");
+const cursorRuntime = await cursor.probeCapabilities?.({ cwd });
+const cursorModels = cursorRuntime?.capabilities.modelDiscovery?.supported
+  ? await cursor.listModels?.({ cwd })
+  : [];
+```
+
+OpenCode model IDs are fully qualified as `provider/model`. Provider-native variants are returned separately on `ProviderModel.variants` and selected with `config.modelVariant`. Cursor models are returned exactly as the installed CLI reports them. Grok therefore appears through Cursor discovery when the account and CLI expose it. There is no separate Grok provider or hard-coded Grok catalog.
+
+OpenCode also exposes its upstream providers so an app can build provider-first credential UI without storing keys in agentex:
+
+```ts
+const manager = opencode.upstreamProviders!;
+const providers = await manager.list({ cwd });
+const methods = await manager.authMethods("anthropic", { cwd });
+await manager.setApiKey("anthropic", apiKey, { cwd });
+```
+
+OAuth uses `beginOAuth()` followed by `completeOAuth()`. Disconnect is capability-gated against the running OpenCode schema. The tested OpenCode 1.3.2 profile uses `DELETE /auth/{providerID}`. Unknown credential-ID schemas are reported unsupported instead of guessing which credential to delete.
 
 Capabilities (sessions, modes, skills, workspaces, MCP, model discovery, quota probing, instructions, concurrent send, cancel queued messages, stop task) are declared on each module's `capabilities` field — check `provider.capabilities` to branch on what's supported. ACP providers set `dynamicCapabilities: true` (their real capability set is negotiated at the ACP `initialize` handshake). Skill-aware providers also report:
 
@@ -209,7 +245,10 @@ interface ExecutionContext {
 interface ProviderConfig {
   command?: string;                 // Override CLI binary path
   model?: string;
+  modelVariant?: string;            // OpenCode provider-native variant, separate from effort
   effort?: string;
+  unattendedPermissionPolicy?: "allow" | "deny";
+  inputRequestTimeoutSec?: number;  // OpenCode permission/question response deadline, default 300
   maxTurns?: number;
   timeoutSec?: number;
   graceSec?: number;
@@ -563,6 +602,8 @@ if (attachment.lastTurn === "interrupted") {
 
 Dedup replayed events against anything you saw live: Claude events carry a stable wire `eventId` (upsert on it); Codex has none (`eventId: null`), so gate replay on your own "not currently running" flag. A runnable end-to-end proof — start a session, crash the host mid-turn, reattach in a fresh process — lives in `scripts/durable-session-demo.ts` (`pnpm demo:durable`).
 
+OpenCode exposes the same host-level recovery shape through service-backed history rather than a local JSONL transcript. Persist `session.describeHistory()`, call `provider.attachHistory(record)`, and checkpoint the opaque `HistoryCheckpoint` returned with each event. `catchUp({ mode: "incremental", after })` resumes after that exact normalized event. `catchUp({ mode: "bounded_full_resync" })` performs a bounded rebuild. OpenCode pagination is capped at 100 pages, 10,000 messages, and 25 MiB so a corrupt or unexpectedly large history cannot exhaust the host.
+
 ## Plan Mode
 
 Run an agent in read-only "plan" mode — it investigates and proposes a plan but cannot edit files or run mutating commands. Same goal in both providers, **different mechanism** in each. Check `provider.capabilities.planMode` before relying on it.
@@ -624,7 +665,7 @@ For Codex sessions, the plan-mode preamble is sent once via `developerInstructio
 ### Caveats
 
 - `planMode` and `skipPermissions` are mutually exclusive — if both are set, `planMode` wins and `skipPermissions` is silently ignored.
-- Providers with `capabilities.planMode === false` (every provider other than claude/codex) ignore `config.planMode` entirely.
+- Providers with `capabilities.planMode === false` ignore `config.planMode`. OpenCode maps plan mode to its `plan` agent. Cursor maps it to `--mode plan` only when its runtime probe confirms that mode.
 - Codex's preamble is a heuristic, not a hard guarantee. The sandbox is the enforcement boundary — even if the agent ignored the prompt and tried to write, the sandbox would reject it. The preamble exists so the agent emits a usable plan instead of a sequence of failed write attempts.
 
 ## Auth
@@ -699,7 +740,7 @@ await claude.execute({ prompt: "Respond with 'hello'.", config: { timeoutSec: 15
 | `claude`  | `claude auth status --json` · fallback: keychain/creds file     | `ANTHROPIC_API_KEY`                        | Bedrock via `ANTHROPIC_BEDROCK_BASE_URL` or `AWS_ACCESS_KEY_ID`+`AWS_REGION` |
 | `codex`   | `codex login status` · fallback: `$CODEX_HOME/auth.json`        | `OPENAI_API_KEY`                           | —                                                                            |
 | `gemini`  | `$GEMINI_CONFIG_DIR/oauth_creds.json`                           | `GEMINI_API_KEY`, `GOOGLE_API_KEY`         | —                                                                            |
-| `cursor`  | (detected at runtime by the CLI)                                | `CURSOR_API_KEY`, `OPENAI_API_KEY`         | —                                                                            |
+| `cursor`  | selected CLI's `status` command                                 | `CURSOR_API_KEY`                           | `OPENAI_API_KEY` is intentionally ignored                                   |
 | `opencode`| —                                                               | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`      | —                                                                            |
 | `pi`      | —                                                               | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`      | —                                                                            |
 

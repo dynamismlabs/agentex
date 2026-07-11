@@ -92,6 +92,13 @@ describe("detectAuth", () => {
     });
   });
 
+  describe("cursor provider", () => {
+    it("uses only CURSOR_API_KEY for API billing", () => {
+      expect(detectAuth("cursor", { OPENAI_API_KEY: "not-cursor" }).method).toBe("subscription");
+      expect(detectAuth("cursor", { CURSOR_API_KEY: "cursor-key" }).method).toBe("api_key");
+    });
+  });
+
   describe("unknown provider", () => {
     it("returns subscription fallback for unrecognized provider", () => {
       const result = detectAuth("unknown-provider", {});
@@ -136,7 +143,10 @@ describe("resolveAuthForProvider", () => {
   describe("shape", () => {
     it("returns AuthReport with binary + options + source for every provider", async () => {
       for (const p of ["codex", "claude", "gemini", "cursor", "opencode", "pi"]) {
-        const report = await resolveAuthForProvider(p, { fresh: true });
+        const report = await resolveAuthForProvider(p, {
+          command: `/definitely/does/not/exist/${p}`,
+          fresh: true,
+        });
         expect(report.providerType).toBe(p);
         expect(report.binary).toBeDefined();
         expect(typeof report.binary.installed).toBe("boolean");
@@ -252,6 +262,29 @@ describe("resolveAuthForProvider", () => {
       const report = await resolveAuthForProvider("gemini", { fresh: true });
       const sub = report.options.find((o) => o.method === "subscription")!;
       expect(sub.present).toBe(true);
+    });
+  });
+
+  describe("cursor", () => {
+    const mockCursor = path.resolve(import.meta.dirname, "../fixtures/mock-cursor.sh");
+
+    it("detects only the Cursor API key from caller env", async () => {
+      const report = await resolveAuthForProvider("cursor", {
+        command: mockCursor,
+        env: { OPENAI_API_KEY: "ignored", CURSOR_API_KEY: "cursor-key" },
+        fresh: true,
+      });
+      expect(report.options.find((option) => option.method === "api_key")?.present).toBe(true);
+    });
+
+    it("uses the selected Cursor binary's native status", async () => {
+      const report = await resolveAuthForProvider("cursor", {
+        command: mockCursor,
+        env: { MOCK_CURSOR_STATUS: "Logged in as test@example.com" },
+        fresh: true,
+      });
+      expect(report.source).toBe("cli");
+      expect(report.options.find((option) => option.method === "subscription")?.present).toBe(true);
     });
   });
 

@@ -93,6 +93,49 @@ export interface ProviderCapabilities {
    * Codex); absent elsewhere. See internal-docs/spec-durable-sessions.md.
    */
   durableSessions?: boolean;
+  /** Provider-neutral durable history through `attachHistory`. */
+  durableHistory?: boolean;
+  /** A persisted provider session can be resumed. */
+  resume?: boolean;
+  /** Models expose provider-native variants independently from effort. */
+  modelVariants?: boolean;
+  /** The provider can surface interactive permission requests. */
+  permissionRequests?: boolean;
+  /** The provider can surface structured questions. */
+  questionRequests?: boolean;
+  /** Ambient MCP configuration can be excluded by a proved mechanism. */
+  strictMcpIsolation?: boolean;
+  /** Connected upstream-provider credentials can be removed safely. */
+  upstreamProviderDisconnect?: boolean;
+  /** Selection changes can be applied without starting a new host chat. */
+  sessionModelChange?: boolean;
+  sessionVariantChange?: boolean;
+  sessionEffortChange?: boolean;
+  sessionModeChange?: boolean;
+}
+
+export type CapabilityStatus = "supported" | "missing" | "upgrade_required" | "degraded";
+
+export interface ProviderRuntimeContext {
+  cwd?: string;
+  env?: Record<string, string>;
+  config?: ProviderConfig;
+  refresh?: boolean;
+}
+
+export interface ProviderRuntimeReport {
+  binary: {
+    status: CapabilityStatus;
+    command: string | null;
+    version: string | null;
+    protocolProfile: string | null;
+    reason?: string;
+  };
+  capabilities: Partial<Record<keyof ProviderCapabilities, {
+    supported: boolean;
+    status: CapabilityStatus;
+    reason?: string;
+  }>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -286,8 +329,12 @@ export interface ProviderModule {
    */
   resolveAuth(ctx?: AuthResolveContext): Promise<AuthReport>;
   sessionCodec?: SessionCodec;
-  /** List available models. Pass cacheTtlMs to cache results (0 = no cache, default). */
-  listModels?(options?: { cacheTtlMs?: number }): Promise<ProviderModel[]>;
+  /** List available models in a runtime context. */
+  listModels?(options?: ListModelsOptions): Promise<ProviderModel[]>;
+  /** Probe the selected binary and wire protocol for effective capabilities. */
+  probeCapabilities?(ctx?: ProviderRuntimeContext): Promise<ProviderRuntimeReport>;
+  /** Optional management surface for harness-owned upstream providers. */
+  upstreamProviders?: UpstreamProviderManager;
   /**
    * List the operating modes this provider exposes (see `AgentMode`). Present
    * only on providers with `capabilities.modes === true`. May spawn the agent
@@ -317,6 +364,8 @@ export interface ProviderModule {
    * never auto-invoked). See internal-docs/spec-durable-sessions.md.
    */
   attachSession?(record: SessionRecord, opts?: AttachOptions): Promise<SessionAttachment>;
+  /** Additive file-or-service durable history surface. */
+  attachHistory?(record: SessionRecord, opts?: AttachOptions): Promise<HistoryAttachment>;
 }
 
 // Result of looking up a transcript for a given session.
@@ -484,6 +533,36 @@ export interface SessionAttachment {
   resume(ctx?: SessionContext): Promise<AgentSession>;
 }
 
+/** Opaque, provider-owned checkpoint for file or service history. */
+export interface HistoryCheckpoint {
+  kind: string;
+  value: unknown;
+}
+
+export type HistorySource =
+  | { kind: "file"; path: string }
+  | { kind: "service"; description: string };
+
+export interface HistoryCatchUpYield {
+  event: StreamEvent;
+  checkpoint: HistoryCheckpoint;
+  eventId: string | null;
+}
+
+export interface HistoryCatchUpOptions {
+  after?: HistoryCheckpoint;
+  mode?: "incremental" | "bounded_full_resync";
+}
+
+export interface HistoryAttachment {
+  record: SessionRecord;
+  historySource: HistorySource | null;
+  lastTurn: LastTurnStatus;
+  catchUp(opts?: HistoryCatchUpOptions): AsyncIterable<HistoryCatchUpYield>;
+  resume(ctx?: SessionContext): Promise<AgentSession>;
+  close?(): Promise<void>;
+}
+
 // Execution input
 export interface ExecutionContext {
   prompt: string;
@@ -567,9 +646,15 @@ export interface ProviderEndpointConfig {
 export interface ProviderConfig {
   command?: string;
   model?: string;
+  /** Provider-native model variant, independent from reasoning effort. */
+  modelVariant?: string;
   /** Provider reasoning effort. Claude maps this to `--effort`; Codex sends
    *  it as the app-server `turn/start.effort` override. */
   effort?: string;
+  /** Behavior when a host does not provide or loses its input callback. */
+  unattendedPermissionPolicy?: "allow" | "deny";
+  /** Deadline for a host to answer an observed permission or question. Default 300s. */
+  inputRequestTimeoutSec?: number;
   maxTurns?: number;
   /**
    * Hard runtime cap, in seconds.
@@ -1229,6 +1314,69 @@ export interface ProviderModel {
   id: string;
   name: string;
   provider?: string;
+  providerName?: string;
+  variants?: Array<{
+    id: string;
+    name: string;
+    description?: string;
+    isDefault?: boolean;
+    disabled?: boolean;
+  }>;
+  supportedEfforts?: string[];
+  defaultEffort?: string;
+  contextWindow?: number;
+  maxOutputTokens?: number;
+  inputCostPerMillion?: number;
+  outputCostPerMillion?: number;
+  supportsImages?: boolean;
+  supportsTools?: boolean;
+}
+
+export interface ListModelsOptions extends ProviderRuntimeContext {
+  cacheTtlMs?: number;
+}
+
+export interface UpstreamProvider {
+  id: string;
+  name: string;
+  connected: boolean;
+  authMethodIds: string[];
+}
+
+export interface ProviderAuthMethod {
+  id: string;
+  name: string;
+  type: "api_key" | "oauth";
+  prompts?: Array<{
+    id: string;
+    label: string;
+    type: "text" | "select";
+    options?: Array<{ value: string; label: string }>;
+  }>;
+}
+
+export interface ProviderAuthFlow {
+  id: string;
+  providerId: string;
+  url: string | null;
+  completion: "code" | "automatic";
+  instructions: string | null;
+  expiresAt: string;
+}
+
+export interface UpstreamProviderManager {
+  list(ctx?: ProviderRuntimeContext): Promise<UpstreamProvider[]>;
+  authMethods(providerId: string, ctx?: ProviderRuntimeContext): Promise<ProviderAuthMethod[]>;
+  setApiKey(providerId: string, key: string, ctx?: ProviderRuntimeContext): Promise<void>;
+  beginOAuth(
+    providerId: string,
+    methodId: string,
+    inputs?: Record<string, string>,
+    ctx?: ProviderRuntimeContext,
+  ): Promise<ProviderAuthFlow>;
+  completeOAuth(flowId: string, code?: string, ctx?: ProviderRuntimeContext): Promise<void>;
+  canDisconnect(providerId: string, ctx?: ProviderRuntimeContext): Promise<boolean>;
+  disconnect(providerId: string, ctx?: ProviderRuntimeContext): Promise<void>;
 }
 
 // MCP server configuration
@@ -1496,6 +1644,8 @@ export interface AgentSession {
    * `capabilities.durableSessions === true`.
    */
   describe?(): SessionRecord | null;
+  /** Additive provider-neutral durable-history identity. */
+  describeHistory?(): SessionRecord | null;
 }
 
 /** Result of a single turn within a session. */
