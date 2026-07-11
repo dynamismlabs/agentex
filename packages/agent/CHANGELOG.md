@@ -58,6 +58,42 @@ remain source-compatible.
 - Cursor authentication checks only `CURSOR_API_KEY` for API billing and uses
   the selected binary's native `status` command for subscription state.
 
+### Review hardening
+
+- OpenCode credential changes now retire every daemon sharing the same
+  `XDG_DATA_HOME` or HOME auth store, across projects and config overlays.
+  Unrelated isolated auth stores remain running. Abandoned OAuth flows release
+  their daemon handle automatically at the advertised expiry time.
+- OpenCode model metadata reads the 1.3.2
+  `capabilities.input.image` / `capabilities.toolcall` schema while retaining
+  compatibility with older modality fields.
+- Cursor only reports sessions, resume, and its stream-json protocol profile
+  when the selected CLI advertises print, resume, and `stream-json` as an
+  explicit output format. A generic `--output-format` flag is not sufficient.
+  Runtime output quarantine remains the final per-turn protocol check.
+- Every new runtime, history, list-model, and upstream-provider type is exported
+  from the package root and covered by a compile-time public-contract test.
+- Claude durable records always persist the effective cwd, attachment resumes
+  there unless explicitly overridden, and goal hydration completes before the
+  session is exposed. Historical hydration cannot overwrite newer live state
+  or restart polling after close.
+- Claude and Codex attachment reject records owned by another provider and
+  classify the latest meaningful raw turn boundary, including user prompts
+  and Codex `task_started` records that replay normalization intentionally
+  drops. Trailing system, rate-limit, goal, and telemetry records are ignored.
+- Rejected goal sentinels now terminate as `blocked` with
+  `blockedReason: "sentinel_error"` and an `errorMessage`, rather than escaping
+  as an unhandled rejection and leaving the goal active. Codex
+  `usageLimited` maps to a budget block.
+- Derived durable providers preserve their derived provider ID across
+  `describe`, attachment, and history records. Resume reapplies the derived
+  env, command, mode, cwd, and session parameters instead of falling through
+  to the unmodified base provider. Upstream provider authentication and
+  disconnect operations receive the same derived runtime overlays, keeping
+  isolated OpenCode credential stores isolated.
+- Codex endpoint header names are emitted as quoted TOML path segments, so
+  valid names containing dots cannot become nested configuration keys.
+
 ### Compatibility and limits
 
 - OpenCode 1.3.2 is the release-tested server schema. Safe disconnect uses

@@ -164,7 +164,7 @@ export interface ProviderRuntimeReport {
 export type GoalStatus = "active" | "paused" | "met" | "blocked" | "cleared";
 
 /** Why a `blocked` goal is blocked. */
-export type GoalBlockedReason = "budget" | "needs_input" | "max_iterations";
+export type GoalBlockedReason = "budget" | "needs_input" | "max_iterations" | "sentinel_error";
 
 /** Who last changed the goal state. */
 export type GoalSource = "host" | "model" | "sentinel" | "agentex";
@@ -208,6 +208,8 @@ export interface GoalState {
   source: GoalSource;
   /** Why a `blocked` goal is blocked. Absent unless status === "blocked". */
   blockedReason?: GoalBlockedReason;
+  /** Error from goal evaluation when blockedReason is `sentinel_error`. */
+  errorMessage?: string;
   /** Codex telemetry, when the provider reports it (reverse-engineered fields). */
   tokensUsed?: number;
   timeUsedSeconds?: number;
@@ -511,6 +513,8 @@ export interface CatchUpOptions {
 export interface AttachOptions {
   /** Env overlay for home-dir resolution (same vars the transcript helpers honor). */
   env?: Record<string, string>;
+  /** Runtime selection for service-backed attachment. */
+  config?: ProviderConfig;
 }
 
 /** Read-only reattachment to a session's durable state. See `attachSession`. */
@@ -1153,6 +1157,7 @@ export type StreamEvent =
       enforced: boolean;
       source: GoalSource;
       blockedReason?: GoalBlockedReason;
+      errorMessage?: string;
       tokensUsed?: number;
       timeUsedSeconds?: number;
       tokenBudget?: number;

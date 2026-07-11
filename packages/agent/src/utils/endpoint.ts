@@ -158,13 +158,13 @@ function translateCodexEndpoint(e: ProviderEndpointConfig): EndpointTranslation 
     // name), never argv: argv is world-readable via `ps` and a header can carry
     // a secret (Authorization, X-API-Key). Mirrors why the claude provider
     // stages MCP headers to a 0600 file instead of the command line. Header
-    // names are assumed TOML bare keys (letters/digits/`-`/`_`), which real HTTP
-    // header tokens are — a name with a `.` would nest as a sub-table.
+    // names are emitted as quoted TOML path segments because valid HTTP token
+    // characters such as `.` must not become nested configuration paths.
     let i = 0;
     for (const [name, value] of Object.entries(e.headers)) {
       const headerEnv = `${CODEX_CUSTOM_HEADER_ENV_PREFIX}${i++}`;
       env[headerEnv] = value;
-      set(`model_providers.${id}.env_http_headers.${name}`, headerEnv);
+      set(`model_providers.${id}.env_http_headers.${JSON.stringify(name)}`, headerEnv);
     }
   }
   // modelMap intentionally ignored — Codex has no tier aliases.

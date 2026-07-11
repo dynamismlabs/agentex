@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({ acquire: vi.fn() }));
 
@@ -40,6 +40,7 @@ function runtime(options: {
     },
     release: vi.fn(),
     retire: vi.fn(async () => undefined),
+    retireAuthStore: vi.fn(async () => undefined),
     isCurrent: () => true,
     generation: 0,
   };
@@ -48,6 +49,7 @@ function runtime(options: {
 
 describe("OpenCode upstream provider manager", () => {
   beforeEach(() => mocks.acquire.mockReset());
+  afterEach(() => vi.useRealTimers());
 
   it("returns secret-free provider and auth method metadata", async () => {
     const fake = runtime();
@@ -69,7 +71,7 @@ describe("OpenCode upstream provider manager", () => {
     const write = fake.calls.find((call) => call.kind === "ok");
     expect(write?.path).toBe("/auth/anthropic");
     expect(JSON.parse(String(write?.init?.body))).toEqual({ type: "api", key: "secret-key" });
-    expect(fake.handle.retire).toHaveBeenCalledOnce();
+    expect(fake.handle.retireAuthStore).toHaveBeenCalledOnce();
     expect(fake.handle.release).toHaveBeenCalledOnce();
   });
 
@@ -87,7 +89,20 @@ describe("OpenCode upstream provider manager", () => {
     await openCodeUpstreamProviders.completeOAuth(flow.id, "returned-code");
     const callback = fake.calls.find((call) => call.path?.includes("/oauth/callback"));
     expect(JSON.parse(String(callback?.init?.body))).toEqual({ method: 1, code: "returned-code" });
-    expect(fake.handle.retire).toHaveBeenCalledOnce();
+    expect(fake.handle.retireAuthStore).toHaveBeenCalledOnce();
+  });
+
+  it("releases an abandoned OAuth flow when its TTL expires", async () => {
+    vi.useFakeTimers();
+    const fake = runtime();
+    mocks.acquire.mockResolvedValue(fake.runtime);
+    const methods = await openCodeUpstreamProviders.authMethods("anthropic");
+    fake.handle.release.mockClear();
+    await openCodeUpstreamProviders.beginOAuth("anthropic", methods[1]!.id);
+    expect(fake.handle.release).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
+    expect(fake.handle.release).toHaveBeenCalledOnce();
   });
 
   it("uses the generated 1.3.2 delete endpoint and rejects unknown profiles", async () => {
@@ -96,7 +111,7 @@ describe("OpenCode upstream provider manager", () => {
     await expect(openCodeUpstreamProviders.canDisconnect("anthropic")).resolves.toBe(true);
     await openCodeUpstreamProviders.disconnect("anthropic");
     expect(supported.calls.some((call) => call.kind === "ok" && call.path === "/auth/anthropic")).toBe(true);
-    expect(supported.handle.retire).toHaveBeenCalledWith({ force: true });
+    expect(supported.handle.retireAuthStore).toHaveBeenCalledWith({ force: true });
 
     const unsupported = runtime({ doc: { paths: {} } });
     mocks.acquire.mockResolvedValue(unsupported.runtime);

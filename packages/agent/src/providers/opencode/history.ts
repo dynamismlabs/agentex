@@ -219,11 +219,17 @@ export async function attachOpenCodeHistory(
   opts?: AttachOptions,
 ): Promise<HistoryAttachment> {
   assertSessionRecord(record);
+  if (record.providerType !== "opencode") {
+    throw new MalformedSessionRecordError(
+      `opencode history attach requires providerType "opencode"; got ${JSON.stringify(record.providerType)}`,
+      "providerType",
+    );
+  }
   const params = opencodeSessionCodec.deserialize(record.params);
   if (!params) throw new MalformedSessionRecordError("opencode history record has no session id", "params");
   const sessionId = params["sessionId"] as string;
   const cwd = typeof params["cwd"] === "string" ? params["cwd"] : record.cwd ?? process.cwd();
-  const runtime = await acquireOpenCodeRuntime({ cwd, env: opts?.env });
+  const runtime = await acquireOpenCodeRuntime({ cwd, env: opts?.env, config: opts?.config });
   let lastTurn: LastTurnStatus = "unknown";
   try {
     const response = await runtime.server.client.request(`/session/${encodeURIComponent(sessionId)}/message?limit=1`);

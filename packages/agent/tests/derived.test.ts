@@ -8,13 +8,16 @@ import {
   registerAcpFactory,
   listProviders,
   acpProvider,
+  createSessionRecord,
 } from "../src/index.js";
 import type {
+  AgentSession,
   ProviderModule,
   ExecutionContext,
   ExecutionResult,
   AuthReport,
   AuthResolveContext,
+  SessionContext,
 } from "../src/index.js";
 
 const fakeResult: ExecutionResult = {
@@ -141,6 +144,127 @@ describe("defineDerivedProvider", () => {
 
   it("throws MalformedProviderConfigError for extends 'acp' (wrong entry point)", () => {
     expect(() => defineDerivedProvider({ id: "x", extends: "acp" })).toThrow(MalformedProviderConfigError);
+  });
+
+  it("preserves derived identity and overlays across describe, attach, and resume", async () => {
+    const creates: SessionContext[] = [];
+    const attachCalls: Array<{
+      providerType: string;
+      env?: Record<string, string>;
+      command?: string;
+    }> = [];
+    const makeSession = (): AgentSession => ({
+      sessionId: "sess-derived",
+      state: "idle",
+      send: async () => ({
+        uuid: "u",
+        result: Promise.resolve({
+          summary: null, costUsd: null, status: "completed", errorCode: null, errorMessage: null,
+        }),
+      }),
+      cancel: async () => ({ cancelled: false }),
+      stopTask: async () => ({ stopped: false }),
+      setGoal: async () => ({ armed: true, mechanism: "emulated" }),
+      clearGoal: async () => ({ cleared: false }),
+      getGoal: () => null,
+      interrupt: async () => {},
+      drain: async () => {},
+      close: async () => {},
+      describe: () => createSessionRecord({
+        providerType: "durable-base",
+        params: { sessionId: "sess-derived", cwd: "/saved" },
+        cwd: "/saved",
+      }),
+    });
+    const base: ProviderModule = {
+      type: "durable-base",
+      capabilities: {
+        sessions: true, modelDiscovery: false, quotaProbing: false, mcp: false,
+        skills: false, instructions: false, workspace: false, planMode: false,
+        concurrentSend: false, cancelQueuedMessage: false, stopTask: false, modes: false,
+        durableSessions: true,
+      },
+      execute: async () => fakeResult,
+      resolveAuth: async () => fakeAuth,
+      createSession: async (ctx) => { creates.push(ctx); return makeSession(); },
+      attachSession: async (record, opts) => {
+        attachCalls.push({
+          providerType: record.providerType,
+          env: opts?.env,
+          command: opts?.config?.command,
+        });
+        return {
+          record,
+          transcript: null,
+          lastTurn: "completed",
+          catchUp: async function* () {},
+          resume: async () => makeSession(),
+        };
+      },
+    };
+    registerProvider(base);
+    const derived = defineDerivedProvider({
+      id: "durable-derived",
+      extends: "durable-base",
+      env: { DERIVED_KEY: "yes", SHARED: "base" },
+      command: "/derived-command",
+    });
+
+    const live = await derived.createSession!({ env: { SHARED: "caller" } });
+    const record = live.describe!()!;
+    expect(record.providerType).toBe("durable-derived");
+    expect(creates[0]).toMatchObject({
+      env: { DERIVED_KEY: "yes", SHARED: "caller" },
+      config: { command: "/derived-command" },
+    });
+
+    const attachment = await derived.attachSession!(record, { env: { SHARED: "attach" } });
+    expect(attachCalls).toEqual([{
+      providerType: "durable-base",
+      env: { DERIVED_KEY: "yes", SHARED: "attach" },
+      command: "/derived-command",
+    }]);
+    expect(attachment.record.providerType).toBe("durable-derived");
+    await attachment.resume();
+    expect(creates.at(-1)).toMatchObject({
+      cwd: "/saved",
+      env: { DERIVED_KEY: "yes", SHARED: "base" },
+      config: { command: "/derived-command" },
+      sessionParams: { sessionId: "sess-derived", cwd: "/saved" },
+    });
+  });
+
+  it("applies derived runtime overlays to upstream provider management", async () => {
+    const contexts: Array<SessionContext | undefined> = [];
+    const { provider } = makeFakeBase("managed-base");
+    provider.upstreamProviders = {
+      list: async (ctx) => { contexts.push(ctx); return []; },
+      authMethods: async (_providerId, ctx) => { contexts.push(ctx); return []; },
+      setApiKey: async (_providerId, _key, ctx) => { contexts.push(ctx); },
+      beginOAuth: async (providerId, _methodId, _inputs, ctx) => {
+        contexts.push(ctx);
+        return {
+          id: "flow", providerId, url: null, completion: "code",
+          instructions: null, expiresAt: new Date().toISOString(),
+        };
+      },
+      completeOAuth: async (_flowId, _code, ctx) => { contexts.push(ctx); },
+      canDisconnect: async (_providerId, ctx) => { contexts.push(ctx); return true; },
+      disconnect: async (_providerId, ctx) => { contexts.push(ctx); },
+    };
+    const derived = defineDerivedProvider({
+      id: "managed-derived",
+      extends: "managed-base",
+      env: { XDG_DATA_HOME: "/derived-data", SHARED: "base" },
+      command: "/derived-opencode",
+      modeId: "plan",
+    });
+
+    await derived.upstreamProviders!.list({ env: { SHARED: "caller" } });
+    expect(contexts[0]).toMatchObject({
+      env: { XDG_DATA_HOME: "/derived-data", SHARED: "caller" },
+      config: { command: "/derived-opencode", modeId: "plan" },
+    });
   });
 });
 

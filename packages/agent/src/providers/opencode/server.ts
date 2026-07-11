@@ -1,5 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
+import * as os from "node:os";
+import * as path from "node:path";
 import { killProcessTree } from "../../utils/process.js";
 import { OpenCodeClient } from "./client.js";
 
@@ -8,6 +10,7 @@ export interface OpenCodeServerHandle {
   generation: number;
   release: () => void;
   retire: (options?: { force?: boolean }) => Promise<void>;
+  retireAuthStore: (options?: { force?: boolean }) => Promise<void>;
   isCurrent: () => boolean;
 }
 
@@ -22,6 +25,13 @@ interface PooledServer {
 
 const pool = new Map<string, Promise<PooledServer>>();
 const generations = new Map<string, number>();
+const runtimeAuthStores = new Map<string, string>();
+
+export function openCodeAuthStoreKey(env: Record<string, string>): string {
+  const home = env["HOME"] || os.homedir();
+  const dataHome = env["XDG_DATA_HOME"] || path.join(home, ".local", "share");
+  return path.resolve(dataHome, "opencode", "auth.json");
+}
 
 export function openCodeRuntimeKey(
   binary: string,
@@ -151,10 +161,18 @@ export async function retireOpenCodeRuntime(
   options: { force?: boolean } = {},
 ): Promise<number> {
   const key = openCodeRuntimeKey(binary, cwd, prefixArgs, env);
+  return retireRuntimeKey(key, options);
+}
+
+async function retireRuntimeKey(
+  key: string,
+  options: { force?: boolean } = {},
+): Promise<number> {
   const nextGeneration = (generations.get(key) ?? 0) + 1;
   generations.set(key, nextGeneration);
   const pending = pool.get(key);
   pool.delete(key);
+  runtimeAuthStores.delete(key);
   if (pending) {
     try {
       const entry = await pending;
@@ -167,6 +185,17 @@ export async function retireOpenCodeRuntime(
   return nextGeneration;
 }
 
+export async function retireOpenCodeAuthStore(
+  env: Record<string, string>,
+  options: { force?: boolean } = {},
+): Promise<void> {
+  const authStore = openCodeAuthStoreKey(env);
+  const keys = [...runtimeAuthStores]
+    .filter(([, candidate]) => candidate === authStore)
+    .map(([key]) => key);
+  await Promise.all(keys.map((key) => retireRuntimeKey(key, options)));
+}
+
 export async function acquireOpenCodeServer(
   binary: string,
   prefixArgs: string[],
@@ -174,14 +203,19 @@ export async function acquireOpenCodeServer(
   cwd: string,
 ): Promise<OpenCodeServerHandle> {
   const key = openCodeRuntimeKey(binary, cwd, prefixArgs, env);
+  const authStore = openCodeAuthStoreKey(env);
   const generation = generations.get(key) ?? 0;
   let pending = pool.get(key);
   if (!pending) {
     pending = startServer(key, generation, binary, prefixArgs, env, cwd).catch((error) => {
-      pool.delete(key);
+      if (pool.get(key) === pending) {
+        pool.delete(key);
+        runtimeAuthStores.delete(key);
+      }
       throw error;
     });
     pool.set(key, pending);
+    runtimeAuthStores.set(key, authStore);
   }
   const entry = await pending;
   entry.refCount += 1;
@@ -192,12 +226,16 @@ export async function acquireOpenCodeServer(
     generation: entry.generation,
     isCurrent: () => !entry.retired && (generations.get(key) ?? 0) === entry.generation,
     retire: (options) => retireOpenCodeRuntime(binary, prefixArgs, env, cwd, options).then(() => undefined),
+    retireAuthStore: (options) => retireOpenCodeAuthStore(env, options),
     release: () => {
       if (released) return;
       released = true;
       entry.refCount -= 1;
       if (entry.refCount <= 0) {
-        if (pool.get(key) === pending) pool.delete(key);
+        if (pool.get(key) === pending) {
+          pool.delete(key);
+          runtimeAuthStores.delete(key);
+        }
         kill(entry);
       }
     },

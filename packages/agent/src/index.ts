@@ -141,6 +141,9 @@ export {
 export type {
   ProviderModule,
   ProviderCapabilities,
+  ProviderRuntimeContext,
+  ProviderRuntimeReport,
+  CapabilityStatus,
   AgentMode,
   ListModesOptions,
   ExecutionContext,
@@ -168,6 +171,11 @@ export type {
   AuthRequiredReason,
   BinaryStatus,
   ProviderModel,
+  ListModelsOptions,
+  ProviderAuthMethod,
+  ProviderAuthFlow,
+  UpstreamProvider,
+  UpstreamProviderManager,
   SessionContext,
   AgentSession,
   SendHandle,
@@ -235,6 +243,11 @@ export type {
   CatchUpOptions,
   AttachOptions,
   SessionAttachment,
+  HistoryCheckpoint,
+  HistorySource,
+  HistoryCatchUpYield,
+  HistoryCatchUpOptions,
+  HistoryAttachment,
 } from "./types.js";
 
 export type {

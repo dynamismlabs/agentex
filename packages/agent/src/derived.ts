@@ -1,11 +1,18 @@
 import type {
+  AgentSession,
+  AttachOptions,
+  HistoryAttachment,
   ProviderCapabilities,
   ProviderConfig,
   ProviderModel,
   ProviderModule,
+  ProviderRuntimeContext,
+  SessionAttachment,
+  SessionRecord,
 } from "./types.js";
 import { getProvider, registerProvider } from "./registry.js";
 import { acpProvider } from "./providers/acp/index.js";
+import { MalformedSessionRecordError } from "./sessions/record.js";
 
 /**
  * Declarative configuration for a *derived* provider — a new provider id that
@@ -76,6 +83,38 @@ export function getAcpFactory(): AcpFactory | null {
   return acpFactory;
 }
 
+function withProviderType(record: SessionRecord | null, providerType: string): SessionRecord | null {
+  return record ? { ...record, providerType } : null;
+}
+
+function wrapDerivedSession(session: AgentSession, providerType: string): AgentSession {
+  return new Proxy(session, {
+    get(target, property) {
+      if (property === "describe") {
+        return target.describe
+          ? () => withProviderType(target.describe!(), providerType)
+          : undefined;
+      }
+      if (property === "describeHistory") {
+        return target.describeHistory
+          ? () => withProviderType(target.describeHistory!(), providerType)
+          : undefined;
+      }
+      const value = Reflect.get(target, property, target) as unknown;
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+function assertDerivedRecord(record: SessionRecord, providerType: string): void {
+  if (record.providerType !== providerType) {
+    throw new MalformedSessionRecordError(
+      `${providerType} attach requires providerType ${JSON.stringify(providerType)}; got ${JSON.stringify(record.providerType)}`,
+      "providerType",
+    );
+  }
+}
+
 /**
  * Build a derived `ProviderModule` from a base provider plus an overlay. The
  * returned module is NOT auto-registered — pass it to `registerProvider`, or
@@ -124,15 +163,21 @@ export function defineDerivedProvider(cfg: DerivedProviderConfig): ProviderModul
 
   if (base.createSession) {
     const baseCreate = base.createSession.bind(base);
-    derived.createSession = (ctx) =>
-      baseCreate({ ...ctx, env: overlayEnv(ctx.env), config: overlayConfig(ctx.config) });
+    derived.createSession = async (ctx) => wrapDerivedSession(
+      await baseCreate({ ...ctx, env: overlayEnv(ctx.env), config: overlayConfig(ctx.config) }),
+      cfg.id,
+    );
   }
   if (cfg.models) {
     const models = cfg.models;
     derived.listModels = async () => models;
   } else if (base.listModels) {
     const baseList = base.listModels.bind(base);
-    derived.listModels = (opts) => baseList(opts);
+    derived.listModels = (opts) => baseList({
+      ...opts,
+      env: overlayEnv(opts?.env),
+      config: overlayConfig(opts?.config),
+    });
   }
   if (base.listModes) {
     const baseModes = base.listModes.bind(base);
@@ -144,8 +189,86 @@ export function defineDerivedProvider(cfg: DerivedProviderConfig): ProviderModul
     derived.checkQuota = (qctx) =>
       baseQuota({ ...qctx, env: overlayEnv(qctx?.env), config: overlayConfig(qctx?.config) });
   }
+  if (base.probeCapabilities) {
+    const baseProbe = base.probeCapabilities.bind(base);
+    derived.probeCapabilities = (ctx) => baseProbe({
+      ...ctx,
+      env: overlayEnv(ctx?.env),
+      config: overlayConfig(ctx?.config),
+    });
+  }
+  if (base.upstreamProviders) {
+    const manager = base.upstreamProviders;
+    const runtime = (ctx?: ProviderRuntimeContext): ProviderRuntimeContext => ({
+      ...ctx,
+      env: overlayEnv(ctx?.env),
+      config: overlayConfig(ctx?.config),
+    });
+    derived.upstreamProviders = {
+      list: (ctx) => manager.list(runtime(ctx)),
+      authMethods: (providerId, ctx) => manager.authMethods(providerId, runtime(ctx)),
+      setApiKey: (providerId, key, ctx) => manager.setApiKey(providerId, key, runtime(ctx)),
+      beginOAuth: (providerId, methodId, inputs, ctx) =>
+        manager.beginOAuth(providerId, methodId, inputs, runtime(ctx)),
+      completeOAuth: (flowId, code, ctx) => manager.completeOAuth(flowId, code, runtime(ctx)),
+      canDisconnect: (providerId, ctx) => manager.canDisconnect(providerId, runtime(ctx)),
+      disconnect: (providerId, ctx) => manager.disconnect(providerId, runtime(ctx)),
+    };
+  }
+  if (base.attachSession && derived.createSession) {
+    const baseAttach = base.attachSession.bind(base);
+    derived.attachSession = async (record, opts): Promise<SessionAttachment> => {
+      assertDerivedRecord(record, cfg.id);
+      const attachment = await baseAttach(
+        { ...record, providerType: base.type },
+        overlayAttachOptions(opts, overlayEnv, overlayConfig),
+      );
+      const derivedRecord = withProviderType(attachment.record, cfg.id)!;
+      return {
+        ...attachment,
+        record: derivedRecord,
+        resume: (ctx) => derived.createSession!({
+          ...ctx,
+          cwd: ctx?.cwd ?? derivedRecord.cwd ?? undefined,
+          sessionParams: derivedRecord.params,
+        }),
+      };
+    };
+  }
+  if (base.attachHistory && derived.createSession) {
+    const baseAttachHistory = base.attachHistory.bind(base);
+    derived.attachHistory = async (record, opts): Promise<HistoryAttachment> => {
+      assertDerivedRecord(record, cfg.id);
+      const attachment = await baseAttachHistory(
+        { ...record, providerType: base.type },
+        overlayAttachOptions(opts, overlayEnv, overlayConfig),
+      );
+      const derivedRecord = withProviderType(attachment.record, cfg.id)!;
+      return {
+        ...attachment,
+        record: derivedRecord,
+        resume: (ctx) => derived.createSession!({
+          ...ctx,
+          cwd: ctx?.cwd ?? derivedRecord.cwd ?? undefined,
+          sessionParams: derivedRecord.params,
+        }),
+      };
+    };
+  }
 
   return derived;
+}
+
+function overlayAttachOptions(
+  opts: AttachOptions | undefined,
+  overlayEnv: (env?: Record<string, string>) => Record<string, string>,
+  overlayConfig: (config?: ProviderConfig) => ProviderConfig,
+): AttachOptions {
+  return {
+    ...opts,
+    env: overlayEnv(opts?.env),
+    config: overlayConfig(opts?.config),
+  };
 }
 
 // ---------------------------------------------------------------------------

@@ -30,6 +30,13 @@ function assistantLine(): string {
     uuid: "u-asst",
   });
 }
+function userLine(): string {
+  return JSON.stringify({
+    type: "user", session_id: SID,
+    message: { id: "msg_user", role: "user", content: "start the next task" },
+    uuid: "u-user",
+  });
+}
 function resultLine(): string {
   return JSON.stringify({
     type: "result", subtype: "success", session_id: SID, result: "hello", is_error: false, uuid: "u-result",
@@ -85,6 +92,24 @@ describe("attachClaudeSession — lastTurn classification", () => {
     const att = await attach(record());
     expect(att.lastTurn).toBe("completed");
     expect(att.transcript).not.toBeNull();
+  });
+
+  it("ignores trailing system telemetry after a completed turn", async () => {
+    await writeTranscript([initLine(), assistantLine(), resultLine(), ...Array(200).fill(initLine())]);
+    const att = await attach(record());
+    expect(att.lastTurn).toBe("completed");
+  });
+
+  it("detects new turn activity after an earlier result", async () => {
+    await writeTranscript([initLine(), resultLine(), assistantLine()]);
+    const att = await attach(record());
+    expect(att.lastTurn).toBe("interrupted");
+  });
+
+  it("treats an ordinary user prompt after a result as a new interrupted turn", async () => {
+    await writeTranscript([initLine(), resultLine(), userLine()]);
+    const att = await attach(record());
+    expect(att.lastTurn).toBe("interrupted");
   });
 
   it("interrupted when the transcript ends without a result", async () => {
@@ -149,7 +174,10 @@ describe("attachClaudeSession — resume delegation", () => {
     await writeTranscript([initLine(), resultLine()]);
     const att = await attach(record());
     await att.resume();
-    expect(createClaudeSession).toHaveBeenCalledWith({ sessionParams: { sessionId: SID, cwd: CWD } });
+    expect(createClaudeSession).toHaveBeenCalledWith({
+      cwd: CWD,
+      sessionParams: { sessionId: SID, cwd: CWD },
+    });
   });
 });
 
@@ -171,5 +199,10 @@ describe("attachClaudeSession — record normalization + errors", () => {
   it("throws MalformedSessionRecordError for a structurally invalid record", async () => {
     const bad = { version: 2, providerType: "claude", params: {}, cwd: null, displayId: null, updatedAt: "x" } as unknown as SessionRecord;
     await expect(attach(bad)).rejects.toBeInstanceOf(MalformedSessionRecordError);
+  });
+
+  it("rejects a structurally valid record owned by another provider", async () => {
+    await expect(attach(record({ providerType: "codex" })))
+      .rejects.toMatchObject({ name: "MalformedSessionRecordError", path: "providerType" });
   });
 });

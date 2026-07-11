@@ -1,4 +1,6 @@
+import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
+import * as readline from "node:readline";
 import type {
   AttachOptions,
   CatchUpOptions,
@@ -19,7 +21,6 @@ import { claudeSessionCodec } from "./codec.js";
 import {
   findClaudeTranscriptBySessionId,
   getClaudeTranscriptPath,
-  peekClaudeTranscript,
   readClaudeTranscript,
 } from "./transcript.js";
 // Heavy-on-heavy is fine: this whole module loads lazily via
@@ -78,6 +79,44 @@ const EMPTY: AsyncIterable<CatchUpYield> = {
 };
 
 /**
+ * Classify lifecycle boundaries from the raw transcript rather than replay's
+ * normalized events. Ordinary Claude `user` prompt records intentionally
+ * normalize to no StreamEvent, but still start a new turn. Looking only at
+ * normalized output can therefore mistake an interrupted new turn for the
+ * preceding completed one.
+ */
+async function classifyLastTurn(filePath: string): Promise<LastTurnStatus> {
+  const stream = createReadStream(filePath, { encoding: "utf8" });
+  stream.on("error", () => {});
+  const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  let lastTurn: LastTurnStatus = "unknown";
+
+  try {
+    for await (const line of lines) {
+      let raw: unknown;
+      try {
+        raw = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (typeof raw !== "object" || raw === null || Array.isArray(raw)) continue;
+      const type = (raw as Record<string, unknown>)["type"];
+      if (type === "result") lastTurn = "completed";
+      else if (type === "user" || type === "assistant") lastTurn = "interrupted";
+    }
+  } catch (error) {
+    const fsError = error as NodeJS.ErrnoException;
+    if (fsError?.code !== "ENOENT") throw error;
+    return "unknown";
+  } finally {
+    lines.close();
+    stream.destroy();
+  }
+
+  return lastTurn;
+}
+
+/**
  * Read-only reattachment to a durable Claude session. Composition of existing
  * primitives (codec + transcript ops + `createClaudeSession` resume) — spawns
  * nothing; `resume` is the one and only live-continuation path.
@@ -87,6 +126,12 @@ export async function attachClaudeSession(
   opts?: AttachOptions,
 ): Promise<SessionAttachment> {
   assertSessionRecord(record);
+  if (record.providerType !== "claude") {
+    throw new MalformedSessionRecordError(
+      `claude attach requires providerType "claude"; got ${JSON.stringify(record.providerType)}`,
+      "providerType",
+    );
+  }
 
   // 1. Normalize params through the codec.
   const params = claudeSessionCodec.deserialize(record.params);
@@ -113,10 +158,7 @@ export async function attachClaudeSession(
   // 3. Classify how the last persisted turn ended.
   let lastTurn: LastTurnStatus = "unknown";
   if (transcript) {
-    const { lastEvent } = await peekClaudeTranscript(transcript.filePath);
-    if (lastEvent === null) lastTurn = "unknown";
-    else if (lastEvent.type === "result") lastTurn = "completed";
-    else lastTurn = "interrupted";
+    lastTurn = await classifyLastTurn(transcript.filePath);
   }
 
   return {
@@ -141,7 +183,7 @@ export async function attachClaudeSession(
     },
     // 5. Continue live — exactly `createSession` with the record's params.
     resume(ctx?: SessionContext) {
-      return createClaudeSession({ ...ctx, sessionParams: params });
+      return createClaudeSession({ ...ctx, cwd: ctx?.cwd ?? cwd ?? undefined, sessionParams: params });
     },
   };
 }

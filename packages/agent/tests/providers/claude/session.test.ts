@@ -820,11 +820,11 @@ describe("ClaudeSession — describe()", () => {
     expect(typeof rec!.updatedAt).toBe("string");
   });
 
-  it("omits cwd from params/record when the session had none", () => {
+  it("records the effective cwd when the caller omitted one", () => {
     const { session, feed } = make({});
     feed(ndjson({ type: "system", subtype: "init", session_id: "s2", model: "m", tools: [], permissionMode: "default" }));
     const rec = session.describe();
-    expect(rec!.cwd).toBeNull();
-    expect(rec!.params).toEqual({ sessionId: "s2" });
+    expect(rec!.cwd).toBe(process.cwd());
+    expect(rec!.params).toEqual({ sessionId: "s2", cwd: process.cwd() });
   });
 });

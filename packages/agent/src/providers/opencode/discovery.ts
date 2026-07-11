@@ -11,13 +11,10 @@ function number(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-export async function listOpenCodeModels(options: ListModelsOptions = {}): Promise<ProviderModel[]> {
-  const runtime = await acquireOpenCodeRuntime(options);
-  try {
-    const payload = await runtime.server.client.json<Record<string, unknown>>("/provider");
-    const providers = Array.isArray(payload["all"]) ? payload["all"] : [];
-    const models: ProviderModel[] = [];
-    for (const rawProvider of providers) {
+export function openCodeModelsFromPayload(payload: Record<string, unknown>): ProviderModel[] {
+  const providers = Array.isArray(payload["all"]) ? payload["all"] : [];
+  const models: ProviderModel[] = [];
+  for (const rawProvider of providers) {
       const provider = record(rawProvider);
       const providerId = typeof provider["id"] === "string" ? provider["id"] : "";
       const providerName = typeof provider["name"] === "string" ? provider["name"] : providerId;
@@ -28,6 +25,8 @@ export async function listOpenCodeModels(options: ListModelsOptions = {}): Promi
         if (!modelId) continue;
         const limits = record(model["limit"]);
         const cost = record(model["cost"]);
+        const capabilities = record(model["capabilities"]);
+        const capabilityInput = record(capabilities["input"]);
         const modalities = record(model["modalities"]);
         const inputModalities = Array.isArray(modalities["input"])
           ? modalities["input"].filter((item): item is string => typeof item === "string")
@@ -51,12 +50,19 @@ export async function listOpenCodeModels(options: ListModelsOptions = {}): Promi
           ...(number(limits["output"]) !== undefined ? { maxOutputTokens: number(limits["output"]) } : {}),
           ...(number(cost["input"]) !== undefined ? { inputCostPerMillion: number(cost["input"]) } : {}),
           ...(number(cost["output"]) !== undefined ? { outputCostPerMillion: number(cost["output"]) } : {}),
-          supportsImages: inputModalities.includes("image"),
-          supportsTools: model["tool_call"] === true,
+          supportsImages: capabilityInput["image"] === true || inputModalities.includes("image"),
+          supportsTools: capabilities["toolcall"] === true || model["tool_call"] === true,
         });
       }
-    }
-    return models;
+  }
+  return models;
+}
+
+export async function listOpenCodeModels(options: ListModelsOptions = {}): Promise<ProviderModel[]> {
+  const runtime = await acquireOpenCodeRuntime(options);
+  try {
+    const payload = await runtime.server.client.json<Record<string, unknown>>("/provider");
+    return openCodeModelsFromPayload(payload);
   } finally {
     runtime.server.release();
   }

@@ -415,7 +415,10 @@ export interface CodexPeekResult {
  * Cheap drift-check: reads up to {@link PEEK_TAIL_BYTES} from the tail,
  * walks back to the last parseable line, returns it plus the file size.
  */
-export async function peekCodexTranscript(filePath: string): Promise<CodexPeekResult> {
+export async function peekCodexTranscript(
+  filePath: string,
+  options: { accept?: (event: CodexTranscriptLine) => boolean } = {},
+): Promise<CodexPeekResult> {
   let size: number;
   try {
     const s = await stat(filePath);
@@ -452,6 +455,7 @@ export async function peekCodexTranscript(filePath: string): Promise<CodexPeekRe
       if (!trimmed) continue;
       const parsed = parseCodexLine(trimmed);
       if (!parsed) continue;
+      if (options.accept && !options.accept(parsed)) continue;
       return { lastEvent: parsed, size };
     }
 

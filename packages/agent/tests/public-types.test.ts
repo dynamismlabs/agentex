@@ -1,0 +1,37 @@
+import { describe, expect, it } from "vitest";
+import type {
+  CapabilityStatus,
+  HistoryAttachment,
+  HistoryCatchUpOptions,
+  HistoryCatchUpYield,
+  HistoryCheckpoint,
+  HistorySource,
+  ListModelsOptions,
+  ProviderAuthFlow,
+  ProviderAuthMethod,
+  ProviderRuntimeContext,
+  ProviderRuntimeReport,
+  UpstreamProvider,
+  UpstreamProviderManager,
+} from "../src/index.js";
+
+type PublicTypes =
+  | CapabilityStatus
+  | HistoryAttachment
+  | HistoryCatchUpOptions
+  | HistoryCatchUpYield
+  | HistoryCheckpoint
+  | HistorySource
+  | ListModelsOptions
+  | ProviderAuthFlow
+  | ProviderAuthMethod
+  | ProviderRuntimeContext
+  | ProviderRuntimeReport
+  | UpstreamProvider
+  | UpstreamProviderManager;
+
+describe("root public type exports", () => {
+  it("keeps the compile-time public contract reachable", () => {
+    expect(null as PublicTypes | null).toBeNull();
+  });
+});

@@ -139,6 +139,9 @@ export class GoalController {
    * sentinel/loop), call `setGoal` again; hydrate does not restart the loop.
    */
   hydrate(state: GoalState): void {
+    // Hydration is historical initialization, never an overwrite. A live
+    // parser event or caller-set goal that won the race remains authoritative.
+    if (this.state !== null) return;
     this.state = state;
     this.mode = "idle";
   }
@@ -387,6 +390,19 @@ export class GoalController {
       // re-enters onTurnSettled and continues the loop.
       const nudge = verdict.nudge ?? defaultNudge(objective, this.iterations);
       void this.deps.send(nudge).catch(() => {});
+    } catch (error) {
+      if (gen !== this.generation) return;
+      this.transition({
+        objective,
+        status: "blocked",
+        met: false,
+        enforced: true,
+        source: "agentex",
+        blockedReason: "sentinel_error",
+        errorMessage: error instanceof Error ? error.message : String(error),
+      });
+      this.mode = "idle";
+      this.sentinel = null;
     } finally {
       this.evaluating = false;
     }
@@ -433,6 +449,7 @@ export class GoalController {
       raw: { synthetic: "goal", ...fields },
     };
     if (fields.blockedReason !== undefined) event.blockedReason = fields.blockedReason;
+    if (fields.errorMessage !== undefined) event.errorMessage = fields.errorMessage;
     if (fields.tokensUsed !== undefined) event.tokensUsed = fields.tokensUsed;
     if (fields.timeUsedSeconds !== undefined) event.timeUsedSeconds = fields.timeUsedSeconds;
     if (fields.tokenBudget !== undefined) event.tokenBudget = fields.tokenBudget;

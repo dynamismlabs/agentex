@@ -17,7 +17,7 @@ if (dumpArgsTo) {
 }
 
 const cliArgs = process.argv.slice(2);
-if (format === "cursor" && process.env.MOCK_CURSOR_PROFILE === "supported") {
+if (format === "cursor" && ["supported", "models_only", "no_stream_json"].includes(process.env.MOCK_CURSOR_PROFILE)) {
   if (cliArgs.includes("--version")) {
     console.log("cursor-agent 2.0.0");
     process.exit(0);
@@ -27,7 +27,15 @@ if (format === "cursor" && process.env.MOCK_CURSOR_PROFILE === "supported") {
     process.exit(0);
   }
   if (cliArgs.includes("--help")) {
-    console.log("Options:\n  --mode <agent|plan|ask>");
+    if (process.env.MOCK_CURSOR_PROFILE === "models_only") {
+      console.log("Options:\n  --mode <agent|plan|ask>");
+      process.exit(0);
+    }
+    if (process.env.MOCK_CURSOR_PROFILE === "no_stream_json") {
+      console.log("Options:\n  -p, --print\n  --output-format <text|json>\n  --resume <chatId>\n  --mode <agent|plan|ask>");
+      process.exit(0);
+    }
+    console.log("Options:\n  -p, --print\n  --output-format <text|json|stream-json>\n  --resume <chatId>\n  --mode <agent|plan|ask>");
     process.exit(0);
   }
 }

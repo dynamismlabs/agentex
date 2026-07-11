@@ -132,6 +132,25 @@ describe("GoalController", () => {
       expect(events.at(-1)).toMatchObject({ status: "blocked", blockedReason: "max_iterations" });
     });
 
+    it("turns a rejected sentinel into a terminal blocked state", async () => {
+      const { controller, events } = makeHarness();
+      await controller.setGoal("goal", {
+        sentinel: async () => { throw new Error("assessment unavailable"); },
+      });
+
+      await expect(controller.onTurnSettled(completedTurn())).resolves.toBeUndefined();
+      expect(controller.getGoal()).toMatchObject({
+        status: "blocked",
+        blockedReason: "sentinel_error",
+        errorMessage: "assessment unavailable",
+      });
+      expect(events.at(-1)).toMatchObject({
+        status: "blocked",
+        blockedReason: "sentinel_error",
+        errorMessage: "assessment unavailable",
+      });
+    });
+
     it("stops driving once the goal is cleared mid-loop", async () => {
       const { controller, sends } = makeHarness();
       await controller.setGoal("goal", { sentinel: () => false });
@@ -410,6 +429,20 @@ describe("GoalController", () => {
       expect(controller.getGoal()?.objective).toBe("resumed goal");
       await controller.onTurnSettled(completedTurn()); // hydrate doesn't restart the loop
       expect(sends).toEqual([]);
+    });
+
+    it("never overwrites newer live goal state", async () => {
+      const { controller } = makeHarness();
+      await controller.setGoal("new live goal", { enforce: "advisory" });
+      controller.hydrate({
+        objective: "stale historical goal",
+        status: "active",
+        met: false,
+        enforced: true,
+        source: "host",
+        updatedAt: "2026-06-25T00:00:00.000Z",
+      });
+      expect(controller.getGoal()?.objective).toBe("new live goal");
     });
   });
 });

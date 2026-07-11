@@ -89,6 +89,8 @@ const cursorModels = cursorRuntime?.capabilities.modelDiscovery?.supported
 
 OpenCode model IDs are fully qualified as `provider/model`. Provider-native variants are returned separately on `ProviderModel.variants` and selected with `config.modelVariant`. Cursor models are returned exactly as the installed CLI reports them. Grok therefore appears through Cursor discovery when the account and CLI expose it. There is no separate Grok provider or hard-coded Grok catalog.
 
+Cursor's runtime report claims sessions and resume only when the selected CLI advertises `--print`, `--resume`, and `stream-json` as an explicit `--output-format` value. A generic output-format flag is not enough. A real turn still validates that `system:init` arrives before releasing any output. This keeps discovery non-billable without treating a successful model-list command as proof of the execution protocol.
+
 OpenCode also exposes its upstream providers so an app can build provider-first credential UI without storing keys in agentex:
 
 ```ts
@@ -135,6 +137,14 @@ loadProvidersFromConfig({
   },
 });
 ```
+
+When the base provider supports durable sessions or service history, the
+derived provider keeps that capability without losing its identity. Persisted
+records use the derived provider ID, and attachment/resume reapplies the
+derived command, environment, mode, cwd, and session parameters. Upstream
+provider authentication and disconnect calls also receive the derived runtime
+overlay, so an OpenCode provider configured with an isolated credential home
+continues to use that store for credential management.
 
 **Per-call endpoint (`config.endpoint`).** When the endpoint is chosen per
 session rather than registered up front — e.g. an app that lets each user bring

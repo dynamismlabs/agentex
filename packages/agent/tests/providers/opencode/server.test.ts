@@ -42,6 +42,41 @@ describe("OpenCode authenticated server lifecycle", () => {
     handle.release();
   });
 
+  it("retires every runtime sharing an auth store without touching another store", async () => {
+    const first = await acquireOpenCodeServer(process.execPath, [MOCK_SERVER], env, process.cwd());
+    const second = await acquireOpenCodeServer(
+      process.execPath,
+      [MOCK_SERVER],
+      env,
+      path.dirname(process.cwd()),
+    );
+    const isolated = await acquireOpenCodeServer(
+      process.execPath,
+      [MOCK_SERVER],
+      { ...env, XDG_DATA_HOME: path.join(process.cwd(), ".different-data") },
+      process.cwd(),
+    );
+
+    await first.retireAuthStore();
+    expect(first.isCurrent()).toBe(false);
+    expect(second.isCurrent()).toBe(false);
+    expect(isolated.isCurrent()).toBe(true);
+    first.release();
+    second.release();
+    isolated.release();
+  });
+
+  it("an old handle cannot untrack its replacement generation", async () => {
+    const old = await acquireOpenCodeServer(process.execPath, [MOCK_SERVER], env, process.cwd());
+    await old.retireAuthStore();
+    const replacement = await acquireOpenCodeServer(process.execPath, [MOCK_SERVER], env, process.cwd());
+    old.release();
+
+    await replacement.retireAuthStore();
+    expect(replacement.isCurrent()).toBe(false);
+    replacement.release();
+  });
+
   it("force-kills a daemon that ignores graceful termination", async () => {
     const handle = await acquireOpenCodeServer(
       process.execPath,

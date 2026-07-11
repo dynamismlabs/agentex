@@ -216,11 +216,7 @@ export async function createClaudeSession(ctx: SessionContext): Promise<AgentSes
     throw new Error("Failed to open stdio on Claude process");
   }
 
-  const session = new ClaudeSessionImpl(proc, ctx, skillsDir, mcpConfigPath);
-
-  // On resume, restore an unmet native goal from the transcript (best-effort,
-  // non-blocking so session creation isn't delayed by a transcript read).
-  if (resumeId) void session.hydrateGoalFromTranscript(resumeId);
+  const session = new ClaudeSessionImpl(proc, { ...ctx, cwd }, skillsDir, mcpConfigPath);
 
   // Wire up AbortSignal to close the session
   if (ctx.signal) {
@@ -230,6 +226,10 @@ export async function createClaudeSession(ctx: SessionContext): Promise<AgentSes
       ctx.signal.addEventListener("abort", () => void session.close(), { once: true });
     }
   }
+
+  // Finish historical hydration before exposing the session. This prevents a
+  // late transcript read from overwriting a goal the caller sets immediately.
+  if (resumeId && session.state !== "closed") await session.hydrateGoalFromTranscript(resumeId);
 
   return session;
 }
@@ -307,6 +307,7 @@ export class ClaudeSessionImpl implements AgentSession {
   /** Tail state for observing native goal_status (transcript-only, not on stdout). */
   private _goalScanOffset = 0;
   private _goalPoll: ReturnType<typeof setInterval> | null = null;
+  private readonly cwd: string;
 
   constructor(
     private readonly proc: ChildProcess,
@@ -314,6 +315,7 @@ export class ClaudeSessionImpl implements AgentSession {
     private readonly skillsDir: string | null,
     private readonly mcpConfigPath: string | null = null,
   ) {
+    this.cwd = ctx.cwd ?? process.cwd();
     this._goals = new GoalController({
       providerType: "claude",
       capability: claudeGoalCapability,
@@ -384,6 +386,7 @@ export class ClaudeSessionImpl implements AgentSession {
 
   get sessionId(): string | null { return this._sessionId; }
   get state(): SessionState { return this._state; }
+  private isClosed(): boolean { return this._state === "closed"; }
 
   /**
    * Durable identity for persistence + later `attachSession`. Null until Claude
@@ -392,7 +395,7 @@ export class ClaudeSessionImpl implements AgentSession {
    */
   describe(): SessionRecord | null {
     if (!this._sessionId) return null;
-    const cwd = this.ctx.cwd ?? null;
+    const cwd = this.cwd;
     const params = claudeSessionCodec.serialize({
       sessionId: this._sessionId,
       ...(cwd ? { cwd } : {}),
@@ -1144,7 +1147,7 @@ export class ClaudeSessionImpl implements AgentSession {
     try {
       const found = await claudeTranscriptOps.find({
         sessionId,
-        cwd: this.ctx.cwd ?? process.cwd(),
+        cwd: this.cwd,
       });
       if (found) this._transcriptPath = found.filePath;
     } catch { /* best effort */ } finally {
@@ -1166,20 +1169,22 @@ export class ClaudeSessionImpl implements AgentSession {
    */
   async hydrateGoalFromTranscript(sessionId: string): Promise<void> {
     try {
+      if (this.isClosed()) return;
       const found = await claudeTranscriptOps.find({
         sessionId,
-        cwd: this.ctx.cwd ?? process.cwd(),
+        cwd: this.cwd,
       });
-      if (!found) return;
+      if (!found || this.isClosed()) return;
       this._transcriptPath = found.filePath;
       const events: StreamEvent[] = [];
       let endOffset = 0;
       for await (const { event, offset } of claudeTranscriptOps.read({ filePath: found.filePath })) {
+        if (this.isClosed()) return;
         endOffset = offset;
         if (event.type === "goal_status") events.push(event);
       }
       const last = latestGoalFromEvents(events);
-      if (last && !isTerminalGoalStatus(last.status)) {
+      if (!this.isClosed() && last && !isTerminalGoalStatus(last.status)) {
         // Start observing from the END of the historical transcript so the poller
         // surfaces only post-resume transitions (we already hydrated the state).
         this._goalScanOffset = endOffset;

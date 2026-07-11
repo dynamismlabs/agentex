@@ -16,6 +16,7 @@ import {
 import { getRuntimeHomeEnvVar } from "../../utils/runtime-homes.js";
 import { codexSessionCodec } from "./codec.js";
 import {
+  type CodexTranscriptLine,
   getCodexTranscriptPath,
   peekCodexTranscript,
   readCodexCwd,
@@ -37,6 +38,44 @@ const EMPTY: AsyncIterable<CatchUpYield> = {
   },
 };
 
+function isTurnBoundary(line: CodexTranscriptLine, sessionId: string): boolean {
+  const payloadType = typeof line.payload?.["type"] === "string" ? line.payload["type"] : null;
+
+  // These raw records start a turn but intentionally normalize to no replay
+  // event. They must still supersede an earlier task_complete when deciding
+  // whether the latest persisted turn was interrupted.
+  if (line.type === "event_msg" && (payloadType === "task_started" || payloadType === "user_message")) {
+    return true;
+  }
+  if (line.type === "response_item" && payloadType === "message" && line.payload?.["role"] === "user") {
+    return true;
+  }
+  if (line.type === "message" && line.raw["role"] === "user") return true;
+
+  return codexLineToStreamEvents(line, { sessionId }).some((event) => ![
+    "system",
+    "permission_mode",
+    "rate_limit",
+    "goal_status",
+    "unknown",
+  ].includes(event.type));
+}
+
+async function latestTurnBoundary(
+  filePath: string,
+  sessionId: string,
+): Promise<CodexTranscriptLine | null> {
+  const { lastEvent } = await peekCodexTranscript(filePath, {
+    accept: (line) => isTurnBoundary(line, sessionId),
+  });
+  if (lastEvent) return lastEvent;
+  let latest: CodexTranscriptLine | null = null;
+  for await (const { event } of readCodexTranscript({ filePath })) {
+    if (isTurnBoundary(event, sessionId)) latest = event;
+  }
+  return latest;
+}
+
 /**
  * Read-only reattachment to a durable Codex session. Same skeleton as Claude,
  * with two deltas: classify via the rollout's last line, and replay through
@@ -48,6 +87,12 @@ export async function attachCodexSession(
   opts?: AttachOptions,
 ): Promise<SessionAttachment> {
   assertSessionRecord(record);
+  if (record.providerType !== "codex") {
+    throw new MalformedSessionRecordError(
+      `codex attach requires providerType "codex"; got ${JSON.stringify(record.providerType)}`,
+      "providerType",
+    );
+  }
 
   // 1. Normalize params through the codec.
   const params = codexSessionCodec.deserialize(record.params);
@@ -85,9 +130,9 @@ export async function attachCodexSession(
   // 3. Classify how the last persisted turn ended.
   let lastTurn: LastTurnStatus = "unknown";
   if (transcript) {
-    const { lastEvent } = await peekCodexTranscript(transcript.filePath);
+    const lastEvent = await latestTurnBoundary(transcript.filePath, sessionId);
     if (lastEvent === null) lastTurn = "unknown";
-    else if (lastEvent.type === "event_msg" && lastEvent.payload?.["type"] === "task_complete")
+    else if (codexLineToStreamEvents(lastEvent, { sessionId }).some((event) => event.type === "result"))
       lastTurn = "completed";
     else lastTurn = "interrupted";
   }
@@ -117,7 +162,7 @@ export async function attachCodexSession(
     },
     // 5. Continue live — exactly `createSession` with the record's params.
     resume(ctx?: SessionContext) {
-      return createCodexSession({ ...ctx, sessionParams: params });
+      return createCodexSession({ ...ctx, cwd: ctx?.cwd ?? cwd ?? undefined, sessionParams: params });
     },
   };
 }

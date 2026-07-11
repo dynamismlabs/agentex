@@ -131,12 +131,25 @@ describe("translateEndpoint — codex (model_providers via -c)", () => {
     });
     const id = CODEX_CUSTOM_PROVIDER_ID;
     // argv references an env var name, and env holds the actual value.
-    const envVar = JSON.parse(codexOverrides(args)[`model_providers.${id}.env_http_headers.Authorization`]);
+    const envVar = JSON.parse(codexOverrides(args)[`model_providers.${id}.env_http_headers."Authorization"`]);
     expect(env[envVar]).toBe("Bearer super-secret");
     // The secret value itself must never appear in argv.
     expect(args.join(" ")).not.toContain("super-secret");
     // ...and we use the env-var form, not the static `http_headers` form.
-    expect(args.join(" ")).toContain("env_http_headers.Authorization=");
+    expect(args.join(" ")).toContain('env_http_headers."Authorization"=');
+  });
+
+  it("quotes dotted HTTP header names as one TOML key segment", () => {
+    const { env, args } = translateEndpoint("codex", {
+      baseUrl: "https://x",
+      headers: { "X.Trace.Id": "trace-secret" },
+    });
+    const id = CODEX_CUSTOM_PROVIDER_ID;
+    const envVar = JSON.parse(
+      codexOverrides(args)[`model_providers.${id}.env_http_headers."X.Trace.Id"`],
+    );
+    expect(env[envVar]).toBe("trace-secret");
+    expect(args.join(" ")).not.toContain("trace-secret");
   });
 
   it("ignores modelMap (codex has no tier aliases)", () => {

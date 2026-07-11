@@ -33,6 +33,7 @@ export interface NormalizedGoalFields {
   enforced: boolean;
   source: GoalSource;
   blockedReason?: GoalBlockedReason;
+  errorMessage?: string;
   tokensUsed?: number;
   timeUsedSeconds?: number;
   tokenBudget?: number;
@@ -90,6 +91,9 @@ export function normalizeCodexGoalStatus(raw: string | null | undefined): {
     case "budget-limited":
     case "budget_limited":
     case "budgetlimited": // camelCase `budgetLimited`, lowercased
+    case "usage-limited":
+    case "usage_limited":
+    case "usagelimited": // camelCase `usageLimited`, lowercased
       return { status: "blocked", met: false, blockedReason: "budget" };
     case "blocked":
       return { status: "blocked", met: false, blockedReason: "needs_input" };
@@ -165,6 +169,7 @@ export function goalStateFromEvent(event: GoalStatusEvent): GoalState {
     updatedAt: event.timestamp,
   };
   if (event.blockedReason !== undefined) state.blockedReason = event.blockedReason;
+  if (event.errorMessage !== undefined) state.errorMessage = event.errorMessage;
   if (event.tokensUsed !== undefined) state.tokensUsed = event.tokensUsed;
   if (event.timeUsedSeconds !== undefined) state.timeUsedSeconds = event.timeUsedSeconds;
   if (event.tokenBudget !== undefined) state.tokenBudget = event.tokenBudget;

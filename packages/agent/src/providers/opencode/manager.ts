@@ -20,6 +20,7 @@ interface FlowRecord {
   completion: "code" | "automatic";
   server: OpenCodeServerHandle;
   contextKey: string;
+  expiryTimer: ReturnType<typeof setTimeout>;
 }
 
 const flows = new Map<string, FlowRecord>();
@@ -92,6 +93,7 @@ function cleanupFlows(): void {
   const now = Date.now();
   for (const [id, flow] of flows) {
     if (flow.expiresAt <= now) {
+      clearTimeout(flow.expiryTimer);
       flow.server.release();
       flows.delete(id);
     }
@@ -99,7 +101,11 @@ function cleanupFlows(): void {
   while (flows.size >= MAX_FLOWS) {
     const oldest = flows.keys().next().value as string | undefined;
     if (!oldest) break;
-    flows.get(oldest)?.server.release();
+    const flow = flows.get(oldest);
+    if (flow) {
+      clearTimeout(flow.expiryTimer);
+      flow.server.release();
+    }
     flows.delete(oldest);
   }
 }
@@ -178,7 +184,7 @@ export const openCodeUpstreamProviders: UpstreamProviderManager = {
         method: "PUT",
         body: JSON.stringify({ type: "api", key }),
       });
-      await runtime.server.retire();
+      await runtime.server.retireAuthStore();
     } finally {
       runtime.server.release();
     }
@@ -195,6 +201,13 @@ export const openCodeUpstreamProviders: UpstreamProviderManager = {
       const id = `ocf_${randomUUID()}`;
       const expiresAt = Date.now() + FLOW_TTL_MS;
       const completion = response["method"] === "auto" ? "automatic" : "code";
+      const expiryTimer = setTimeout(() => {
+        const expired = flows.get(id);
+        if (!expired) return;
+        flows.delete(id);
+        expired.server.release();
+      }, FLOW_TTL_MS);
+      expiryTimer.unref();
       flows.set(id, {
         id,
         providerId,
@@ -203,6 +216,7 @@ export const openCodeUpstreamProviders: UpstreamProviderManager = {
         completion,
         server: runtime.server,
         contextKey: contextKey(ctx),
+        expiryTimer,
       });
       return {
         id,
@@ -225,12 +239,13 @@ export const openCodeUpstreamProviders: UpstreamProviderManager = {
       throw new OpenCodeAuthFlowExpiredError();
     }
     flows.delete(flowId);
+    clearTimeout(flow.expiryTimer);
     try {
       await flow.server.client.ok(`/provider/${encodeURIComponent(flow.providerId)}/oauth/callback`, {
         method: "POST",
         body: JSON.stringify({ method: flow.methodIndex, ...(code ? { code } : {}) }),
       });
-      await flow.server.retire();
+      await flow.server.retireAuthStore();
     } finally {
       flow.server.release();
     }
@@ -246,7 +261,7 @@ export const openCodeUpstreamProviders: UpstreamProviderManager = {
     const runtime = await acquireOpenCodeRuntime(ctx);
     try {
       await runtime.server.client.ok(`/auth/${encodeURIComponent(providerId)}`, { method: "DELETE" });
-      await runtime.server.retire({ force: true });
+      await runtime.server.retireAuthStore({ force: true });
     } finally {
       runtime.server.release();
     }

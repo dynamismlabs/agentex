@@ -32,6 +32,16 @@ function taskCompleteLine(): string {
     type: "event_msg", timestamp: TS, payload: { type: "task_complete", last_agent_message: "done" },
   });
 }
+function taskStartedLine(): string {
+  return JSON.stringify({
+    type: "event_msg", timestamp: TS, payload: { type: "task_started" },
+  });
+}
+function userMessageLine(): string {
+  return JSON.stringify({
+    type: "event_msg", timestamp: TS, payload: { type: "user_message", message: "next task" },
+  });
+}
 
 let home: string;
 
@@ -81,6 +91,27 @@ describe("attachCodexSession — lastTurn classification", () => {
     const att = await attach(record());
     expect(att.lastTurn).toBe("completed");
     expect(att.transcript?.cwd).toBe(CWD);
+  });
+
+  it("ignores trailing session metadata after a completed turn", async () => {
+    await writeRollout([metaLine(), assistantLine(), taskCompleteLine(), ...Array(200).fill(metaLine())]);
+    const att = await attach(record());
+    expect(att.lastTurn).toBe("completed");
+  });
+
+  it("detects new turn activity after an earlier completion", async () => {
+    await writeRollout([metaLine(), taskCompleteLine(), assistantLine()]);
+    const att = await attach(record());
+    expect(att.lastTurn).toBe("interrupted");
+  });
+
+  it.each([
+    ["task_started", taskStartedLine],
+    ["user_message", userMessageLine],
+  ])("treats raw %s after task_complete as a new interrupted turn", async (_name, line) => {
+    await writeRollout([metaLine(), taskCompleteLine(), line()]);
+    const att = await attach(record());
+    expect(att.lastTurn).toBe("interrupted");
   });
 
   it("interrupted when the rollout ends without task_complete", async () => {
@@ -159,5 +190,10 @@ describe("attachCodexSession — record normalization + errors", () => {
   it("throws MalformedSessionRecordError for a record with no usable sessionId", async () => {
     const bad = createSessionRecord({ providerType: "codex", params: { nope: true } });
     await expect(attach(bad)).rejects.toBeInstanceOf(MalformedSessionRecordError);
+  });
+
+  it("rejects a structurally valid record owned by another provider", async () => {
+    await expect(attach(record({ providerType: "claude" })))
+      .rejects.toMatchObject({ name: "MalformedSessionRecordError", path: "providerType" });
   });
 });

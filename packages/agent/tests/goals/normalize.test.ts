@@ -77,6 +77,7 @@ describe("goal normalization", () => {
       ["budget-limited", "blocked", false, "budget"],
       ["budget_limited", "blocked", false, "budget"],
       ["budgetLimited", "blocked", false, "budget"], // camelCase, lowercased internally
+      ["usageLimited", "blocked", false, "budget"],
       ["blocked", "blocked", false, "needs_input"],
       ["cleared", "cleared", false, undefined],
       [null, "active", false, undefined],
