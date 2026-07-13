@@ -206,6 +206,24 @@ export type {
   GoalSentinelContext,
 } from "./types.js";
 
+// Local persisted session discovery. Runtime errors are exported from the
+// `@agentex/agent/history` subpath to keep the root barrel lazy.
+export type {
+  LocalHistoryArchiveState,
+  LocalHistoryDiscoverOptions,
+  LocalHistoryErrorCode,
+  LocalHistoryEvent,
+  LocalHistoryFingerprintOptions,
+  LocalHistoryOps,
+  LocalHistoryProbeOptions,
+  LocalHistoryProbeResult,
+  LocalHistoryReadOptions,
+  LocalHistorySession,
+  LocalHistorySourceFingerprint,
+  LocalHistoryUserEvent,
+  LocalHistoryYield,
+} from "./history/index.js";
+
 // Goals
 export {
   GoalController,

@@ -95,6 +95,8 @@ export interface ProviderCapabilities {
   durableSessions?: boolean;
   /** Provider-neutral durable history through `attachHistory`. */
   durableHistory?: boolean;
+  /** Read-only discovery and import of locally persisted sessions. */
+  localHistory?: boolean;
   /** A persisted provider session can be resumed. */
   resume?: boolean;
   /** Models expose provider-native variants independently from effort. */
@@ -368,6 +370,8 @@ export interface ProviderModule {
   attachSession?(record: SessionRecord, opts?: AttachOptions): Promise<SessionAttachment>;
   /** Additive file-or-service durable history surface. */
   attachHistory?(record: SessionRecord, opts?: AttachOptions): Promise<HistoryAttachment>;
+  /** Discover and read local sessions when their ids are not already known. */
+  localHistory?: import("./history/types.js").LocalHistoryOps;
 }
 
 // Result of looking up a transcript for a given session.
@@ -499,7 +503,7 @@ export interface CatchUpYield {
    * only bites Claude tool-call turns.)
    */
   offset: number;
-  /** Stable wire id for dedup vs live events (Claude); null when the provider has none (Codex). */
+  /** Stable replay id. Claude uses its wire id and file-backed Codex uses a deterministic synthetic id. */
   eventId: string | null;
 }
 

@@ -131,7 +131,7 @@ describe("attachCodexSession — lastTurn classification", () => {
 });
 
 describe("attachCodexSession — catchUp", () => {
-  it("replays normalized events with increasing offsets and NULL eventIds", async () => {
+  it("replays normalized events with increasing offsets and stable eventIds", async () => {
     await writeRollout([metaLine(), assistantLine(), taskCompleteLine()]);
     const att = await attach(record());
     const events = await collect(att.catchUp());
@@ -141,8 +141,10 @@ describe("attachCodexSession — catchUp", () => {
     for (let i = 1; i < events.length; i++) {
       expect(events[i]!.offset).toBeGreaterThan(events[i - 1]!.offset);
     }
-    // Codex has no wire ids — contract is null (spec §9.7).
-    expect(events.every((e) => e.eventId === null)).toBe(true);
+    // Codex has no native wire ids, so file replay uses a deterministic
+    // rollout-id + line-offset identity.
+    expect(events.every((e) => e.eventId?.startsWith(`codex:${SID}:`) === true)).toBe(true);
+    expect(events.map((e) => e.eventId)).toEqual(events.map((e) => e.event.eventId));
   });
 
   it("re-invoking from the last offset yields nothing", async () => {

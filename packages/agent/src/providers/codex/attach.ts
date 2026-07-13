@@ -79,8 +79,8 @@ async function latestTurnBoundary(
 /**
  * Read-only reattachment to a durable Codex session. Same skeleton as Claude,
  * with two deltas: classify via the rollout's last line, and replay through
- * `codexLineToStreamEvents` (Codex has no wire ids, so `eventId` is always null
- * — hosts gate replay dedup on their own running flag, per spec §9.7).
+ * `codexLineToStreamEvents`. File-backed transcript lines carry deterministic
+ * synthetic event ids so replay can be deduplicated across process restarts.
  */
 export async function attachCodexSession(
   record: SessionRecord,
@@ -142,7 +142,7 @@ export async function attachCodexSession(
     transcript,
     lastTurn,
     // 4. Replay: map each rollout line through the normalizer; one yield per
-    //    produced event, all sharing the line's offset, eventId always null.
+    //    produced event, all sharing the line's offset and source event id.
     catchUp(catchOpts?: CatchUpOptions): AsyncIterable<CatchUpYield> {
       if (!transcript) return EMPTY;
       const filePath = transcript.filePath;
@@ -154,7 +154,7 @@ export async function attachCodexSession(
             ...(catchOpts?.fromOffset !== undefined ? { fromOffset: catchOpts.fromOffset } : {}),
           })) {
             for (const event of codexLineToStreamEvents(line, { sessionId: sid })) {
-              yield { event, offset, eventId: null };
+              yield { event, offset, eventId: event.eventId };
             }
           }
         },

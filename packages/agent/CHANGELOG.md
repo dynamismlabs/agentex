@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.0.29 — Local Claude and Codex history import
+
+### Added
+
+- Claude and Codex expose `provider.localHistory` for bounded, content-free
+  presence probes, main-session discovery, normalized historical reads,
+  line-aligned checkpoints, and source fingerprints.
+- Local history includes human messages alongside the normal `StreamEvent`
+  vocabulary. `(eventId, partIndex)` is stable across repeated reads when one
+  source record produces several normalized events.
+- Codex discovery uses rollout JSONL as its canonical read-only source and
+  reads `session_index.jsonl` plus compatible SQLite state databases only for
+  optional titles.
+- Added `pnpm --filter @agentex/agent diagnose:history`, which reports only
+  structural counts and durations from local stores.
+- Limited discovery orders candidates using file metadata and stops transcript
+  inspection once enough eligible sessions are found.
+- `mainSessionsOnly: false` includes Claude nested subagents with stable parent
+  identities and inherited project context. Legacy Codex reads retain
+  unwrapped tool calls and tool results.
+
+### Changed
+
+- File-backed Codex normalization now preserves its deterministic synthetic
+  transcript event id through `codexLineToStreamEvents()` and durable session
+  catch-up.
+- Strong fingerprints use one file descriptor and verify metadata after
+  hashing. Completed transcript reads report `source_changed_during_read` when
+  the opened source changes before EOF verification.
+
 ## 0.0.28 — OpenCode and Cursor integration contracts
 
 Additive release. OpenCode is now a fully managed session provider and Cursor

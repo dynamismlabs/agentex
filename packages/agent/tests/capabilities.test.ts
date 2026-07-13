@@ -47,6 +47,7 @@ describe("ProviderCapabilities", () => {
       },
       durableSessions: true,
       durableHistory: true,
+      localHistory: true,
     });
   });
 
@@ -131,6 +132,15 @@ describe("ProviderCapabilities", () => {
       const p = getProvider(type);
       expect(p.capabilities.durableSessions).toBeUndefined();
       expect(p.attachSession).toBeUndefined();
+    }
+  });
+
+  it("advertises localHistory only where local discovery is implemented", () => {
+    for (const type of listProviders()) {
+      const provider = getProvider(type);
+      const expected = type === "claude" || type === "codex";
+      expect(provider.capabilities.localHistory === true).toBe(expected);
+      expect(typeof provider.localHistory === "object").toBe(expected);
     }
   });
 

@@ -24,6 +24,7 @@ export const codexProvider: ProviderModule = {
     goals: codexGoalCapability,
     durableSessions: true,
     durableHistory: true,
+    localHistory: true,
   },
   // Heavy machinery (execute.ts, session.ts, modes.ts, attach.ts) loads lazily
   // on first use — every ProviderModule method is already async.
@@ -42,6 +43,23 @@ export const codexProvider: ProviderModule = {
       import("../../sessions/history.js"),
     ]);
     return historyFromSessionAttachment("codex", await attachCodexSession(record, opts));
+  },
+  localHistory: {
+    probe: (options) => import("./history.js").then((module) => module.codexLocalHistory.probe(options)),
+    discover: (options) => ({
+      async *[Symbol.asyncIterator]() {
+        const module = await import("./history.js");
+        yield* module.codexLocalHistory.discover(options);
+      },
+    }),
+    read: (session, options) => ({
+      async *[Symbol.asyncIterator]() {
+        const module = await import("./history.js");
+        yield* module.codexLocalHistory.read(session, options);
+      },
+    }),
+    fingerprint: (session, options) => import("./history.js")
+      .then((module) => module.codexLocalHistory.fingerprint(session, options)),
   },
 };
 

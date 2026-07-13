@@ -36,6 +36,7 @@ export const claudeProvider: ProviderModule = {
     goals: claudeGoalCapability,
     durableSessions: true,
     durableHistory: true,
+    localHistory: true,
   },
   // Heavy machinery (execute.ts, session.ts, attach.ts) loads lazily on first
   // use — every ProviderModule method is already async, so this is invisible to
@@ -55,6 +56,23 @@ export const claudeProvider: ProviderModule = {
       import("../../sessions/history.js"),
     ]);
     return historyFromSessionAttachment("claude", await attachClaudeSession(record, opts));
+  },
+  localHistory: {
+    probe: (options) => import("./history.js").then((module) => module.claudeLocalHistory.probe(options)),
+    discover: (options) => ({
+      async *[Symbol.asyncIterator]() {
+        const module = await import("./history.js");
+        yield* module.claudeLocalHistory.discover(options);
+      },
+    }),
+    read: (session, options) => ({
+      async *[Symbol.asyncIterator]() {
+        const module = await import("./history.js");
+        yield* module.claudeLocalHistory.read(session, options);
+      },
+    }),
+    fingerprint: (session, options) => import("./history.js")
+      .then((module) => module.claudeLocalHistory.fingerprint(session, options)),
   },
 };
 

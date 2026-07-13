@@ -610,9 +610,48 @@ if (attachment.lastTurn === "interrupted") {
 }
 ```
 
-Dedup replayed events against anything you saw live: Claude events carry a stable wire `eventId` (upsert on it); Codex has none (`eventId: null`), so gate replay on your own "not currently running" flag. A runnable end-to-end proof — start a session, crash the host mid-turn, reattach in a fresh process — lives in `scripts/durable-session-demo.ts` (`pnpm demo:durable`).
+Dedup replayed events against anything you saw live: Claude events carry a stable wire `eventId`. File-backed Codex events carry a deterministic synthetic id derived from the rollout session id and line-start byte offset. A runnable end-to-end proof — start a session, crash the host mid-turn, reattach in a fresh process — lives in `scripts/durable-session-demo.ts` (`pnpm demo:durable`).
 
 OpenCode exposes the same host-level recovery shape through service-backed history rather than a local JSONL transcript. Persist `session.describeHistory()`, call `provider.attachHistory(record)`, and checkpoint the opaque `HistoryCheckpoint` returned with each event. `catchUp({ mode: "incremental", after })` resumes after that exact normalized event. `catchUp({ mode: "bounded_full_resync" })` performs a bounded rebuild. OpenCode pagination is capped at 100 pages, 10,000 messages, and 25 MiB so a corrupt or unexpectedly large history cannot exhaust the host.
+
+### Discover local history when session ids are unknown
+
+Claude and Codex expose `provider.localHistory` for import and migration tools. This is separate from `attachHistory()`: attachment starts from a persisted `SessionRecord`, while local discovery starts with no known session ids.
+
+```typescript
+import { getProvider } from "@agentex/agent";
+
+const history = getProvider("claude").localHistory!;
+const presence = await history.probe(); // file presence only, no transcript parsing
+
+if (presence.historyAvailable) {
+  for await (const session of history.discover({ limit: 50 })) {
+    let checkpoint = 0;
+    let completedLine: number | undefined;
+    for await (const item of history.read(session, { fromOffset: checkpoint })) {
+      if (completedLine !== undefined && item.nextOffset !== completedLine) {
+        checkpoint = completedLine;
+        await saveCheckpoint(checkpoint);
+      }
+      await ingest(item.event, item.partIndex);
+      completedLine = item.nextOffset;
+    }
+    if (completedLine !== undefined) await saveCheckpoint(completedLine);
+    const strongFingerprint = await history.fingerprint(session, { sha256: true });
+    await saveFingerprint(strongFingerprint);
+  }
+}
+```
+
+Discovery defaults to main sessions with at least one meaningful human message. Claude nested subagents and sidechains are excluded by default. Pass `mainSessionsOnly: false` to include them with a stable parent-session identity and inherited project context. Codex subagent rollouts, environment context, metadata-only threads, and duplicate active/archive copies are excluded by default. Source files are opened read-only and are never changed.
+
+`discover({ limit })` first orders candidates by filesystem metadata, then inspects transcripts in bounded batches until it finds enough eligible sessions. A limit bounds transcript parsing, not only returned rows.
+
+Strong fingerprints verify the opened file before and after hashing. A strong fingerprint or completed transcript read throws `LocalHistoryError` with code `source_changed_during_read` when the source changes during the operation. Hosts should keep committed line checkpoints and retry from the last completed boundary.
+
+`LocalHistoryYield.event.eventId` identifies the provider source record. Use `(providerType, externalSessionId, eventId, partIndex)` as the normalized-event idempotency key because one JSONL record can produce several events. `nextOffset` is line-aligned, so persist it only after every part for that line commits.
+
+Codex rollout JSONL is the canonical history and checkpoint source. `session_index.jsonl` and compatible SQLite state databases are optional title sources opened read-only. Local history never starts Codex App Server.
 
 ## Plan Mode
 

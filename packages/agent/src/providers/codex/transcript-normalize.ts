@@ -20,8 +20,9 @@ import type { CodexTranscriptLine } from "./transcript.js";
  *
  * The on-disk vocabulary is Codex-internal and version-shifting, so every field
  * is read defensively and a weird line NEVER throws — it returns `[]`. Codex
- * emits no per-line wire id, so `eventId`/`turnId` are null (hosts gate replay
- * dedup on their own "not currently running" flag; see spec §9.7).
+ * emits no native per-line wire id. File readers attach a deterministic
+ * synthetic `line.eventId`, which this normalizer preserves. Standalone line
+ * parsing still produces a null event id.
  */
 export function codexLineToStreamEvents(
   line: CodexTranscriptLine,
@@ -47,7 +48,7 @@ function mapLine(line: CodexTranscriptLine, sessionId: string | null): StreamEve
     providerType: "codex",
     sessionId,
     messageId: null,
-    eventId: null,
+    eventId: line.eventId,
     turnId: null,
     parentToolCallId: null,
     raw: line.raw,
