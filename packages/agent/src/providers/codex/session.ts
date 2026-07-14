@@ -619,10 +619,11 @@ export class CodexSessionImpl implements AgentSession {
       input: [{ type: "text", text: message }],
     };
     if (this._threadId) turnParams["threadId"] = this._threadId;
-    // Codex app-server accepts reasoning effort as a turn/start override. The
-    // selected value becomes the default for later turns on this thread, so
-    // forwarding the session config here works for both fresh and resumed
-    // sessions without mutating the user's global config.toml.
+    // Codex app-server accepts model and reasoning effort as turn/start
+    // overrides. Selected values become defaults for later turns on the same
+    // thread, so forwarding the session config here works for fresh and
+    // resumed sessions without mutating the user's global config.toml.
+    if (this.model) turnParams["model"] = this.model;
     if (this.ctx.config?.effort) turnParams["effort"] = this.ctx.config.effort;
 
     let resolveFn!: (r: TurnResult) => void;

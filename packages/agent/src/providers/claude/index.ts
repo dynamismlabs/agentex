@@ -37,6 +37,16 @@ export const claudeProvider: ProviderModule = {
     durableSessions: true,
     durableHistory: true,
     localHistory: true,
+    resume: true,
+    modelVariants: false,
+    permissionRequests: true,
+    questionRequests: true,
+    strictMcpIsolation: true,
+    upstreamProviderDisconnect: false,
+    sessionModelChange: true,
+    sessionVariantChange: false,
+    sessionEffortChange: true,
+    sessionModeChange: true,
   },
   // Heavy machinery (execute.ts, session.ts, attach.ts) loads lazily on first
   // use — every ProviderModule method is already async, so this is invisible to

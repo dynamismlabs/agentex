@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.0.30 — Complete Claude and Codex host capabilities
+
+### Fixed
+
+- Claude and Codex now declare the resumability, permission, question, and
+  in-session selection capabilities their session implementations support.
+- Codex now sends both model and effort overrides on every `turn/start`, so a
+  recycled host process can apply a changed selection while resuming the same
+  thread.
+- Provider contract tests cover the complete Claude and Codex host capability
+  matrix, including explicit unsupported controls.
+
 ## 0.0.29 — Local Claude and Codex history import
 
 ### Added

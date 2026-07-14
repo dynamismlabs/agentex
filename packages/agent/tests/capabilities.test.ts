@@ -48,6 +48,39 @@ describe("ProviderCapabilities", () => {
       durableSessions: true,
       durableHistory: true,
       localHistory: true,
+      resume: true,
+      modelVariants: false,
+      permissionRequests: true,
+      questionRequests: true,
+      strictMcpIsolation: true,
+      upstreamProviderDisconnect: false,
+      sessionModelChange: true,
+      sessionVariantChange: false,
+      sessionEffortChange: true,
+      sessionModeChange: true,
+    });
+  });
+
+  it("claude and codex declare their complete host session-control contract", () => {
+    expect(getProvider("claude").capabilities).toMatchObject({
+      resume: true,
+      permissionRequests: true,
+      questionRequests: true,
+      strictMcpIsolation: true,
+      sessionModelChange: true,
+      sessionVariantChange: false,
+      sessionEffortChange: true,
+      sessionModeChange: true,
+    });
+    expect(getProvider("codex").capabilities).toMatchObject({
+      resume: true,
+      permissionRequests: true,
+      questionRequests: true,
+      strictMcpIsolation: false,
+      sessionModelChange: true,
+      sessionVariantChange: false,
+      sessionEffortChange: true,
+      sessionModeChange: false,
     });
   });
 

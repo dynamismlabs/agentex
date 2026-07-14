@@ -485,8 +485,8 @@ function paramsFor(writes: Array<Record<string, unknown>>, method: string): Reco
   return (msg?.["params"] as Record<string, unknown>) ?? {};
 }
 
-describe("CodexSession — reasoning effort", () => {
-  it("forwards ProviderConfig.effort to turn/start", async () => {
+describe("CodexSession — turn selection overrides", () => {
+  it("forwards ProviderConfig model and effort to turn/start", async () => {
     const { proc, writes } = makeRpcProc({
       initialize: () => ({}),
       "thread/start": () => ({ thread: { id: "thr_effort" } }),
@@ -502,6 +502,7 @@ describe("CodexSession — reasoning effort", () => {
     await session.handshake();
 
     const handle = await session.send("Solve carefully");
+    expect(paramsFor(writes, "turn/start")["model"]).toBe("test-model");
     expect(paramsFor(writes, "turn/start")["effort"]).toBe("xhigh");
 
     (session as unknown as { handleLine: (line: string) => void }).handleLine(
@@ -520,7 +521,40 @@ describe("CodexSession — reasoning effort", () => {
     await session.handshake();
 
     const handle = await session.send("Use the configured default");
+    expect(paramsFor(writes, "turn/start")["model"]).toBe("test-model");
     expect(paramsFor(writes, "turn/start")["effort"]).toBeUndefined();
+
+    (session as unknown as { handleLine: (line: string) => void }).handleLine(
+      ndjson({ type: "turn.completed" }),
+    );
+    await handle.result;
+  });
+
+  it("applies model and effort overrides after resuming an existing thread", async () => {
+    const { proc, writes } = makeRpcProc({
+      initialize: () => ({}),
+      "thread/resume": (params) => ({ thread: { id: params["threadId"] } }),
+      "thread/goal/get": () => ({ goal: {} }),
+      "turn/start": () => ({ turn: { id: "turn_resumed_selection", status: "inProgress" } }),
+    });
+    const session = new CodexSessionImpl(
+      proc,
+      {
+        sessionParams: { sessionId: "thr_existing" },
+        config: { model: "gpt-5.4", effort: "high" },
+      },
+      "/tmp",
+      "gpt-5.4",
+      null,
+    );
+    await session.handshake();
+
+    const handle = await session.send("Continue with the new selection");
+    expect(paramsFor(writes, "turn/start")).toMatchObject({
+      threadId: "thr_existing",
+      model: "gpt-5.4",
+      effort: "high",
+    });
 
     (session as unknown as { handleLine: (line: string) => void }).handleLine(
       ndjson({ type: "turn.completed" }),
