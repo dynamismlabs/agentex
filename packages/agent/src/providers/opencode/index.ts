@@ -20,6 +20,7 @@ export const opencodeProvider: ProviderModule = {
     modes: true,
     goals: EMULATED_GOAL_CAPABILITY,
     durableHistory: true,
+    savedHistory: true,
     resume: true,
     modelVariants: true,
     permissionRequests: true,
@@ -50,4 +51,20 @@ export const opencodeProvider: ProviderModule = {
     disconnect: (providerId, ctx) => import("./manager.js").then((m) => m.openCodeUpstreamProviders.disconnect(providerId, ctx)),
   },
   attachHistory: (record, options) => import("./history.js").then((m) => m.attachOpenCodeHistory(record, options)),
+  savedHistory: {
+    probe: (options) => import("./saved-history.js")
+      .then((module) => module.openCodeSavedHistory.probe(options)),
+    discover: (options) => ({
+      async *[Symbol.asyncIterator]() {
+        const module = await import("./saved-history.js");
+        yield* module.openCodeSavedHistory.discover(options);
+      },
+    }),
+    read: (session, options) => ({
+      async *[Symbol.asyncIterator]() {
+        const module = await import("./saved-history.js");
+        yield* module.openCodeSavedHistory.read(session, options);
+      },
+    }),
+  },
 };

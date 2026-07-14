@@ -74,6 +74,10 @@ export async function probeOpenCodeCapabilities(
         questionRequests: capability(has("/question", "get") && has("/question/{requestID}/reply", "post")),
         upstreamProviderDisconnect: capability(supportsDisconnect),
         durableHistory: capability(has("/session/{sessionID}/message", "get")),
+        savedHistory: capability(
+          (has("/experimental/session", "get") || has("/session", "get"))
+          && has("/session/{sessionID}/message", "get"),
+        ),
         planMode: capability(agents.some((value) => {
           const agent = rec(value);
           return agent["name"] === "plan" || agent["id"] === "plan";

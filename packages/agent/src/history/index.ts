@@ -2,6 +2,16 @@ export {
   LocalHistoryError,
 } from "./types.js";
 export type {
+  SavedHistoryArchiveState,
+  SavedHistoryDiscoverOptions,
+  SavedHistoryEvent,
+  SavedHistoryOps,
+  SavedHistoryProbeOptions,
+  SavedHistoryProbeResult,
+  SavedHistoryReadOptions,
+  SavedHistorySession,
+  SavedHistoryUserEvent,
+  SavedHistoryYield,
   LocalHistoryArchiveState,
   LocalHistoryDiscoverOptions,
   LocalHistoryErrorCode,

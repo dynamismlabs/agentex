@@ -18,6 +18,7 @@ import type {
   AuthReport,
   AuthResolveContext,
   SessionContext,
+  SavedHistorySession,
 } from "../src/index.js";
 
 const fakeResult: ExecutionResult = {
@@ -265,6 +266,90 @@ describe("defineDerivedProvider", () => {
       env: { XDG_DATA_HOME: "/derived-data", SHARED: "caller" },
       config: { command: "/derived-opencode", modeId: "plan" },
     });
+  });
+
+  it("preserves derived identity and runtime overlays for saved history", async () => {
+    const contexts: Array<{ env?: Record<string, string>; command?: string }> = [];
+    const readSessions: SavedHistorySession[] = [];
+    const { provider } = makeFakeBase("saved-base");
+    provider.capabilities.savedHistory = true;
+    const baseSession: SavedHistorySession = {
+      version: 1,
+      providerType: "saved-base",
+      externalSessionId: "ses_saved",
+      cwd: "/saved-project",
+      title: "Saved",
+      startedAt: "2026-07-14T00:00:00.000Z",
+      updatedAt: "2026-07-14T00:01:00.000Z",
+      branch: null,
+      gitOriginUrl: null,
+      archiveState: "active",
+      hasUserMessage: true,
+    };
+    provider.savedHistory = {
+      probe: async (options) => {
+        contexts.push({ env: options?.env, command: options?.config?.command });
+        return {
+          providerType: "saved-base",
+          sourceAvailable: true,
+          historyAvailable: true,
+          approximateCount: 1,
+        };
+      },
+      discover: (options) => ({
+        async *[Symbol.asyncIterator]() {
+          contexts.push({ env: options?.env, command: options?.config?.command });
+          yield baseSession;
+        },
+      }),
+      read: (session, options) => ({
+        async *[Symbol.asyncIterator]() {
+          readSessions.push(session);
+          contexts.push({ env: options?.env, command: options?.config?.command });
+          yield {
+            event: {
+              type: "user" as const,
+              text: "hello",
+              timestamp: "2026-07-14T00:00:00.000Z",
+              providerType: "saved-base",
+              sessionId: "ses_saved",
+              messageId: "msg_saved",
+              eventId: "msg_saved",
+              turnId: null,
+              parentToolCallId: null,
+              raw: {},
+            },
+            checkpoint: { kind: "saved", value: 1 },
+            eventId: "msg_saved",
+            partIndex: 0,
+          };
+        },
+      }),
+    };
+    const derived = defineDerivedProvider({
+      id: "saved-derived",
+      extends: "saved-base",
+      env: { XDG_DATA_HOME: "/derived", SHARED: "base" },
+      command: "/derived-opencode",
+    });
+
+    expect(await derived.savedHistory!.probe({ env: { SHARED: "probe" } }))
+      .toMatchObject({ providerType: "saved-derived", historyAvailable: true });
+    const discovered: SavedHistorySession[] = [];
+    for await (const session of derived.savedHistory!.discover()) discovered.push(session);
+    expect(discovered[0]?.providerType).toBe("saved-derived");
+    const events = [];
+    for await (const item of derived.savedHistory!.read(discovered[0]!, {
+      env: { SHARED: "read" },
+    })) events.push(item);
+
+    expect(readSessions[0]?.providerType).toBe("saved-base");
+    expect(events[0]?.event.providerType).toBe("saved-derived");
+    expect(contexts).toEqual([
+      { env: { XDG_DATA_HOME: "/derived", SHARED: "probe" }, command: "/derived-opencode" },
+      { env: { XDG_DATA_HOME: "/derived", SHARED: "base" }, command: "/derived-opencode" },
+      { env: { XDG_DATA_HOME: "/derived", SHARED: "read" }, command: "/derived-opencode" },
+    ]);
   });
 });
 

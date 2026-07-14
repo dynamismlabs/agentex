@@ -1,4 +1,93 @@
-import type { BaseStreamEventFields, StreamEvent } from "../types.js";
+import type {
+  BaseStreamEventFields,
+  HistoryCheckpoint,
+  ProviderRuntimeContext,
+  StreamEvent,
+} from "../types.js";
+
+/**
+ * Provider-neutral discovery options for persisted sessions. Unlike
+ * `LocalHistoryDiscoverOptions`, these options do not assume a filesystem
+ * source. Providers may satisfy them through a local authenticated service.
+ */
+export interface SavedHistoryDiscoverOptions extends ProviderRuntimeContext {
+  /** Optional provider-session directory filter. `cwd` is runtime context only. */
+  directory?: string;
+  includeArchived?: boolean;
+  mainSessionsOnly?: boolean;
+  requireUserMessage?: boolean;
+  limit?: number;
+}
+
+export interface SavedHistoryProbeOptions extends ProviderRuntimeContext {
+  limit?: number;
+}
+
+export interface SavedHistoryProbeResult {
+  providerType: string;
+  /** The provider-owned history source could be reached. */
+  sourceAvailable: boolean;
+  historyAvailable: boolean;
+  /** A bounded source count, not necessarily an eligible-session count. */
+  approximateCount?: number;
+}
+
+export type SavedHistoryArchiveState = "active" | "archived" | "unknown";
+
+/**
+ * Serializable metadata for a provider-owned persisted session. Storage
+ * details such as transcript paths, byte offsets, and database layouts are
+ * deliberately absent.
+ */
+export interface SavedHistorySession {
+  version: 1;
+  providerType: string;
+  externalSessionId: string;
+  cwd: string | null;
+  title: string | null;
+  startedAt: string | null;
+  updatedAt: string;
+  branch: string | null;
+  gitOriginUrl: string | null;
+  archiveState: SavedHistoryArchiveState;
+  hasUserMessage: boolean;
+}
+
+export type SavedHistoryUserEvent = {
+  type: "user";
+  text: string;
+} & BaseStreamEventFields;
+
+export type SavedHistoryEvent = StreamEvent | SavedHistoryUserEvent;
+
+export interface SavedHistoryYield {
+  event: SavedHistoryEvent & { eventId: string };
+  /** Opaque provider-owned bookmark. Persist only after the event commits. */
+  checkpoint: HistoryCheckpoint;
+  eventId: string;
+  /** Disambiguates normalized events that share one provider source part. */
+  partIndex: number;
+}
+
+export interface SavedHistoryReadOptions extends ProviderRuntimeContext {
+  after?: HistoryCheckpoint;
+  mode?: "incremental" | "bounded_full_resync";
+}
+
+/**
+ * Discover and read provider-owned saved sessions when their ids are not yet
+ * known. This is the provider-neutral import/synchronization surface. It is
+ * separate from `attachHistory`, which starts from a known `SessionRecord`,
+ * and from the file-specific `LocalHistoryOps` compatibility API.
+ */
+export interface SavedHistoryOps {
+  probe(options?: SavedHistoryProbeOptions): Promise<SavedHistoryProbeResult>;
+  discover(options?: SavedHistoryDiscoverOptions): AsyncIterable<SavedHistorySession>;
+  read(
+    session: SavedHistorySession,
+    options?: SavedHistoryReadOptions,
+  ): AsyncIterable<SavedHistoryYield>;
+}
 
 export interface LocalHistoryDiscoverOptions {
   includeArchived?: boolean;

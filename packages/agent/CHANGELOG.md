@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased — OpenCode saved history import and synchronization
+
+### Added
+
+- Added the optional provider-neutral `provider.savedHistory` contract for
+  discovering and reading provider-owned sessions without exposing transcript
+  paths, database layouts, or byte offsets.
+- OpenCode saved-history discovery uses its authenticated, cross-project
+  `/experimental/session` API with root-session, archived-session, directory,
+  and limit filters. The older global `GET /session` list remains an
+  active-session fallback.
+- OpenCode saved-history reads include user prompts alongside normalized
+  assistant, thinking, tool, and terminal events. Opaque message-part
+  checkpoints support incremental synchronization and bounded full resync.
+- Added public saved-history types, a static and runtime capability flag,
+  derived-provider identity and environment overlays, and release-safe runtime
+  cleanup.
+
+### Safety and compatibility
+
+- Discovery and message inspection are bounded by page, record, and byte
+  limits. A damaged or concurrently deleted session is isolated so it does not
+  hide healthy sessions from the import catalog.
+- Runtime `cwd` is separate from the optional saved-session `directory` filter,
+  preserving cross-project discovery. Reads acquire OpenCode in the discovered
+  session's cwd so another project's messages remain available.
+- Existing Claude and Codex `localHistory` APIs and existing OpenCode
+  `attachHistory()` behavior are unchanged. Known-session catch-up still omits
+  user prompts owned by the host.
+
 ## 0.0.30 — Complete Claude and Codex host capabilities
 
 ### Fixed

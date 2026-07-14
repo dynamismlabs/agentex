@@ -6,8 +6,9 @@ import type {
   HistoryCheckpoint,
   LastTurnStatus,
   SessionRecord,
-  StreamEvent,
 } from "../../types.js";
+import type { SavedHistoryEvent, SavedHistoryUserEvent } from "../../history/types.js";
+import { meaningfulHumanText } from "../../history/fs.js";
 import { assertSessionRecord, createSessionRecord, MalformedSessionRecordError } from "../../sessions/record.js";
 import { acquireOpenCodeRuntime } from "./runtime.js";
 import { opencodeSessionCodec } from "./codec.js";
@@ -42,9 +43,21 @@ interface DecodedCheckpoint {
   ordinal: number | null;
 }
 
-export interface MessageEnvelope {
+export interface MessageEnvelope extends Record<string, unknown> {
   info?: Record<string, unknown>;
   parts?: unknown[];
+}
+
+interface HistoricalEvent {
+  event: SavedHistoryEvent;
+  partId: string;
+}
+
+export interface CollectedHistoryEvent {
+  event: SavedHistoryEvent;
+  checkpoint: HistoryCheckpoint;
+  eventId: string | null;
+  partIndex: number;
 }
 
 function rec(value: unknown): Record<string, unknown> | null {
@@ -74,17 +87,69 @@ function checkpoint(messageId: string, partId: string, ordinal: number): History
   return { kind: CHECKPOINT_KIND, value: { messageId, partId, ordinal } };
 }
 
-export function historicalEvents(message: MessageEnvelope, sessionId: string): Array<{ event: StreamEvent; partId: string }> {
+function userTextPart(part: Record<string, unknown>): string | null {
+  if (part["synthetic"] === true || part["ignored"] === true) return null;
+  if (part["type"] === "text") return string(part["text"]);
+  if (part["type"] === "subtask") return string(part["prompt"]);
+  return null;
+}
+
+function historicalUserEvent(
+  message: MessageEnvelope,
+  sessionId: string,
+  timestamp: string,
+): HistoricalEvent | null {
   const info = message.info ?? {};
-  if (info["role"] !== "assistant") return [];
+  const messageId = string(info["id"]);
+  const texts: string[] = [];
+  let partId: string | null = null;
+  for (const rawPart of message.parts ?? []) {
+    const part = rec(rawPart);
+    const text = part ? userTextPart(part) : null;
+    if (!part || !text) continue;
+    const candidatePartId = string(part["id"]);
+    if (!candidatePartId) continue;
+    texts.push(text);
+    partId = candidatePartId;
+  }
+  const text = meaningfulHumanText(texts.join("\n\n"));
+  if (!text || !partId) return null;
+  const eventId = messageId ?? partId;
+  const event: SavedHistoryUserEvent = {
+    type: "user",
+    text,
+    timestamp,
+    providerType: "opencode",
+    sessionId,
+    messageId,
+    eventId,
+    turnId: null,
+    parentToolCallId: null,
+    raw: message,
+  };
+  return { event, partId };
+}
+
+export function historicalEvents(
+  message: MessageEnvelope,
+  sessionId: string,
+  options: { includeUserMessages?: boolean } = {},
+): HistoricalEvent[] {
+  const info = message.info ?? {};
   const messageId = string(info["id"]);
   const timestamp = new Date(
     typeof rec(info["time"])?.["created"] === "number"
       ? rec(info["time"])!["created"] as number
       : Date.now(),
   ).toISOString();
+  if (info["role"] === "user") {
+    if (!options.includeUserMessages) return [];
+    const user = historicalUserEvent(message, sessionId, timestamp);
+    return user ? [user] : [];
+  }
+  if (info["role"] !== "assistant") return [];
   const base: OcBaseInfo = { provider: "opencode", sessionId, timestamp };
-  const events: Array<{ event: StreamEvent; partId: string }> = [];
+  const events: HistoricalEvent[] = [];
   for (const rawPart of message.parts ?? []) {
     const part = rec(rawPart);
     const partId = string(part?.["id"]);
@@ -130,7 +195,8 @@ export async function collectHistory(
   client: import("./client.js").OpenCodeClient,
   sessionId: string,
   options: HistoryCatchUpOptions | undefined,
-): Promise<Array<{ event: StreamEvent; checkpoint: HistoryCheckpoint; eventId: string | null }>> {
+  mapping: { includeUserMessages?: boolean } = {},
+): Promise<CollectedHistoryEvent[]> {
   const after = options?.mode === "bounded_full_resync" ? null : decodeCheckpoint(options?.after);
   const pages: MessageEnvelope[][] = [];
   let before: string | null = null;
@@ -171,13 +237,13 @@ export async function collectHistory(
   }
 
   const messages = pages.reverse().flat();
-  const output: Array<{ event: StreamEvent; checkpoint: HistoryCheckpoint; eventId: string | null }> = [];
+  const output: CollectedHistoryEvent[] = [];
   let passedCheckpoint = after === null;
   let foundPart = after === null;
   for (const message of messages) {
     const messageId = string(message.info?.["id"]);
     if (!messageId) continue;
-    const events = historicalEvents(message, sessionId);
+    const events = historicalEvents(message, sessionId, mapping);
     const partOrdinals = new Map<string, number>();
     for (const item of events) {
       const ordinal = partOrdinals.get(item.partId) ?? 0;
@@ -206,6 +272,7 @@ export async function collectHistory(
         event: item.event,
         checkpoint: checkpoint(messageId, item.partId, ordinal),
         eventId: item.event.eventId,
+        partIndex: ordinal,
       });
     }
     if (foundPart && messageId === after?.messageId) passedCheckpoint = true;
@@ -256,7 +323,13 @@ export async function attachOpenCodeHistory(
     catchUp(options) {
       return {
         async *[Symbol.asyncIterator](): AsyncIterator<HistoryCatchUpYield> {
-          for (const yielded of await collectHistory(runtime.server.client, sessionId, options)) yield yielded;
+          for (const yielded of await collectHistory(runtime.server.client, sessionId, options)) {
+            // Known-session catch-up deliberately excludes user prompts. The
+            // host already owns them. `savedHistory.read()` opts in to users
+            // when importing a conversation the host did not create.
+            const event = yielded.event;
+            if (event.type !== "user") yield { ...yielded, event };
+          }
         },
       };
     },

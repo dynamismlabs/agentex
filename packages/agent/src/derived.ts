@@ -10,6 +10,7 @@ import type {
   SessionAttachment,
   SessionRecord,
 } from "./types.js";
+import type { SavedHistorySession } from "./history/types.js";
 import { getProvider, registerProvider } from "./registry.js";
 import { acpProvider } from "./providers/acp/index.js";
 import { MalformedSessionRecordError } from "./sessions/record.js";
@@ -213,6 +214,44 @@ export function defineDerivedProvider(cfg: DerivedProviderConfig): ProviderModul
       completeOAuth: (flowId, code, ctx) => manager.completeOAuth(flowId, code, runtime(ctx)),
       canDisconnect: (providerId, ctx) => manager.canDisconnect(providerId, runtime(ctx)),
       disconnect: (providerId, ctx) => manager.disconnect(providerId, runtime(ctx)),
+    };
+  }
+  if (base.savedHistory) {
+    const savedHistory = base.savedHistory;
+    const savedOptions = <T extends ProviderRuntimeContext>(options: T | undefined): T => ({
+      ...options,
+      env: overlayEnv(options?.env),
+      config: overlayConfig(options?.config),
+    }) as T;
+    derived.savedHistory = {
+      async probe(options) {
+        const result = await savedHistory.probe(savedOptions(options));
+        return { ...result, providerType: cfg.id };
+      },
+      discover: (options) => ({
+        async *[Symbol.asyncIterator]() {
+          for await (const session of savedHistory.discover(savedOptions(options))) {
+            yield { ...session, providerType: cfg.id };
+          }
+        },
+      }),
+      read: (session, options) => ({
+        async *[Symbol.asyncIterator]() {
+          if (session.providerType !== cfg.id) {
+            throw new MalformedSessionRecordError(
+              `${cfg.id} saved history requires providerType ${JSON.stringify(cfg.id)}; got ${JSON.stringify(session.providerType)}`,
+              "providerType",
+            );
+          }
+          const baseSession: SavedHistorySession = { ...session, providerType: base.type };
+          for await (const yielded of savedHistory.read(baseSession, savedOptions(options))) {
+            yield {
+              ...yielded,
+              event: { ...yielded.event, providerType: cfg.id },
+            };
+          }
+        },
+      }),
     };
   }
   if (base.attachSession && derived.createSession) {

@@ -64,7 +64,7 @@ Providers fall into three tiers:
 
 Cursor sessions are exec-backed. Each `send()` starts one CLI process and promotes the returned Cursor session ID into `--resume` for the next turn. `probeCapabilities()` verifies the selected binary's model catalog and advertised modes. Each execution independently validates the supported stream-json acceptance marker before releasing output. Older Cursor CLIs report `upgrade_required` instead of silently advertising discovery features they do not expose.
 
-OpenCode sessions use a password-authenticated loopback server, SSE events, permission and question reconciliation, durable service-backed history, runtime model and agent discovery, and upstream provider authentication. `config.mcpServers` remains unsupported for OpenCode because strict isolation from ambient OpenCode MCP configuration is not yet proven.
+OpenCode sessions use a password-authenticated loopback server, SSE events, permission and question reconciliation, durable service-backed history, saved-session discovery and import, runtime model and agent discovery, and upstream provider authentication. `config.mcpServers` remains unsupported for OpenCode because strict isolation from ambient OpenCode MCP configuration is not yet proven.
 
 ### OpenCode and Cursor discovery
 
@@ -614,7 +614,67 @@ Dedup replayed events against anything you saw live: Claude events carry a stabl
 
 OpenCode exposes the same host-level recovery shape through service-backed history rather than a local JSONL transcript. Persist `session.describeHistory()`, call `provider.attachHistory(record)`, and checkpoint the opaque `HistoryCheckpoint` returned with each event. `catchUp({ mode: "incremental", after })` resumes after that exact normalized event. `catchUp({ mode: "bounded_full_resync" })` performs a bounded rebuild. OpenCode pagination is capped at 100 pages, 10,000 messages, and 25 MiB so a corrupt or unexpectedly large history cannot exhaust the host.
 
-### Discover local history when session ids are unknown
+### Discover and synchronize provider-owned saved history
+
+OpenCode exposes `provider.savedHistory` for import tools that do not yet know
+the provider session ids. This provider-neutral API does not expose OpenCode's
+database layout, transcript paths, or byte offsets. Discovery uses OpenCode's
+authenticated global session API and reading returns opaque provider-owned
+checkpoints.
+
+```typescript
+import { getProvider, type HistoryCheckpoint } from "@agentex/agent";
+
+const history = getProvider("opencode").savedHistory!;
+const presence = await history.probe({ cwd: appRoot });
+
+if (presence.historyAvailable) {
+  for await (const session of history.discover({
+    cwd: appRoot,             // where Agentex starts the local OpenCode service
+    includeArchived: true,
+    mainSessionsOnly: true,
+    limit: 50,
+  })) {
+    let checkpoint: HistoryCheckpoint | undefined = await loadCheckpoint(session);
+    for await (const item of history.read(session, {
+      after: checkpoint,
+      mode: "incremental",
+    })) {
+      await ingest(item.event, item.partIndex);
+      checkpoint = item.checkpoint;
+      await saveCheckpoint(session, checkpoint); // only after ingest commits
+    }
+  }
+}
+```
+
+Saved OpenCode reads include human messages as well as assistant, thinking,
+tool, and terminal events. Use
+`(providerType, externalSessionId, eventId, partIndex)` as the idempotency key.
+If an old checkpoint is no longer present, retry with
+`mode: "bounded_full_resync"` and deduplicate using that key.
+
+Discovery is global across OpenCode projects. `cwd` is only runtime context for
+starting the authenticated local service. Pass `directory` separately when an
+import UI intentionally filters the provider catalog to one project. Root
+sessions with a meaningful user message are returned by default. Archived
+sessions are included by default and can be excluded with
+`includeArchived: false`.
+
+The current OpenCode `/experimental/session` global endpoint is paginated and
+bounded at 10,000 sessions and 25 MiB of session metadata. Message history
+retains the existing
+100-page, 10,000-message, and 25 MiB bounds. A compatibility fallback uses the
+older global `GET /session` list for active sessions on older OpenCode builds.
+One damaged or concurrently deleted session is skipped without hiding healthy
+sessions from the catalog.
+
+`savedHistory` is distinct from `attachHistory()`. Saved-history discovery
+starts without known ids and includes user prompts for import. Attachment
+starts from a persisted `SessionRecord` for a host-owned session and omits user
+prompts because the host already owns them.
+
+### Discover local file history when session ids are unknown
 
 Claude and Codex expose `provider.localHistory` for import and migration tools. This is separate from `attachHistory()`: attachment starts from a persisted `SessionRecord`, while local discovery starts with no known session ids.
 

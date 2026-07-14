@@ -11,6 +11,14 @@ import type {
   ProviderAuthMethod,
   ProviderRuntimeContext,
   ProviderRuntimeReport,
+  SavedHistoryDiscoverOptions,
+  SavedHistoryEvent,
+  SavedHistoryOps,
+  SavedHistoryProbeOptions,
+  SavedHistoryProbeResult,
+  SavedHistoryReadOptions,
+  SavedHistorySession,
+  SavedHistoryYield,
   UpstreamProvider,
   UpstreamProviderManager,
 } from "../src/index.js";
@@ -27,6 +35,14 @@ type PublicTypes =
   | ProviderAuthMethod
   | ProviderRuntimeContext
   | ProviderRuntimeReport
+  | SavedHistoryDiscoverOptions
+  | SavedHistoryEvent
+  | SavedHistoryOps
+  | SavedHistoryProbeOptions
+  | SavedHistoryProbeResult
+  | SavedHistoryReadOptions
+  | SavedHistorySession
+  | SavedHistoryYield
   | UpstreamProvider
   | UpstreamProviderManager;
 

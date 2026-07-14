@@ -95,8 +95,18 @@ describe("OpenCode durable history", () => {
     })).rejects.toBeInstanceOf(OpenCodeHistoryCheckpointNotFoundError);
   });
 
-  it("uses stable OpenCode IDs and ignores user messages", () => {
+  it("uses stable OpenCode IDs and includes user messages only for imports", () => {
     expect(historicalEvents(message(1, "user"), "ses_test")).toEqual([]);
+    expect(historicalEvents(message(1, "user"), "ses_test", {
+      includeUserMessages: true,
+    })[0]?.event).toMatchObject({
+      type: "user",
+      text: "text-1",
+      providerType: "opencode",
+      sessionId: "ses_test",
+      messageId: "msg_0001",
+      eventId: "msg_0001",
+    });
     const events = historicalEvents(message(2), "ses_test");
     expect(events[0]?.event).toMatchObject({
       providerType: "opencode",

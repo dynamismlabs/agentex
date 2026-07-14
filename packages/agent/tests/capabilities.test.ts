@@ -177,6 +177,15 @@ describe("ProviderCapabilities", () => {
     }
   });
 
+  it("advertises savedHistory only where provider-neutral discovery is implemented", () => {
+    for (const type of listProviders()) {
+      const provider = getProvider(type);
+      const expected = type === "opencode";
+      expect(provider.capabilities.savedHistory === true).toBe(expected);
+      expect(typeof provider.savedHistory === "object").toBe(expected);
+    }
+  });
+
   it("openclaw has no capabilities", () => {
     const caps = getProvider("openclaw").capabilities;
     expect(Object.values(caps).every((v) => v === false)).toBe(true);

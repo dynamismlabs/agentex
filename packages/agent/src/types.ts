@@ -97,6 +97,8 @@ export interface ProviderCapabilities {
   durableHistory?: boolean;
   /** Read-only discovery and import of locally persisted sessions. */
   localHistory?: boolean;
+  /** Provider-neutral discovery and synchronization of saved sessions. */
+  savedHistory?: boolean;
   /** A persisted provider session can be resumed. */
   resume?: boolean;
   /** Models expose provider-native variants independently from effort. */
@@ -372,6 +374,8 @@ export interface ProviderModule {
   attachHistory?(record: SessionRecord, opts?: AttachOptions): Promise<HistoryAttachment>;
   /** Discover and read local sessions when their ids are not already known. */
   localHistory?: import("./history/types.js").LocalHistoryOps;
+  /** Discover and read provider-owned saved sessions without storage coupling. */
+  savedHistory?: import("./history/types.js").SavedHistoryOps;
 }
 
 // Result of looking up a transcript for a given session.
