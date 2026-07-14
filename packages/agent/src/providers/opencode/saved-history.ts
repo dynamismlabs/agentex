@@ -62,6 +62,15 @@ export class OpenCodeSavedHistoryInvalidSessionError extends Error {
   }
 }
 
+export class OpenCodeSavedHistoryProtocolError extends Error {
+  readonly code = "history_protocol_error";
+
+  constructor(message: string) {
+    super(message);
+    this.name = "OpenCodeSavedHistoryProtocolError";
+  }
+}
+
 function rec(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -78,13 +87,32 @@ function millis(value: unknown): number | null {
 
 function isoMillis(value: unknown): string | null {
   const timestamp = millis(value);
-  return timestamp === null ? null : new Date(timestamp).toISOString();
+  if (timestamp === null) return null;
+  const date = new Date(timestamp);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
 }
 
 function normalizedLimit(limit: number | undefined): number | null {
   if (limit === undefined) return null;
   if (!Number.isFinite(limit)) return null;
   return Math.max(0, Math.floor(limit));
+}
+
+function parseResponseArray(text: string, description: string): unknown[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text) as unknown;
+  } catch {
+    throw new OpenCodeSavedHistoryProtocolError(
+      `OpenCode ${description} response is not valid JSON`,
+    );
+  }
+  if (!Array.isArray(parsed)) {
+    throw new OpenCodeSavedHistoryProtocolError(
+      `OpenCode ${description} response is not an array`,
+    );
+  }
+  return parsed;
 }
 
 function sessionQuery(
@@ -115,8 +143,7 @@ async function parseSessionPage(
     throw new Error(`OpenCode saved-session request failed (${response.status})`);
   }
   const text = await response.text();
-  const parsed = JSON.parse(text) as unknown;
-  if (!Array.isArray(parsed)) throw new Error("OpenCode saved-session response is not an array");
+  const parsed = parseResponseArray(text, "saved-session");
   return {
     endpoint,
     sessions: parsed.map((value) => rec(value)).filter((value): value is OpenCodeSessionEnvelope => !!value),
@@ -181,10 +208,10 @@ async function findUserText(
     const read = await readInspectionText(response, sessionBytes, budget);
     const text = read.text;
     sessionBytes = read.sessionBytes;
-    const parsed = JSON.parse(text) as unknown;
-    const messages = Array.isArray(parsed)
-      ? parsed.map((value) => rec(value) as MessageEnvelope).filter(Boolean)
-      : [];
+    const parsed = parseResponseArray(text, "saved-session message");
+    const messages = parsed
+      .map((value) => rec(value) as MessageEnvelope)
+      .filter(Boolean);
     budget.messages += messages.length;
     if (budget.messages > MAX_DISCOVERY_INSPECTION_MESSAGES) {
       throw new OpenCodeSavedHistoryDiscoveryLimitError();
@@ -285,13 +312,13 @@ async function inspectBatch(
   budget: InspectionBudget,
 ): Promise<Array<SavedHistorySession | null>> {
   const output = new Array<SavedHistorySession | null>(sessions.length).fill(null);
+  const failures: unknown[] = [];
   let next = 0;
-  let fatal: OpenCodeSavedHistoryDiscoveryLimitError | null = null;
   const workers = Array.from(
     { length: Math.min(INSPECTION_CONCURRENCY, sessions.length) },
     async () => {
       while (true) {
-        if (fatal) return;
+        if (failures.length > 0) return;
         const index = next;
         next += 1;
         if (index >= sessions.length) return;
@@ -300,20 +327,18 @@ async function inspectBatch(
         try {
           output[index] = await inspectSession(client, session, options, budget);
         } catch (error) {
-          // A session can be deleted or damaged between global listing and
-          // message inspection. Isolate that candidate so the remaining
-          // import catalog is still usable, while preserving safety bounds.
-          if (error instanceof OpenCodeSavedHistoryDiscoveryLimitError) {
-            fatal = error;
-            return;
-          }
-          output[index] = null;
+          // A 404 is converted to null inside findUserText because that one
+          // candidate disappeared. Any thrown error is systemic or makes the
+          // scan incomplete, so discovery must not report a partial catalog
+          // as authoritative to a synchronizing host.
+          failures.push(error);
+          return;
         }
       }
     },
   );
   await Promise.all(workers);
-  if (fatal) throw fatal;
+  if (failures.length > 0) throw failures[0];
   return output;
 }
 

@@ -82,6 +82,15 @@ function string(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
+function historicalTimestamp(info: Record<string, unknown>): string {
+  const created = rec(info["time"])?.["created"];
+  if (typeof created === "number" && Number.isFinite(created)) {
+    const timestamp = new Date(created);
+    if (!Number.isNaN(timestamp.getTime())) return timestamp.toISOString();
+  }
+  return new Date(0).toISOString();
+}
+
 function decodeCheckpoint(checkpoint: HistoryCheckpoint | undefined): DecodedCheckpoint | null {
   if (!checkpoint) return null;
   if (checkpoint.kind !== CHECKPOINT_KIND) throw new OpenCodeHistoryCheckpointNotFoundError();
@@ -141,7 +150,7 @@ function historicalUserEvent(
   const messageId = string(info["id"]);
   const texts: string[] = [];
   let partId: string | null = null;
-  for (const rawPart of message.parts ?? []) {
+  for (const rawPart of Array.isArray(message.parts) ? message.parts : []) {
     const part = rec(rawPart);
     const text = part ? userTextPart(part) : null;
     if (!part || !text) continue;
@@ -173,13 +182,9 @@ export function historicalEvents(
   sessionId: string,
   options: { includeUserMessages?: boolean } = {},
 ): HistoricalEvent[] {
-  const info = message.info ?? {};
+  const info = rec(message.info) ?? {};
   const messageId = string(info["id"]);
-  const timestamp = new Date(
-    typeof rec(info["time"])?.["created"] === "number"
-      ? rec(info["time"])!["created"] as number
-      : Date.now(),
-  ).toISOString();
+  const timestamp = historicalTimestamp(info);
   if (info["role"] === "user") {
     if (!options.includeUserMessages) return [];
     const user = historicalUserEvent(message, sessionId, timestamp);
@@ -188,7 +193,7 @@ export function historicalEvents(
   if (info["role"] !== "assistant") return [];
   const base: OcBaseInfo = { provider: "opencode", sessionId, timestamp };
   const events: HistoricalEvent[] = [];
-  for (const rawPart of message.parts ?? []) {
+  for (const rawPart of Array.isArray(message.parts) ? message.parts : []) {
     const part = rec(rawPart);
     const partId = string(part?.["id"]);
     if (!part || !partId) continue;

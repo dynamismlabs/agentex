@@ -17,6 +17,7 @@ vi.mock("../../../src/providers/opencode/runtime.js", () => ({
 import {
   discoverOpenCodeSavedSessions,
   OpenCodeSavedHistoryInvalidSessionError,
+  OpenCodeSavedHistoryProtocolError,
   openCodeSavedHistory,
   readOpenCodeSavedSession,
 } from "../../../src/providers/opencode/saved-history.js";
@@ -232,13 +233,78 @@ describe("OpenCode saved history", () => {
           session("ses_healthy", "/healthy", 1_700_000_001_000),
         ]);
       }
-      if (path.includes("ses_broken")) return new Response(null, { status: 500 });
+      if (path.includes("ses_broken")) return new Response(null, { status: 404 });
       return Response.json([userMessage("ses_healthy")]);
     });
 
     const sessions = await collect(discoverOpenCodeSavedSessions(client));
 
     expect(sessions.map((item) => item.externalSessionId)).toEqual(["ses_healthy"]);
+  });
+
+  it("skips malformed candidate metadata and message records without hiding healthy sessions", async () => {
+    const { client } = fakeClient((path) => {
+      if (path.startsWith("/experimental/session?")) {
+        return Response.json([
+          { id: null, time: { updated: "invalid" } },
+          session("ses_corrupt", "/corrupt", 1_700_000_002_000),
+          session("ses_healthy", "/healthy", 1_700_000_001_000),
+        ]);
+      }
+      if (path.includes("ses_corrupt")) {
+        return Response.json([
+          null,
+          { info: { role: "user", time: { created: Number.MAX_VALUE } }, parts: {} },
+        ]);
+      }
+      return Response.json([userMessage("ses_healthy")]);
+    });
+
+    const sessions = await collect(discoverOpenCodeSavedSessions(client));
+
+    expect(sessions.map((item) => item.externalSessionId)).toEqual(["ses_healthy"]);
+  });
+
+  it.each([401, 403, 500])(
+    "aborts discovery when message inspection returns HTTP %s",
+    async (status) => {
+      const { client } = fakeClient((path) => {
+        if (path.startsWith("/experimental/session?")) {
+          return Response.json([session("ses_one", "/project", 1_700_000_001_000)]);
+        }
+        return new Response(null, { status });
+      });
+
+      await expect(collect(discoverOpenCodeSavedSessions(client)))
+        .rejects.toThrow(`OpenCode saved-session message request failed (${status})`);
+    },
+  );
+
+  it("aborts discovery when message inspection cannot reach OpenCode", async () => {
+    const { client } = fakeClient((path) => {
+      if (path.startsWith("/experimental/session?")) {
+        return Response.json([session("ses_one", "/project", 1_700_000_001_000)]);
+      }
+      throw new Error("connection reset");
+    });
+
+    await expect(collect(discoverOpenCodeSavedSessions(client)))
+      .rejects.toThrow("connection reset");
+  });
+
+  it.each([
+    new Response("not-json"),
+    Response.json({ error: "not an array" }),
+  ])("aborts discovery on an invalid message inspection response", async (response) => {
+    const { client } = fakeClient((path) => {
+      if (path.startsWith("/experimental/session?")) {
+        return Response.json([session("ses_one", "/project", 1_700_000_001_000)]);
+      }
+      return response.clone();
+    });
+
+    await expect(collect(discoverOpenCodeSavedSessions(client)))
+      .rejects.toBeInstanceOf(OpenCodeSavedHistoryProtocolError);
   });
 
   it("fails explicitly when aggregate discovery inspection exceeds its message budget", async () => {
@@ -324,6 +390,20 @@ describe("OpenCode saved history", () => {
     expect((await iterator.next()).value?.externalSessionId).toBe("ses_one");
     await iterator.return?.();
 
+    expect(runtime.release).toHaveBeenCalledOnce();
+  });
+
+  it("releases the service runtime when discovery fails systemically", async () => {
+    const { client } = fakeClient((path) => {
+      if (path.startsWith("/experimental/session?")) {
+        return Response.json([session("ses_one", "/project-a", 1_700_000_001_000)]);
+      }
+      return new Response(null, { status: 500 });
+    });
+    runtime.acquire.mockResolvedValue({ server: { client, release: runtime.release } });
+
+    await expect(collect(openCodeSavedHistory.discover()))
+      .rejects.toThrow("OpenCode saved-session message request failed (500)");
     expect(runtime.release).toHaveBeenCalledOnce();
   });
 

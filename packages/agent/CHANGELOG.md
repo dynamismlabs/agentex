@@ -21,8 +21,10 @@
 ### Safety and compatibility
 
 - Discovery and message inspection are bounded by page, record, and byte
-  limits. A damaged or concurrently deleted session is isolated so it does not
-  hide healthy sessions from the import catalog.
+  limits. Malformed candidate records and sessions concurrently deleted with
+  a 404 are isolated so they do not hide healthy sessions from the import
+  catalog. Authentication, server, network, and invalid-response failures
+  abort discovery rather than reporting a partial catalog as authoritative.
 - Eligibility inspection has a shared 10,000-message and 25 MiB budget across
   the complete discovery call, in addition to its per-session bounds.
 - Opaque checkpoints fingerprint their complete source message. If OpenCode

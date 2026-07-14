@@ -666,8 +666,11 @@ bounded at 10,000 sessions and 25 MiB of session metadata. Message history
 retains the existing
 100-page, 10,000-message, and 25 MiB bounds. A compatibility fallback uses the
 older global `GET /session` list for active sessions on older OpenCode builds.
-One damaged or concurrently deleted session is skipped without hiding healthy
-sessions from the catalog.
+Malformed candidate records and sessions concurrently deleted with a 404 are
+skipped without hiding healthy sessions from the catalog. Authentication,
+server, network, size-bound, and invalid-response failures abort discovery so
+a synchronizing host cannot mistake a partial catalog for an authoritative
+empty result.
 Discovery's eligibility inspection also shares a 10,000-message and 25 MiB
 budget across the complete scan, so many large or damaged candidates cannot
 multiply the per-session bound. Checkpoints fingerprint their complete source
