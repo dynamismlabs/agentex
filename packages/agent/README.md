@@ -668,6 +668,12 @@ retains the existing
 older global `GET /session` list for active sessions on older OpenCode builds.
 One damaged or concurrently deleted session is skipped without hiding healthy
 sessions from the catalog.
+Discovery's eligibility inspection also shares a 10,000-message and 25 MiB
+budget across the complete scan, so many large or damaged candidates cannot
+multiply the per-session bound. Checkpoints fingerprint their complete source
+message. If OpenCode mutates a still-running tail message after synchronization,
+the next incremental read rejects that checkpoint and lets the host perform a
+deduplicated bounded full resync.
 
 `savedHistory` is distinct from `attachHistory()`. Saved-history discovery
 starts without known ids and includes user prompts for import. Attachment

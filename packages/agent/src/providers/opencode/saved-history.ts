@@ -18,6 +18,8 @@ const MAX_SESSION_LIST_BYTES = 25 * 1024 * 1024;
 const MESSAGE_SCAN_PAGE_SIZE = 100;
 const MAX_MESSAGE_SCAN_PAGES = 100;
 const MAX_MESSAGE_SCAN_BYTES = 25 * 1024 * 1024;
+const MAX_DISCOVERY_INSPECTION_BYTES = 25 * 1024 * 1024;
+const MAX_DISCOVERY_INSPECTION_MESSAGES = 10_000;
 const INSPECTION_CONCURRENCY = 8;
 
 type SessionListEndpoint = "experimental" | "legacy";
@@ -35,6 +37,11 @@ interface SessionPage {
   sessions: OpenCodeSessionEnvelope[];
   nextCursor: string | null;
   bytes: number;
+}
+
+interface InspectionBudget {
+  bytes: number;
+  messages: number;
 }
 
 export class OpenCodeSavedHistoryDiscoveryLimitError extends Error {
@@ -157,9 +164,10 @@ async function nextSessionPage(
 async function findUserText(
   client: OpenCodeClient,
   sessionId: string,
+  budget: InspectionBudget,
 ): Promise<string | null> {
   let before: string | null = null;
-  let totalBytes = 0;
+  let sessionBytes = 0;
   for (let pageIndex = 0; pageIndex < MAX_MESSAGE_SCAN_PAGES; pageIndex += 1) {
     const query = new URLSearchParams({ limit: String(MESSAGE_SCAN_PAGE_SIZE) });
     if (before) query.set("before", before);
@@ -170,15 +178,17 @@ async function findUserText(
     if (!response.ok) {
       throw new Error(`OpenCode saved-session message request failed (${response.status})`);
     }
-    const text = await response.text();
-    totalBytes += Buffer.byteLength(text);
-    if (totalBytes > MAX_MESSAGE_SCAN_BYTES) {
-      throw new OpenCodeSavedHistoryDiscoveryLimitError();
-    }
+    const read = await readInspectionText(response, sessionBytes, budget);
+    const text = read.text;
+    sessionBytes = read.sessionBytes;
     const parsed = JSON.parse(text) as unknown;
     const messages = Array.isArray(parsed)
       ? parsed.map((value) => rec(value) as MessageEnvelope).filter(Boolean)
       : [];
+    budget.messages += messages.length;
+    if (budget.messages > MAX_DISCOVERY_INSPECTION_MESSAGES) {
+      throw new OpenCodeSavedHistoryDiscoveryLimitError();
+    }
     for (const message of messages) {
       const user = historicalEvents(message, sessionId, { includeUserMessages: true })
         .find((item) => item.event.type === "user");
@@ -192,10 +202,56 @@ async function findUserText(
   throw new OpenCodeSavedHistoryDiscoveryLimitError();
 }
 
+async function readInspectionText(
+  response: Response,
+  priorSessionBytes: number,
+  budget: InspectionBudget,
+): Promise<{ text: string; sessionBytes: number }> {
+  const reader = response.body?.getReader();
+  if (!reader) {
+    const text = await response.text();
+    const size = Buffer.byteLength(text);
+    const sessionBytes = priorSessionBytes + size;
+    budget.bytes += size;
+    if (
+      sessionBytes > MAX_MESSAGE_SCAN_BYTES
+      || budget.bytes > MAX_DISCOVERY_INSPECTION_BYTES
+    ) {
+      throw new OpenCodeSavedHistoryDiscoveryLimitError();
+    }
+    return { text, sessionBytes };
+  }
+
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let sessionBytes = priorSessionBytes;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const size = value.byteLength;
+    total += size;
+    sessionBytes += size;
+    budget.bytes += size;
+    if (
+      sessionBytes > MAX_MESSAGE_SCAN_BYTES
+      || budget.bytes > MAX_DISCOVERY_INSPECTION_BYTES
+    ) {
+      await reader.cancel().catch(() => undefined);
+      throw new OpenCodeSavedHistoryDiscoveryLimitError();
+    }
+    chunks.push(value);
+  }
+  return {
+    text: Buffer.concat(chunks, total).toString("utf8"),
+    sessionBytes,
+  };
+}
+
 async function inspectSession(
   client: OpenCodeClient,
   raw: OpenCodeSessionEnvelope,
   options: SavedHistoryDiscoverOptions,
+  budget: InspectionBudget,
 ): Promise<SavedHistorySession | null> {
   const externalSessionId = string(raw.id);
   const time = rec(raw.time);
@@ -203,7 +259,7 @@ async function inspectSession(
   if (!externalSessionId || !updatedAt) return null;
   if ((options.mainSessionsOnly ?? true) && string(raw.parentID)) return null;
 
-  const userText = await findUserText(client, externalSessionId);
+  const userText = await findUserText(client, externalSessionId, budget);
   const hasUserMessage = userText !== null;
   if ((options.requireUserMessage ?? true) && !hasUserMessage) return null;
   const archived = millis(time?.["archived"]);
@@ -226,6 +282,7 @@ async function inspectBatch(
   client: OpenCodeClient,
   sessions: OpenCodeSessionEnvelope[],
   options: SavedHistoryDiscoverOptions,
+  budget: InspectionBudget,
 ): Promise<Array<SavedHistorySession | null>> {
   const output = new Array<SavedHistorySession | null>(sessions.length).fill(null);
   let next = 0;
@@ -241,7 +298,7 @@ async function inspectBatch(
         const session = sessions[index];
         if (!session) continue;
         try {
-          output[index] = await inspectSession(client, session, options);
+          output[index] = await inspectSession(client, session, options, budget);
         } catch (error) {
           // A session can be deleted or damaged between global listing and
           // message inspection. Isolate that candidate so the remaining
@@ -274,6 +331,7 @@ export async function* discoverOpenCodeSavedSessions(
   let yielded = 0;
   let pageCount = 0;
   let previousCursor: string | null = null;
+  const inspectionBudget: InspectionBudget = { bytes: 0, messages: 0 };
   while (true) {
     pageCount += 1;
     totalSessions += page.sessions.length;
@@ -286,7 +344,7 @@ export async function* discoverOpenCodeSavedSessions(
       throw new OpenCodeSavedHistoryDiscoveryLimitError();
     }
 
-    const inspected = await inspectBatch(client, page.sessions, options);
+    const inspected = await inspectBatch(client, page.sessions, options, inspectionBudget);
     for (const session of inspected) {
       if (!session) continue;
       yield session;
@@ -323,7 +381,7 @@ export async function* readOpenCodeSavedSession(
     client,
     session.externalSessionId,
     { after: options.after, mode: options.mode },
-    { includeUserMessages: true },
+    { includeUserMessages: true, missingSession: "error" },
   );
   for (const item of collected) {
     const eventId = item.eventId;

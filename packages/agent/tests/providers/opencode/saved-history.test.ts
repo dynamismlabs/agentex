@@ -241,6 +241,33 @@ describe("OpenCode saved history", () => {
     expect(sessions.map((item) => item.externalSessionId)).toEqual(["ses_healthy"]);
   });
 
+  it("fails explicitly when aggregate discovery inspection exceeds its message budget", async () => {
+    const firstPage = Array.from(
+      { length: 100 },
+      (_, index) => session(`ses_${index}`, `/project-${index}`, 1_700_001_000_000 - index),
+    );
+    const messagePayload = JSON.stringify(Array.from(
+      { length: 100 },
+      (_, index) => assistantMessage("ses_scan", index + 1),
+    ));
+    const { client } = fakeClient((path) => {
+      if (path.startsWith("/experimental/session?")) {
+        if (path.includes("cursor=1699999999900")) {
+          return Response.json([session("ses_100", "/project-100", 1_699_999_999_899)]);
+        }
+        return Response.json(firstPage, {
+          headers: { "x-next-cursor": "1699999999900" },
+        });
+      }
+      return new Response(messagePayload, {
+        headers: { "content-type": "application/json" },
+      });
+    });
+
+    await expect(collect(discoverOpenCodeSavedSessions(client)))
+      .rejects.toMatchObject({ code: "history_discovery_limit" });
+  });
+
   it("reads user and assistant history with opaque incremental checkpoints", async () => {
     const messages = [
       userMessage("ses_one", 1, "Original prompt"),
@@ -257,7 +284,7 @@ describe("OpenCode saved history", () => {
       eventId: "msg_user_1",
       partIndex: 0,
       event: { type: "user", text: "Original prompt", providerType: "opencode" },
-      checkpoint: { kind: "opencode:message-part:v1" },
+      checkpoint: { kind: "opencode:message-part:v2" },
     });
 
     const resumed = await collect(readOpenCodeSavedSession(client, descriptor(), {
@@ -272,6 +299,16 @@ describe("OpenCode saved history", () => {
     const invalid = { ...descriptor(), providerType: "codex" };
     await expect(collect(readOpenCodeSavedSession(client, invalid)))
       .rejects.toBeInstanceOf(OpenCodeSavedHistoryInvalidSessionError);
+  });
+
+  it("reports source_missing when a session is deleted after discovery", async () => {
+    const { client } = fakeClient(() => new Response(null, { status: 404 }));
+
+    await expect(collect(readOpenCodeSavedSession(client, descriptor())))
+      .rejects.toMatchObject({
+        name: "OpenCodeHistorySourceMissingError",
+        code: "source_missing",
+      });
   });
 
   it("releases the service runtime when discovery is stopped early", async () => {

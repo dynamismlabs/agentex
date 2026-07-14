@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — OpenCode saved history import and synchronization
+## 0.0.31 — OpenCode saved history import and synchronization
 
 ### Added
 
@@ -23,6 +23,18 @@
 - Discovery and message inspection are bounded by page, record, and byte
   limits. A damaged or concurrently deleted session is isolated so it does not
   hide healthy sessions from the import catalog.
+- Eligibility inspection has a shared 10,000-message and 25 MiB budget across
+  the complete discovery call, in addition to its per-session bounds.
+- Opaque checkpoints fingerprint their complete source message. If OpenCode
+  mutates an active tail message in place, incremental sync reports the
+  checkpoint missing so the host can perform a bounded deduplicated resync.
+- Historical normalization emits terminal `result` events only after OpenCode
+  records a finish reason or error. In-progress assistant messages no longer
+  appear completed.
+- A session deleted after discovery fails saved-history reads with the stable
+  `source_missing` error code instead of appearing to be a successful empty
+  resync. Known-session attachment retains its existing empty-on-missing
+  compatibility behavior.
 - Runtime `cwd` is separate from the optional saved-session `directory` filter,
   preserving cross-project discovery. Reads acquire OpenCode in the discovered
   session's cwd so another project's messages remain available.

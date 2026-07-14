@@ -53,11 +53,10 @@ describe("OpenCode durable history", () => {
 
   it("discards every event through the checkpoint part", async () => {
     const { client } = pagedClient();
+    const initial = await collectHistory(client, "ses_test", { mode: "bounded_full_resync" });
+    const after = initial.findLast((item) => item.event.messageId === "msg_0150")!.checkpoint;
     const result = await collectHistory(client, "ses_test", {
-      after: {
-        kind: "opencode:message-part:v1",
-        value: { messageId: "msg_0150", partId: "part_0150" },
-      },
+      after,
     });
     const assistant = result.filter((item) => item.event.type === "assistant");
     expect(assistant[0]?.event).toMatchObject({ text: "text-151" });
@@ -81,18 +80,48 @@ describe("OpenCode durable history", () => {
 
   it("returns a typed error when a checkpoint message or part is missing", async () => {
     const { client } = pagedClient();
+    const initial = await collectHistory(client, "ses_test", { mode: "bounded_full_resync" });
+    const existing = initial.findLast((item) => item.event.messageId === "msg_0150")!.checkpoint;
     await expect(collectHistory(client, "ses_test", {
       after: {
-        kind: "opencode:message-part:v1",
-        value: { messageId: "msg_missing", partId: "part_missing" },
+        ...existing,
+        value: { ...existing.value as object, messageId: "msg_missing" },
       },
     })).rejects.toBeInstanceOf(OpenCodeHistoryCheckpointNotFoundError);
     await expect(collectHistory(client, "ses_test", {
       after: {
-        kind: "opencode:message-part:v1",
-        value: { messageId: "msg_0150", partId: "part_missing" },
+        ...existing,
+        value: { ...existing.value as object, partId: "part_missing" },
       },
     })).rejects.toBeInstanceOf(OpenCodeHistoryCheckpointNotFoundError);
+  });
+
+  it("invalidates a checkpoint when its message mutates in place", async () => {
+    const original = message(1);
+    const client = {
+      async request() { return Response.json([original]); },
+    } as unknown as OpenCodeClient;
+    const initial = await collectHistory(client, "ses_test", { mode: "bounded_full_resync" });
+    const after = initial.at(-1)!.checkpoint;
+
+    original.parts[0]!.text = "changed after checkpoint";
+
+    await expect(collectHistory(client, "ses_test", { after, mode: "incremental" }))
+      .rejects.toBeInstanceOf(OpenCodeHistoryCheckpointNotFoundError);
+  });
+
+  it("does not emit a completed result for an unfinished assistant message", () => {
+    const running = message(1);
+    delete running.info.finish;
+    expect(historicalEvents(running, "ses_test").map((item) => item.event.type))
+      .toEqual(["assistant"]);
+  });
+
+  it("preserves empty-on-404 behavior for known-session attachment catch-up", async () => {
+    const client = {
+      async request() { return new Response(null, { status: 404 }); },
+    } as unknown as OpenCodeClient;
+    await expect(collectHistory(client, "ses_deleted", undefined)).resolves.toEqual([]);
   });
 
   it("uses stable OpenCode IDs and includes user messages only for imports", () => {

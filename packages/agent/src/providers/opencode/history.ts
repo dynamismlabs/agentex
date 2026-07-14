@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import type {
   AttachOptions,
   HistoryAttachment,
@@ -19,7 +21,7 @@ const PAGE_SIZE = 100;
 const MAX_PAGES = 100;
 const MAX_MESSAGES = 10_000;
 const MAX_BYTES = 25 * 1024 * 1024;
-const CHECKPOINT_KIND = "opencode:message-part:v1";
+const CHECKPOINT_KIND = "opencode:message-part:v2";
 
 export class OpenCodeHistoryCheckpointNotFoundError extends Error {
   readonly code = "history_checkpoint_not_found";
@@ -37,10 +39,20 @@ export class OpenCodeHistoryResyncLimitError extends Error {
   }
 }
 
+export class OpenCodeHistorySourceMissingError extends Error {
+  readonly code = "source_missing";
+
+  constructor(sessionId: string) {
+    super(`OpenCode saved session ${JSON.stringify(sessionId)} no longer exists`);
+    this.name = "OpenCodeHistorySourceMissingError";
+  }
+}
+
 interface DecodedCheckpoint {
   messageId: string;
   partId: string;
   ordinal: number | null;
+  messageRevision: string;
 }
 
 export interface MessageEnvelope extends Record<string, unknown> {
@@ -76,15 +88,41 @@ function decodeCheckpoint(checkpoint: HistoryCheckpoint | undefined): DecodedChe
   const value = rec(checkpoint.value);
   const messageId = string(value?.["messageId"]);
   const partId = string(value?.["partId"]);
-  if (!messageId || !partId) throw new OpenCodeHistoryCheckpointNotFoundError();
+  const messageRevision = string(value?.["messageRevision"]);
+  if (!messageId || !partId || !messageRevision) throw new OpenCodeHistoryCheckpointNotFoundError();
   const ordinal = typeof value?.["ordinal"] === "number" && Number.isInteger(value["ordinal"])
     ? value["ordinal"] as number
     : null;
-  return { messageId, partId, ordinal };
+  return { messageId, partId, ordinal, messageRevision };
 }
 
-function checkpoint(messageId: string, partId: string, ordinal: number): HistoryCheckpoint {
-  return { kind: CHECKPOINT_KIND, value: { messageId, partId, ordinal } };
+function checkpoint(
+  messageId: string,
+  partId: string,
+  ordinal: number,
+  messageRevision: string,
+): HistoryCheckpoint {
+  return {
+    kind: CHECKPOINT_KIND,
+    value: { messageId, partId, ordinal, messageRevision },
+  };
+}
+
+function canonicalJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalJson);
+  const record = rec(value);
+  if (record) {
+    return Object.fromEntries(
+      Object.keys(record).sort().map((key) => [key, canonicalJson(record[key])]),
+    );
+  }
+  return value;
+}
+
+function messageRevision(message: MessageEnvelope): string {
+  return createHash("sha256")
+    .update(JSON.stringify(canonicalJson(message)))
+    .digest("hex");
 }
 
 function userTextPart(part: Record<string, unknown>): string | null {
@@ -164,7 +202,8 @@ export function historicalEvents(
     if (event) events.push({ event, partId });
   }
   const lastPartId = events.at(-1)?.partId;
-  if (messageId && lastPartId) {
+  const finished = string(info["finish"]) !== null || info["error"] != null;
+  if (messageId && lastPartId && finished) {
     const error = info["error"] != null;
     events.push({
       partId: lastPartId,
@@ -195,7 +234,10 @@ export async function collectHistory(
   client: import("./client.js").OpenCodeClient,
   sessionId: string,
   options: HistoryCatchUpOptions | undefined,
-  mapping: { includeUserMessages?: boolean } = {},
+  mapping: {
+    includeUserMessages?: boolean;
+    missingSession?: "empty" | "error";
+  } = {},
 ): Promise<CollectedHistoryEvent[]> {
   const after = options?.mode === "bounded_full_resync" ? null : decodeCheckpoint(options?.after);
   const pages: MessageEnvelope[][] = [];
@@ -208,7 +250,12 @@ export async function collectHistory(
     const query = new URLSearchParams({ limit: String(PAGE_SIZE) });
     if (before) query.set("before", before);
     const response = await client.request(`/session/${encodeURIComponent(sessionId)}/message?${query}`);
-    if (response.status === 404) return [];
+    if (response.status === 404) {
+      if (mapping.missingSession === "error") {
+        throw new OpenCodeHistorySourceMissingError(sessionId);
+      }
+      return [];
+    }
     if (!response.ok) throw new Error(`OpenCode history request failed (${response.status})`);
     const text = await response.text();
     collectedBytes += Buffer.byteLength(text);
@@ -243,6 +290,14 @@ export async function collectHistory(
   for (const message of messages) {
     const messageId = string(message.info?.["id"]);
     if (!messageId) continue;
+    const revision = messageRevision(message);
+    if (
+      after
+      && messageId === after.messageId
+      && revision !== after.messageRevision
+    ) {
+      throw new OpenCodeHistoryCheckpointNotFoundError();
+    }
     const events = historicalEvents(message, sessionId, mapping);
     const partOrdinals = new Map<string, number>();
     for (const item of events) {
@@ -270,7 +325,7 @@ export async function collectHistory(
       }
       output.push({
         event: item.event,
-        checkpoint: checkpoint(messageId, item.partId, ordinal),
+        checkpoint: checkpoint(messageId, item.partId, ordinal, revision),
         eventId: item.event.eventId,
         partIndex: ordinal,
       });
