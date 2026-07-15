@@ -362,6 +362,44 @@ describe("parseCodexStreamLine — v2 JSON-RPC (codex --json app-server)", () =>
     if (unknown?.type === "assistant") expect(unknown).not.toHaveProperty("phase");
   });
 
+  it.each([
+    ["started", "started", "running"],
+    ["interacted", "progress", "running"],
+    ["interrupted", "completed", "stopped"],
+  ] as const)(
+    "v2 subAgentActivity %s normalizes to a background-task lifecycle event",
+    (kind, phase, status) => {
+      const line = JSON.stringify({
+        jsonrpc: "2.0",
+        method: "item/completed",
+        params: {
+          threadId: "root-thread",
+          turnId: "root-turn",
+          item: {
+            type: "subAgentActivity",
+            id: `activity-${kind}`,
+            kind,
+            agentThreadId: "child-thread",
+            agentPath: "/root/reviewer",
+          },
+        },
+      });
+
+      expect(parseCodexStreamLine(line)).toMatchObject({
+        type: "background_task",
+        taskId: "child-thread",
+        taskType: "subagent",
+        phase,
+        status,
+        description: "/root/reviewer",
+        summary: null,
+        parentTaskId: null,
+        sessionId: "root-thread",
+        turnId: "root-turn",
+      });
+    },
+  );
+
   it("v2 item/completed reasoning emits a thinking event", () => {
     const line = JSON.stringify({
       jsonrpc: "2.0",

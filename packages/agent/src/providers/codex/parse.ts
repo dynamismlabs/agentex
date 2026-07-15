@@ -413,6 +413,28 @@ function parseV2Notification(event: Record<string, unknown>): StreamEvent | null
         ...base,
       };
     }
+    if (itemType === "subAgentActivity") {
+      const taskId = asString(item["agentThreadId"], "");
+      const kind = asString(item["kind"], "");
+      if (!taskId || (kind !== "started" && kind !== "interacted" && kind !== "interrupted")) {
+        return {
+          type: "unknown",
+          subtype: `item/completed:${itemType}`,
+          ...base,
+        };
+      }
+      return {
+        type: "background_task",
+        taskId,
+        taskType: "subagent",
+        phase: kind === "started" ? "started" : kind === "interrupted" ? "completed" : "progress",
+        status: kind === "interrupted" ? "stopped" : "running",
+        description: asNullableString(item["agentPath"]),
+        summary: null,
+        parentTaskId: null,
+        ...base,
+      };
+    }
     if (itemType === "userMessage") {
       // Consumer persists user input on the write path before calling send().
       // We don't re-emit it here to keep a single source of truth.

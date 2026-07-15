@@ -20,6 +20,7 @@ export const codexProvider: ProviderModule = {
     concurrentSend: true,
     cancelQueuedMessage: false,
     stopTask: false,
+    backgroundTaskEvents: true,
     modes: true,
     goals: codexGoalCapability,
     durableSessions: true,

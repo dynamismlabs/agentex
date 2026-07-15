@@ -37,6 +37,7 @@ describe("ProviderCapabilities", () => {
       concurrentSend: true,
       cancelQueuedMessage: true,
       stopTask: true,
+      backgroundTaskEvents: true,
       modes: false,
       goals: {
         mechanism: "sentinel",
@@ -109,7 +110,7 @@ describe("ProviderCapabilities", () => {
   });
 
   it("only claude supports per-message cancel", () => {
-    // Codex's JSON-RPC has no per-message cancel; only turn/cancel via interrupt().
+    // Codex's JSON-RPC has no per-message cancel; only turn/interrupt.
     for (const name of listProviders()) {
       const caps = getProvider(name).capabilities;
       const expected = name === "claude";
@@ -124,6 +125,13 @@ describe("ProviderCapabilities", () => {
       const caps = getProvider(name).capabilities;
       const expected = name === "claude";
       expect(caps.stopTask).toBe(expected);
+    }
+  });
+
+  it("claude and codex emit normalized background-task lifecycle events", () => {
+    for (const name of listProviders()) {
+      const expected = name === "claude" || name === "codex";
+      expect(getProvider(name).capabilities.backgroundTaskEvents === true).toBe(expected);
     }
   });
 

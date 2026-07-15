@@ -382,6 +382,7 @@ Variants:
 - `tool_result` — Tool returned a result (`toolCallId: string | null`, `toolName: string | null`, `content`, `isError`, `exitCode: number | null`). `toolName` mirrors the matching `tool_call.name` (correlated for you), so you don't need your own `toolCallId → name` cache; null when no preceding `tool_call` was seen on the stream.
 - `rate_limit` — Provider reported rate-limit state (`status`, `limitType`, `resetAt`, `overageStatus`, `isUsingOverage`)
 - `permission_mode` — Permission mode change mid-session (`permissionMode: string`). Claude only, e.g., when the user accepts a plan and the session leaves `plan` mode.
+- `background_task` — Provider-neutral lifecycle for work that can outlive the root turn (`taskId`, `taskType`, `phase`, `status`, `description`, `summary`, `parentTaskId`). A terminal task event never settles the root turn.
 - `result` — Final result (`text`, `costUsd`, `isError`, `stopReason`, `terminalReason`, `numTurns`, `durationMs`)
 
 Lifecycle events (via `onLifecycle`) report phases: `preparing`, `spawning`, `running`, `waiting_for_input`, `completed`, `cancelled`, `error`.
@@ -535,18 +536,42 @@ if (stopped) console.log("Asked the CLI to kill that task.");
 
 `stopTask()` is always callable. For providers with `stopTask = false` it returns `{ stopped: false }` immediately. For Claude it sends a `stop_task` control_request; the **CLI/harness** owns the process and performs the kill (the model is never in the loop). The acknowledgement carries no payload, so `stopped: true` just means "accepted" — an unknown or already-ended `taskId` (or a closed session) yields `{ stopped: false }`. The task's terminal status arrives asynchronously on the event stream as its next `task_updated` / `task_notification`.
 
-Background-task lifecycle events (`task_started`, `task_progress`, `task_updated`, `task_notification`) reach you as `type: "unknown"` StreamEvents (Claude emits them as `system` subtypes; only `system`+`init` gets its own typed variant, so the rest fall through the forward-compat escape hatch with the payload on `raw`). Use `getClaudeTaskDetails(event)` to decode one into typed fields — `{ phase, taskId, taskType, status, usage, … }` — or `null` if it isn't a task event. It's a stateless per-event decode, not a reducer: `status` reflects only the event in hand (and `task_updated` is a sparse `patch`), so collapsing a task's events into one current state over its lifetime is the consumer's job.
+Claude and Codex advertise `capabilities.backgroundTaskEvents = true` and emit a
+first-class `background_task` event. Its normalized contract is:
 
 ```typescript
-import { getClaudeTaskDetails } from "@agentex/agent";
+{
+  type: "background_task";
+  taskId: string;
+  taskType: "subagent" | "process" | "unknown";
+  phase: "started" | "progress" | "completed";
+  status: "pending" | "running" | "paused" | "completed" | "failed" | "stopped";
+  description: string | null;
+  summary: string | null;
+  parentTaskId: string | null;
+}
+```
 
+Treat these as a task-keyed event log: upsert by `taskId`, and remove the task
+from the active set when `phase === "completed"`. Root turn state is a separate
+axis. A `result` may arrive while background tasks are still active, and a
+background task may complete while the root is still running.
+
+```typescript
 createSession({
   onEvent(event) {
-    const task = getClaudeTaskDetails(event);
-    if (task?.phase === "started") console.log("background task:", task.taskId, task.description);
+    if (event.type !== "background_task") return;
+    if (event.phase === "started") {
+      console.log("background task:", event.taskId, event.description);
+    }
   },
 });
 ```
+
+Claude's raw events include additional fields such as `tool_use_id`, usage,
+and output file. `getClaudeTaskDetails(event)` decodes those details from a
+Claude `background_task`. It also accepts legacy `unknown` task events emitted
+by agentex 0.0.32 and earlier.
 
 ### Graceful shutdown with `drain()`
 

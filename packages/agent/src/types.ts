@@ -64,6 +64,13 @@ export interface ProviderCapabilities {
    */
   stopTask: boolean;
   /**
+   * Provider emits first-class `background_task` StreamEvents for work that
+   * can outlive the root turn, such as async subagents and backgrounded
+   * processes. Absent/false means callers must not infer task lifecycle from
+   * provider-specific `unknown` events.
+   */
+  backgroundTaskEvents?: boolean;
+  /**
    * Provider exposes selectable operating modes via `listModes()` — e.g. Codex
    * collaboration modes, Copilot's allow-all/agent/plan. When `false`,
    * `config.modeId` is ignored and `listModes` is absent.
@@ -985,6 +992,21 @@ export interface BaseStreamEventFields {
   raw: Record<string, unknown>;
 }
 
+/** Provider-neutral category for work that may outlive its launching turn. */
+export type BackgroundTaskType = "subagent" | "process" | "unknown";
+
+/** Lifecycle edge represented by one `background_task` StreamEvent. */
+export type BackgroundTaskPhase = "started" | "progress" | "completed";
+
+/** Current normalized state carried by a `background_task` event. */
+export type BackgroundTaskStatus =
+  | "pending"
+  | "running"
+  | "paused"
+  | "completed"
+  | "failed"
+  | "stopped";
+
 /**
  * Categorical reason for an `auth_required` event. Derived from the
  * provider's user-facing error text. Stable across providers — new
@@ -1175,6 +1197,26 @@ export type StreamEvent =
       timeUsedSeconds?: number;
       tokenBudget?: number;
       iterations?: number;
+    } & BaseStreamEventFields)
+  /**
+   * Lifecycle for work that is independent from the root turn. In particular,
+   * `phase: "completed"` settles only this task. It is never a root turn
+   * result and must not be used to resolve `SendHandle.result`.
+   *
+   * Events are reducer-friendly snapshots. `status` is always populated,
+   * while description/summary may be null when the provider did not report
+   * them. `parentTaskId` identifies a nested background task when that lineage
+   * is available.
+   */
+  | ({
+      type: "background_task";
+      taskId: string;
+      taskType: BackgroundTaskType;
+      phase: BackgroundTaskPhase;
+      status: BackgroundTaskStatus;
+      description: string | null;
+      summary: string | null;
+      parentTaskId: string | null;
     } & BaseStreamEventFields)
   | ({
       type: "result";

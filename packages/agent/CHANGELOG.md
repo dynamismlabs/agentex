@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.0.33 — Reliable Codex control and background tasks
+
+### Added
+
+- `background_task` is now a first-class, provider-neutral `StreamEvent` for
+  async subagents and background processes. It carries a stable task id,
+  normalized type/phase/status, description, summary, and optional parent task
+  lineage. Claude and Codex advertise this through
+  `capabilities.backgroundTaskEvents`.
+- Codex live sessions correlate root `subAgentActivity` items with child-thread
+  lifecycle notifications from the multiplexed app-server connection. Child
+  completion, failure, and interruption now remain visible after the root turn
+  ends without ever resolving or mutating the root turn.
+- Claude `task_started`, `task_progress`, `task_updated`, and
+  `task_notification` records now normalize directly to `background_task`.
+  `getClaudeTaskDetails()` remains available for Claude-native fields and
+  accepts legacy `unknown` task events from older agentex versions.
+
+### Fixed
+
+- Codex live sessions now track the active root turn and interrupt it with the
+  supported `turn/interrupt` request, including the required thread and turn
+  identifiers. Stop requests made before `turn/start` responds wait for the
+  root turn identity instead of sending an invalid unscoped request.
+- Repeated interrupt requests for one turn are coalesced, while a later turn
+  receives its own interrupt. Child-agent turn notifications and queued send
+  responses cannot replace the root turn being targeted.
+- Codex `interrupted` terminal notifications now resolve the public turn result
+  as `aborted`. Interrupt RPC errors propagate to the caller so hosts can show a
+  failed Stop action instead of reporting false success.
+
+### Compatibility
+
+- Timeout and AbortSignal cancellation remain best-effort and preserve their
+  existing synthetic results. Concurrent root sends retain their shared-result
+  behavior. Background-task terminal events are informational and never settle
+  a root `SendHandle.result`.
+
 ## 0.0.32 — Codex root-thread completion isolation
 
 ### Fixed

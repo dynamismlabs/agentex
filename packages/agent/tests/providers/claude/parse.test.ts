@@ -533,8 +533,8 @@ describe("parseClaudeStreamJson errorCode", () => {
 // ---------------------------------------------------------------------------
 // getClaudeTaskDetails — typed view of background-task lifecycle events.
 // Wire shapes captured from Claude CLI 2.1.187. These arrive as type:"system"
-// on the wire but surface as type:"unknown" through agentex's escape hatch, so
-// every test drives the real path: parseStreamLine -> unknown event -> accessor.
+// on the wire and normalize to provider-neutral `background_task` events. The
+// Claude accessor remains as a compatibility/detail view over the raw payload.
 // ---------------------------------------------------------------------------
 
 describe("getClaudeTaskDetails", () => {
@@ -544,10 +544,18 @@ describe("getClaudeTaskDetails", () => {
     return events[0]!;
   }
 
-  it("surfaces task events as `unknown`, not `system`", () => {
+  it("normalizes task events instead of surfacing provider-specific system records", () => {
     const ev = parseOne({ type: "system", subtype: "task_started", task_id: "t1", description: "x" });
-    // The discriminator gotcha consumers must know: NOT type:"system".
-    expect(ev.type).toBe("unknown");
+    expect(ev).toMatchObject({
+      type: "background_task",
+      taskId: "t1",
+      taskType: "unknown",
+      phase: "started",
+      status: "running",
+      description: "x",
+      summary: null,
+      parentTaskId: null,
+    });
   });
 
   it("decodes a task_started local_bash event", () => {
@@ -573,6 +581,13 @@ describe("getClaudeTaskDetails", () => {
       summary: null,
       endTime: null,
     });
+    expect(ev).toMatchObject({
+      type: "background_task",
+      taskId: "task_abc",
+      taskType: "process",
+      phase: "started",
+      status: "running",
+    });
   });
 
   it("decodes task_started subagent fields (subagent_type, workflow_name); task_type stays optional", () => {
@@ -591,6 +606,7 @@ describe("getClaudeTaskDetails", () => {
     expect(t.workflowName).toBe("review-changes");
     expect(t.taskType).toBeNull();
     expect(t.status).toBeNull();
+    expect(ev).toMatchObject({ taskType: "subagent", phase: "started", status: "running" });
   });
 
   it("decodes task_progress usage (snake_case -> camelCase)", () => {
@@ -607,6 +623,7 @@ describe("getClaudeTaskDetails", () => {
     expect(t.description).toBe("running tests");
     expect(t.usage).toEqual({ totalTokens: 1200, toolUses: 3, durationMs: 4500 });
     expect(t.status).toBeNull();
+    expect(ev).toMatchObject({ phase: "progress", status: "running" });
   });
 
   it("reads status/description/end_time out of task_updated's `patch` envelope", () => {
@@ -623,6 +640,7 @@ describe("getClaudeTaskDetails", () => {
     expect(t.description).toBe("stopped by user");
     expect(t.endTime).toBe(1719200000000);
     expect(t.toolUseId).toBeNull(); // task_updated carries no tool_use_id
+    expect(ev).toMatchObject({ phase: "completed", status: "stopped" });
   });
 
   it("decodes a terminal task_notification (3-value status enum)", () => {
@@ -642,6 +660,23 @@ describe("getClaudeTaskDetails", () => {
     expect(t.outputFile).toBe("/tmp/task_abc.output");
     expect(t.summary).toBe("Server stopped");
     expect(t.usage).toEqual({ totalTokens: 50, toolUses: 0, durationMs: 12000 });
+    expect(ev).toMatchObject({ phase: "completed", status: "stopped", summary: "Server stopped" });
+  });
+
+  it("treats a status-less task_notification as a completed terminal edge", () => {
+    const ev = parseOne({
+      type: "system",
+      subtype: "task_notification",
+      task_id: "task_done",
+      summary: "Finished",
+    });
+    expect(ev).toMatchObject({
+      type: "background_task",
+      taskId: "task_done",
+      phase: "completed",
+      status: "completed",
+      summary: "Finished",
+    });
   });
 
   it("maps an out-of-range status to null (forward-compat; raw keeps the truth)", () => {

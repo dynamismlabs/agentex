@@ -132,6 +132,22 @@ interface PendingResult {
   cleanup?: () => void;
 }
 
+interface TrackedBackgroundTask {
+  taskId: string;
+  description: string | null;
+  summary: string | null;
+  parentTaskId: string | null;
+  terminal: boolean;
+}
+
+/** Identity latch for the root turn currently represented by this session. */
+interface ActiveTurnReady {
+  promise: Promise<string | null>;
+  resolve: (turnId: string | null) => void;
+  reject: (err: Error) => void;
+  settled: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // JSON-RPC 2.0 helpers
 // ---------------------------------------------------------------------------
@@ -342,6 +358,19 @@ export class CodexSessionImpl implements AgentSession {
   /** Shared promise so concurrent / repeated `drain()` calls coalesce. */
   private _drainPromise: Promise<void> | null = null;
 
+  /**
+   * Root turn targeted by `interrupt()`. The id is learned asynchronously from
+   * the leader `turn/start` response or the root `turn/started` notification.
+   * Concurrent sends reuse this latch so a queued response cannot replace the
+   * actual active turn.
+   */
+  private _activeTurnId: string | null = null;
+  private _activeTurnReady: ActiveTurnReady | null = null;
+  /** Successful repeated interrupts coalesce until the terminal notification. */
+  private _interruptPromise: Promise<void> | null = null;
+  /** Prevents a late interrupt request after the terminal frame was observed. */
+  private _turnTerminalObserved = false;
+
   /** Stamps `tool_result.toolName` by correlating with prior `tool_call`s. */
   private readonly _trackToolName = createToolNameTracker();
 
@@ -351,8 +380,13 @@ export class CodexSessionImpl implements AgentSession {
   private _turnUsage: { inputTokens: number; outputTokens: number } | null = null;
   private _turnModel: string | null = null;
   private _turnIsError = false;
+  private _turnWasInterrupted = false;
   private _turnErrorMessage: string | null = null;
   private _turnStartedAt: Date | null = null;
+
+  /** Child-agent lifecycle is informational and never participates in root turn settlement. */
+  private readonly _backgroundTasks = new Map<string, TrackedBackgroundTask>();
+  private readonly _backgroundTaskIdsByPath = new Map<string, string>();
 
   /**
    * Serial dispatch chain for `onEvent`. Each dispatched event appends a
@@ -446,10 +480,77 @@ export class CodexSessionImpl implements AgentSession {
     }
     for (const [, p] of this._pendingRpc) p.reject(err);
     this._pendingRpc.clear();
+    this.clearActiveTurn(err);
   }
 
   get sessionId(): string | null { return this._threadId; }
   get state(): SessionState { return this._state; }
+
+  /** Start the identity latch before writing the leader `turn/start` request. */
+  private beginActiveTurn(): ActiveTurnReady {
+    let resolveFn!: (turnId: string | null) => void;
+    let rejectFn!: (err: Error) => void;
+    const promise = new Promise<string | null>((resolve, reject) => {
+      resolveFn = resolve;
+      rejectFn = reject;
+    });
+    // A turn can finish without anyone calling interrupt(). Keep a later
+    // process-exit rejection from becoming an unhandled promise rejection.
+    void promise.catch(() => {});
+
+    const ready: ActiveTurnReady = {
+      promise,
+      resolve: resolveFn,
+      reject: rejectFn,
+      settled: false,
+    };
+    this._activeTurnId = null;
+    this._activeTurnReady = ready;
+    this._interruptPromise = null;
+    this._turnTerminalObserved = false;
+    this._turnWasInterrupted = false;
+    return ready;
+  }
+
+  /** First root turn id wins for the current latch. */
+  private captureActiveTurnId(turnId: string, expected?: ActiveTurnReady): void {
+    const ready = this._activeTurnReady;
+    if (!turnId || !ready || ready.settled) return;
+    if (expected && ready !== expected) return;
+    this._activeTurnId = turnId;
+    ready.settled = true;
+    ready.resolve(turnId);
+  }
+
+  private rejectActiveTurnReady(err: Error, expected: ActiveTurnReady): void {
+    if (this._activeTurnReady !== expected || expected.settled) return;
+    expected.settled = true;
+    expected.reject(err);
+  }
+
+  /** Clear the current turn and release an interrupt waiting for its id. */
+  private clearActiveTurn(err?: Error): void {
+    const ready = this._activeTurnReady;
+    if (ready && !ready.settled) {
+      ready.settled = true;
+      if (err) ready.reject(err);
+      else ready.resolve(null);
+    }
+    this._activeTurnId = null;
+    this._activeTurnReady = null;
+    this._interruptPromise = null;
+    this._turnTerminalObserved = false;
+  }
+
+  /** Mark root turn termination and release an interrupt still awaiting its id. */
+  private markTurnTerminalObserved(): void {
+    this._turnTerminalObserved = true;
+    const ready = this._activeTurnReady;
+    if (ready && !ready.settled) {
+      ready.settled = true;
+      ready.resolve(null);
+    }
+  }
 
   /**
    * Durable identity for persistence + later `attachSession`. Null until Codex
@@ -618,6 +719,10 @@ export class CodexSessionImpl implements AgentSession {
     // and pass through. If the second `turn/start` lands during the first
     // turn, the per-turn accumulators continue collecting until the result
     // event fires; the result then drains all pending resolvers.
+    const existingTurnReady = this._activeTurnReady;
+    const isTurnLeader = existingTurnReady === null;
+    const turnReady = existingTurnReady ?? this.beginActiveTurn();
+
     if (this._state === "idle") {
       this._state = "thinking";
       this._turnStartedAt = new Date();
@@ -659,16 +764,34 @@ export class CodexSessionImpl implements AgentSession {
     // ProviderConfig.timeoutSec default when no per-call timeout is given.
     this.armSendDeadline(entry, options);
 
-    this.rpcRequest("turn/start", turnParams).catch(() => {
-      // Turn-level errors arrive via turn.failed notifications.
-    });
+    const turnStart = this.rpcRequest("turn/start", turnParams);
+    if (isTurnLeader) {
+      void turnStart.then((response) => {
+        const turnId = str(asObj(response, "turn"), "id");
+        if (turnId) {
+          this.captureActiveTurnId(turnId, turnReady);
+        }
+        // Some app-server versions may omit the id from the response and send
+        // it only in turn/started. Keep the latch open for that notification.
+      }).catch((err: unknown) => {
+        this.rejectActiveTurnReady(
+          err instanceof Error ? err : new Error(String(err)),
+          turnReady,
+        );
+        // Turn-level failures may also arrive via turn/failed notifications.
+      });
+    } else {
+      void turnStart.catch(() => {
+        // Turn-level failures arrive via turn/failed notifications.
+      });
+    }
 
     return { uuid, result };
   }
 
   /**
    * Wire up this send's timeout and/or abort signal. On fire, the active turn
-   * is cancelled (`turn/cancel`) and the send settles with `timeout` /
+   * is interrupted (`turn/interrupt`) and the send settles with `timeout` /
    * `aborted`. No-op when neither a timeout nor a signal applies.
    */
   private armSendDeadline(entry: PendingResult, options?: SendOptions): void {
@@ -711,7 +834,7 @@ export class CodexSessionImpl implements AgentSession {
 
     // Best-effort cancel of the active turn. With concurrent sends this ends
     // the single shared turn for all of them — see SendOptions JSDoc.
-    void this.interrupt();
+    void this.interrupt().catch(() => {});
 
     entry.resolve({
       summary: null,
@@ -727,7 +850,7 @@ export class CodexSessionImpl implements AgentSession {
 
   async cancel(_uuid: string): Promise<CancelResult> {
     // Codex's JSON-RPC protocol exposes no per-message cancel — only
-    // turn-wide `turn/cancel` (which is what `interrupt()` calls).
+    // turn-wide `turn/interrupt` (which is what `interrupt()` calls).
     // capabilities.cancelQueuedMessage is false; this is a documented no-op.
     return { cancelled: false };
   }
@@ -780,11 +903,37 @@ export class CodexSessionImpl implements AgentSession {
   }
 
   async interrupt(): Promise<void> {
-    if (this._state === "idle" || this._state === "closed") return;
+    if (this._state === "closed") return;
+    const ready = this._activeTurnReady;
+    if (!ready || this._turnTerminalObserved) return;
+    if (this._interruptPromise) return this._interruptPromise;
+
+    const threadId = this._threadId;
+    if (!threadId) {
+      throw new Error("Cannot interrupt Codex turn before the root thread id is known");
+    }
     this._goals.notifyInterrupted(); // don't let an emulated goal auto-continue
+
+    const interruptPromise = (async () => {
+      const turnId = this._activeTurnId ?? await ready.promise;
+      // The turn may have completed while interrupt() was waiting for the
+      // leader turn/start response. In that race, completion is the success.
+      if (!turnId || this._activeTurnReady !== ready || this._turnTerminalObserved) return;
+      await this.rpcRequest("turn/interrupt", { threadId, turnId });
+    })();
+    this._interruptPromise = interruptPromise;
+
     try {
-      await this.rpcRequest("turn/cancel", {});
-    } catch { /* best effort */ }
+      await interruptPromise;
+    } catch (err) {
+      // A rejected control request must reach the host instead of becoming a
+      // false successful Stop. Clear only this turn's failed attempt so a
+      // subsequent click can retry.
+      if (this._activeTurnReady === ready && this._interruptPromise === interruptPromise) {
+        this._interruptPromise = null;
+      }
+      throw err;
+    }
   }
 
   async drain(): Promise<void> {
@@ -804,6 +953,7 @@ export class CodexSessionImpl implements AgentSession {
   async close(): Promise<void> {
     if (this._state === "closed") return;
     this._state = "closed";
+    this.rejectAllPending(new Error("Codex session closed"));
 
     this.proc.stdin!.end();
 
@@ -1003,6 +1153,201 @@ export class CodexSessionImpl implements AgentSession {
     return !!threadId && !!rootThreadId && threadId !== rootThreadId;
   }
 
+  private backgroundTaskParentIdForPath(agentPath: string | null): string | null {
+    if (!agentPath) return null;
+    const separator = agentPath.lastIndexOf("/");
+    if (separator <= 0) return null;
+    return this._backgroundTaskIdsByPath.get(agentPath.slice(0, separator)) ?? null;
+  }
+
+  private agentMessageText(item: Record<string, unknown>): string | null {
+    const direct = str(item, "text");
+    if (direct) return direct;
+    const content = Array.isArray(item["content"]) ? item["content"] : [];
+    for (const entry of content) {
+      if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
+      const block = entry as Record<string, unknown>;
+      const text = str(block, "text");
+      if (text && (str(block, "type") === "output_text" || str(block, "type") === "text")) {
+        return text;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Maintain just enough child metadata to turn a later foreign-thread
+   * terminal notification into one provider-neutral task event. This reducer
+   * is deliberately separate from every root turn accumulator.
+   */
+  private observeBackgroundTask(event: Extract<StreamEvent, { type: "background_task" }>): boolean {
+    const previous = this._backgroundTasks.get(event.taskId);
+    // Codex reports `subAgentActivity:interacted` after it forwards a child's
+    // final answer to the parent. The authoritative child turn/completed can
+    // arrive first, so suppress that late progress edge instead of resurrecting
+    // a task that already reached a terminal state. A later child turn/started
+    // explicitly reactivates the record below in handleForeignNotification.
+    if (previous?.terminal) return false;
+
+    const description = event.description ?? previous?.description ?? null;
+    const summary = event.summary ?? previous?.summary ?? null;
+    const parentTaskId = event.parentTaskId
+      ?? previous?.parentTaskId
+      ?? this.backgroundTaskParentIdForPath(description);
+
+    event.description = description;
+    event.summary = summary;
+    event.parentTaskId = parentTaskId;
+
+    this._backgroundTasks.set(event.taskId, {
+      taskId: event.taskId,
+      description,
+      summary,
+      parentTaskId,
+      terminal: event.phase === "completed",
+    });
+    if (description) this._backgroundTaskIdsByPath.set(description, event.taskId);
+    return true;
+  }
+
+  /**
+   * A Codex app-server connection also publishes child thread notifications.
+   * They are useful only as background-task metadata. They must never flow
+   * through root state, summary, usage, or `resolveTurn()`.
+   */
+  private handleForeignNotification(
+    method: string,
+    params: Record<string, unknown>,
+    rawLine: string,
+    childThreadId: string,
+  ): void {
+    if (method === "thread/started") {
+      const thread = asObj(params, "thread");
+      const parentThreadId = str(thread, "parentThreadId") || str(thread, "parent_thread_id");
+      const rootThreadId = this._threadId ?? this._expectedThreadId;
+      const parentTask = this._backgroundTasks.get(parentThreadId);
+      // App-server can publish child thread/started before the corresponding
+      // root subAgentActivity item. Register only descendants of this session,
+      // not unrelated foreign threads multiplexed by a future server version.
+      if (parentThreadId !== rootThreadId && !parentTask) return;
+
+      const source = asObj(thread, "source");
+      const subAgent = Object.keys(asObj(source, "subAgent")).length > 0
+        ? asObj(source, "subAgent")
+        : asObj(source, "subagent");
+      const spawnSource = Object.keys(asObj(subAgent, "threadSpawn")).length > 0
+        ? asObj(subAgent, "threadSpawn")
+        : asObj(subAgent, "thread_spawn");
+      const description = str(spawnSource, "agentPath")
+        || str(spawnSource, "agent_path")
+        || str(thread, "name")
+        || str(thread, "agentNickname")
+        || str(thread, "agentRole")
+        || null;
+
+      this.dispatchEvent({
+        type: "background_task",
+        taskId: childThreadId,
+        taskType: "subagent",
+        phase: "started",
+        status: "running",
+        description,
+        summary: null,
+        parentTaskId: parentThreadId === rootThreadId ? null : parentThreadId,
+        timestamp: new Date().toISOString(),
+        providerType: "codex",
+        sessionId: rootThreadId,
+        messageId: null,
+        eventId: rootThreadId
+          ? `codex:${rootThreadId}:background-task:${childThreadId}:started`
+          : null,
+        turnId: null,
+        parentToolCallId: null,
+        raw: parseJson(rawLine) ?? params,
+      });
+      return;
+    }
+
+    const task = this._backgroundTasks.get(childThreadId);
+    if (!task) return;
+
+    if (method === "turn/started") {
+      if (!task.terminal) return;
+      task.terminal = false;
+      task.summary = null;
+      const turn = asObj(params, "turn");
+      const turnId = str(turn, "id") || str(params, "turnId") || null;
+      const rootThreadId = this._threadId ?? this._expectedThreadId;
+      this.dispatchEvent({
+        type: "background_task",
+        taskId: childThreadId,
+        taskType: "subagent",
+        phase: "progress",
+        status: "running",
+        description: task.description,
+        summary: null,
+        parentTaskId: task.parentTaskId,
+        timestamp: new Date().toISOString(),
+        providerType: "codex",
+        sessionId: rootThreadId,
+        messageId: null,
+        eventId: rootThreadId && turnId
+          ? `codex:${rootThreadId}:background-task:${childThreadId}:${turnId}:progress`
+          : null,
+        turnId,
+        parentToolCallId: null,
+        raw: parseJson(rawLine) ?? params,
+      });
+      return;
+    }
+
+    if (method === "item/completed") {
+      const item = asObj(params, "item");
+      const itemType = str(item, "type");
+      if ((itemType === "agentMessage" || itemType === "agent_message") && str(item, "phase") !== "commentary") {
+        const summary = this.agentMessageText(item);
+        if (summary) task.summary = summary;
+      }
+      return;
+    }
+
+    if (method !== "turn/completed" && method !== "turn/failed") return;
+
+    const turn = asObj(params, "turn");
+    const turnId = str(turn, "id") || str(params, "turnId") || null;
+    const nativeStatus = method === "turn/failed" ? "failed" : str(turn, "status");
+    const status = nativeStatus === "failed"
+      ? "failed"
+      : nativeStatus === "interrupted" || nativeStatus === "cancelled"
+        ? "stopped"
+        : "completed";
+    const errorMessage = str(asObj(turn, "error"), "message")
+      || str(params, "message")
+      || str(params, "error");
+    const rootThreadId = this._threadId ?? this._expectedThreadId;
+
+    this.dispatchEvent({
+      type: "background_task",
+      taskId: childThreadId,
+      taskType: "subagent",
+      phase: "completed",
+      status,
+      description: task.description,
+      summary: task.summary ?? (errorMessage || null),
+      parentTaskId: task.parentTaskId,
+      timestamp: new Date().toISOString(),
+      providerType: "codex",
+      sessionId: rootThreadId,
+      messageId: null,
+      eventId: rootThreadId && turnId
+        ? `codex:${rootThreadId}:background-task:${childThreadId}:${turnId}:completed`
+        : null,
+      turnId,
+      parentToolCallId: null,
+      raw: parseJson(rawLine) ?? params,
+    });
+  }
+
   private handleNotification(method: string, params: Record<string, unknown>, rawLine: string): void {
     // codex/event — legacy wrapper
     if (method === "codex/event") {
@@ -1020,12 +1365,22 @@ export class CodexSessionImpl implements AgentSession {
     // its root thread, so foreign items must not change root state/summary and,
     // most importantly, a child turn/completed must not resolve the root send.
     const notificationThreadId = this.notificationThreadId(params);
-    if (this.isForeignThread(notificationThreadId)) return;
+    if (this.isForeignThread(notificationThreadId)) {
+      this.handleForeignNotification(method, params, rawLine, notificationThreadId!);
+      return;
+    }
 
     // Map v2 notification methods to processing
     if (method === "thread/started") {
       // codex-cli 0.130.0+ shape: { thread: { id, sessionId, ... } }
       if (!this._threadId) this._threadId = notificationThreadId;
+      this.emitStreamEvent(rawLine);
+      return;
+    }
+
+    if (method === "turn/started") {
+      this.captureActiveTurnId(str(asObj(params, "turn"), "id") || str(params, "turnId"));
+      // The parser intentionally suppresses this lifecycle-only event.
       this.emitStreamEvent(rawLine);
       return;
     }
@@ -1049,6 +1404,7 @@ export class CodexSessionImpl implements AgentSession {
     }
 
     if (method === "turn/failed") {
+      this.markTurnTerminalObserved();
       this._turnIsError = true;
       this._turnErrorMessage = str(params, "message") || str(params, "error") || "Turn failed";
       // Emit before resolve so the result event is queued onto _eventChain
@@ -1111,6 +1467,7 @@ export class CodexSessionImpl implements AgentSession {
     }
 
     if (type === "turn.failed" || type === "error") {
+      this.markTurnTerminalObserved();
       this._turnIsError = true;
       this._turnErrorMessage = str(event, "message") || str(event, "error") || "Turn failed";
       // Emit before resolve so the result event is queued onto _eventChain
@@ -1162,6 +1519,7 @@ export class CodexSessionImpl implements AgentSession {
   }
 
   private handleTurnCompleted(params: Record<string, unknown>): void {
+    this.markTurnTerminalObserved();
     const usage = typeof params["usage"] === "object" && params["usage"] !== null
       ? (params["usage"] as Record<string, unknown>)
       : null;
@@ -1181,7 +1539,9 @@ export class CodexSessionImpl implements AgentSession {
     // the error instead of a false "completed".
     const turn = asObj(params, "turn");
     const turnStatus = str(turn, "status");
-    if (turnStatus === "failed" || turnStatus === "cancelled") {
+    if (turnStatus === "interrupted" || turnStatus === "cancelled") {
+      this._turnWasInterrupted = true;
+    } else if (turnStatus === "failed") {
       this._turnIsError = true;
       const msg = str(asObj(turn, "error"), "message");
       this._turnErrorMessage = msg || this._turnErrorMessage || `Turn ${turnStatus}`;
@@ -1253,9 +1613,9 @@ export class CodexSessionImpl implements AgentSession {
       summary: this._turnSummary,
       usage,
       costUsd: null,
-      status: this._turnIsError ? "failed" : "completed",
-      errorCode: this._turnIsError ? "execution_error" : null,
-      errorMessage: this._turnErrorMessage,
+      status: this._turnWasInterrupted ? "aborted" : this._turnIsError ? "failed" : "completed",
+      errorCode: this._turnWasInterrupted ? "aborted" : this._turnIsError ? "execution_error" : null,
+      errorMessage: this._turnWasInterrupted ? "Turn was interrupted" : this._turnErrorMessage,
     };
 
     // Drain pending onEvent handlers so callers awaiting send() see a settled
@@ -1283,8 +1643,10 @@ export class CodexSessionImpl implements AgentSession {
     this._turnUsage = null;
     this._turnModel = null;
     this._turnIsError = false;
+    this._turnWasInterrupted = false;
     this._turnErrorMessage = null;
     this._turnStartedAt = null;
+    this.clearActiveTurn();
 
     for (const p of pending) {
       // Skip sends already settled early by timeout / abort.
@@ -1316,6 +1678,7 @@ export class CodexSessionImpl implements AgentSession {
    * throwing handler does not break delivery of subsequent events.
    */
   private dispatchEvent(event: StreamEvent): void {
+    if (event.type === "background_task" && !this.observeBackgroundTask(event)) return;
     // Track native goal_status transitions (keeps getGoal() accurate).
     this._goals.observe(event);
     const cb = this.ctx.onEvent;

@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type {
+  BackgroundTaskPhase,
+  BackgroundTaskStatus,
+  BackgroundTaskType,
   CapabilityStatus,
   HistoryAttachment,
   HistoryCatchUpOptions,
@@ -24,6 +27,9 @@ import type {
 } from "../src/index.js";
 
 type PublicTypes =
+  | BackgroundTaskPhase
+  | BackgroundTaskStatus
+  | BackgroundTaskType
   | CapabilityStatus
   | HistoryAttachment
   | HistoryCatchUpOptions

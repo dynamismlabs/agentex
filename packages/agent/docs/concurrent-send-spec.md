@@ -95,7 +95,7 @@ Capability flags describe *what the provider can do*. They do not gate API acces
 | Provider | concurrentSend | cancelQueuedMessage | Mechanism |
 |---|---|---|---|
 | claude | true | true | stream-json stdin enqueue; `control_request {subtype: 'cancel_async_message', message_uuid}` |
-| codex | true | false (TBD) | JSON-RPC `turn/start` while turn active — verified empirically (transcript shows queued messages). No known per-message cancel; only `turn/cancel`. |
+| codex | true | false (TBD) | JSON-RPC `turn/start` while turn active — verified empirically (transcript shows queued messages). No known per-message cancel; only turn-wide `turn/interrupt`. |
 | cursor | TBD | TBD | Audit during impl. |
 | gemini | TBD | TBD | Audit during impl. |
 | openclaw | TBD | TBD | Audit during impl. |
@@ -207,6 +207,6 @@ For each of cursor, gemini, openclaw, opencode, pi:
 
 1. **`onTurnResult` callback?** With shared TurnResults, the awaited-result pattern gets awkward for apps that fire-and-forget many sends. Maybe add `session.onResult(cb)` later and let callers ignore `handle.result`. Defer — start with the Promise-based API and let real usage decide.
 
-2. **Cancel on the codex side.** Worth investigating whether `turn/cancel` on Codex aborts queued items too, or only the active turn. If it nukes queued items, we could expose a `cancelAll()` for Codex. Defer to T21.
+2. **Interrupt on the codex side.** Worth investigating whether `turn/interrupt` on Codex aborts queued items too, or only the active turn. If it nukes queued items, we could expose a `cancelAll()` for Codex. Defer to T21.
 
 3. **Race between send and immediate cancel.** App calls `send()` then `cancel()` in the same tick. We write the user message to stdin, then immediately write the control_request. The CLI processes them in order — by the time it sees `cancel_async_message`, the user message is already in the queue, so cancel succeeds. But if the CLI is mid-drain when the user message lands, it could be consumed before cancel arrives. Document as best-effort with `{cancelled: false}` as the honest "too late" signal.

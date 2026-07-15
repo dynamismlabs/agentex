@@ -436,6 +436,13 @@ export function parseStreamLine(line: string, partial?: PartialStreamContext): S
     }];
   }
 
+  // Claude's async subagents and backgrounded shell processes are independent
+  // from the root turn. Normalize their system/task_* records before the
+  // forward-compat `unknown` branch so hosts can track work that outlives the
+  // root result without provider-specific parsing.
+  const backgroundTask = backgroundTaskEventFromClaude(event);
+  if (backgroundTask) return [backgroundTask];
+
   // `/goal` writes a `goal_status` attachment recording the sentinel's view of
   // the goal (`{type:"goal_status", met, sentinel, condition}`). It appears as a
   // top-level `attachment` line in both the live stream and the on-disk
@@ -757,29 +764,7 @@ function taskUsageFromRaw(value: unknown): ClaudeTaskUsage | null {
   };
 }
 
-/**
- * Decode a Claude background-task lifecycle event into typed fields.
- *
- * Claude emits `task_started` / `task_progress` / `task_updated` /
- * `task_notification` as `type:"system"` on the wire; agentex surfaces those as
- * `type:"unknown"` (the forward-compat escape hatch — only `system`+`init` gets
- * its own typed variant), with the payload preserved on `event.raw`. This
- * accessor reads that payload into named fields, returning `null` for any event
- * that isn't a Claude task lifecycle event. The full payload always remains on
- * `event.raw` as the backstop, so fields agentex doesn't model yet stay
- * reachable.
- *
- * This is a stateless, per-event decode — NOT a reducer. `status` reflects only
- * the event in hand (and `task_updated` is a sparse patch). Collapsing a task's
- * events into one current state over its lifetime is the consumer's job.
- */
-export function getClaudeTaskDetails(event: StreamEvent): ClaudeTaskDetails | null {
-  if (event.type !== "unknown") return null;
-  if (event.providerType !== PROVIDER_TYPE) return null;
-  const raw = event.raw;
-  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
-  const r = raw as Record<string, unknown>;
-
+function claudeTaskDetailsFromRaw(r: Record<string, unknown>): ClaudeTaskDetails | null {
   const phase = CLAUDE_TASK_PHASES[asString(r["subtype"], "")];
   if (!phase) return null;
 
@@ -805,6 +790,79 @@ export function getClaudeTaskDetails(event: StreamEvent): ClaudeTaskDetails | nu
     summary: asNullableString(r["summary"]),
     endTime: patch ? asNullableNumber(patch["end_time"]) : null,
   };
+}
+
+function normalizedClaudeTaskType(task: ClaudeTaskDetails): "subagent" | "process" | "unknown" {
+  if (task.subagentType || task.workflowName) return "subagent";
+  const nativeType = task.taskType?.toLowerCase() ?? "";
+  if (nativeType.includes("agent")) return "subagent";
+  if (nativeType === "local_bash" || nativeType.includes("shell") || nativeType.includes("process")) {
+    return "process";
+  }
+  return "unknown";
+}
+
+function normalizedClaudeTaskStatus(
+  status: ClaudeTaskStatus | null,
+): "pending" | "running" | "paused" | "completed" | "failed" | "stopped" {
+  switch (status) {
+    case "pending": return "pending";
+    case "paused": return "paused";
+    case "completed": return "completed";
+    case "failed": return "failed";
+    case "killed":
+    case "stopped": return "stopped";
+    case "running":
+    default: return "running";
+  }
+}
+
+function backgroundTaskEventFromClaude(
+  raw: Record<string, unknown>,
+): Extract<StreamEvent, { type: "background_task" }> | null {
+  if (asString(raw["type"], "") !== "system") return null;
+  const task = claudeTaskDetailsFromRaw(raw);
+  if (!task || !task.taskId) return null;
+
+  const status = task.phase === "notification" && task.status === null
+    ? "completed"
+    : normalizedClaudeTaskStatus(task.status);
+  const terminal = status === "completed" || status === "failed" || status === "stopped";
+  return {
+    type: "background_task",
+    taskId: task.taskId,
+    taskType: normalizedClaudeTaskType(task),
+    phase: terminal || task.phase === "notification"
+      ? "completed"
+      : task.phase === "started" ? "started" : "progress",
+    status,
+    description: task.description,
+    summary: task.summary,
+    parentTaskId: null,
+    ...baseFieldsFromEvent(raw, null),
+  };
+}
+
+/**
+ * Decode a Claude background-task lifecycle event into typed fields.
+ *
+ * Claude emits `task_started` / `task_progress` / `task_updated` /
+ * `task_notification` as `type:"system"` on the wire; agentex surfaces those as
+ * first-class `background_task` events with the payload preserved on
+ * `event.raw`. This accessor exposes the additional Claude-native fields and
+ * also accepts legacy `unknown` task events produced by agentex <=0.0.32.
+ * It returns `null` for anything that isn't a Claude task lifecycle event.
+ *
+ * This is a stateless, per-event decode — NOT a reducer. `status` reflects only
+ * the event in hand (and `task_updated` is a sparse patch). Collapsing a task's
+ * events into one current state over its lifetime is the consumer's job.
+ */
+export function getClaudeTaskDetails(event: StreamEvent): ClaudeTaskDetails | null {
+  if (event.type !== "unknown" && event.type !== "background_task") return null;
+  if (event.providerType !== PROVIDER_TYPE) return null;
+  const raw = event.raw;
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+  return claudeTaskDetailsFromRaw(raw as Record<string, unknown>);
 }
 
 export function isClaudeMaxTurns(stdout: string): boolean {

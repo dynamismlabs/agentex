@@ -97,7 +97,12 @@ describe("CodexSession — onEvent dispatch", () => {
       params: {
         threadId: "child-thread",
         turnId: "child-turn",
-        item: { type: "agentMessage", id: "child-message", text: "child done", phase: "final_answer" },
+        item: {
+          type: "agentMessage",
+          id: "child-message",
+          content: [{ type: "output_text", text: "child done" }],
+          phase: "final_answer",
+        },
       },
     }));
     feed(ndjson({
@@ -123,6 +128,43 @@ describe("CodexSession — onEvent dispatch", () => {
     expect(internal._turnSummary).toBeNull();
     expect(events.some((event) => event.sessionId === "child-thread")).toBe(false);
     expect(events.some((event) => event.type === "result")).toBe(false);
+    expect(events.filter((event) => event.type === "background_task")).toEqual([
+      expect.objectContaining({
+        type: "background_task",
+        taskId: "child-thread",
+        phase: "started",
+        status: "running",
+        sessionId: "root-thread",
+      }),
+      expect.objectContaining({
+        type: "background_task",
+        taskId: "child-thread",
+        phase: "completed",
+        status: "failed",
+        summary: "child done",
+        sessionId: "root-thread",
+      }),
+    ]);
+
+    // Codex forwards the child's final answer to its parent as a later
+    // `interacted` activity item. It must not resurrect the completed task.
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "item/completed",
+      params: {
+        threadId: "root-thread",
+        turnId: "root-turn",
+        item: {
+          type: "subAgentActivity",
+          id: "late-interaction",
+          kind: "interacted",
+          agentThreadId: "child-thread",
+          agentPath: "/root/child",
+        },
+      },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(events.filter((event) => event.type === "background_task")).toHaveLength(2);
 
     // Global notifications have no thread scope and must still flow through.
     feed(ndjson({
@@ -166,6 +208,132 @@ describe("CodexSession — onEvent dispatch", () => {
     expect(assistants).toHaveLength(2);
     expect(assistants[0]?.type === "assistant" && assistants[0].phase).toBe("commentary");
     expect(assistants[1]?.type === "assistant" && assistants[1].phase).toBe("final_answer");
+  });
+
+  it("tracks fast and nested child threads without settling the root handle", async () => {
+    const events: StreamEvent[] = [];
+    const { session, feed, turnResult } = makeDrivenSession({
+      onEvent: (event) => { events.push(event); },
+    });
+    (session as unknown as { _threadId: string | null })._threadId = "root-thread";
+    let rootSettled = false;
+    void turnResult.then(() => { rootSettled = true; });
+
+    // thread/started is the fallback source when a fast child can finish
+    // before its root subAgentActivity item is published.
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "thread/started",
+      params: {
+        thread: {
+          id: "child-thread",
+          parentThreadId: "root-thread",
+          source: {
+            subAgent: {
+              thread_spawn: { parent_thread_id: "root-thread", agent_path: "/root/child" },
+            },
+          },
+        },
+      },
+    }));
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "thread/started",
+      params: { thread: { id: "nested-thread", parentThreadId: "child-thread" } },
+    }));
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "item/completed",
+      params: {
+        threadId: "nested-thread",
+        turnId: "nested-turn",
+        item: { type: "agentMessage", id: "nested-final", text: "nested done", phase: "final_answer" },
+      },
+    }));
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "turn/completed",
+      params: {
+        threadId: "nested-thread",
+        turn: { id: "nested-turn", status: "completed" },
+      },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(rootSettled).toBe(false);
+    expect(events.filter((event) => event.type === "result")).toHaveLength(0);
+    expect(events.filter((event) => event.type === "background_task")).toEqual([
+      expect.objectContaining({
+        taskId: "child-thread",
+        phase: "started",
+        status: "running",
+        description: "/root/child",
+        parentTaskId: null,
+      }),
+      expect.objectContaining({
+        taskId: "nested-thread",
+        phase: "started",
+        status: "running",
+        parentTaskId: "child-thread",
+      }),
+      expect.objectContaining({
+        taskId: "nested-thread",
+        phase: "completed",
+        status: "completed",
+        summary: "nested done",
+        parentTaskId: "child-thread",
+      }),
+    ]);
+  });
+
+  it("continues delivering child lifecycle after the root turn has settled", async () => {
+    const events: StreamEvent[] = [];
+    const { session, feed, turnResult } = makeDrivenSession({
+      onEvent: (event) => { events.push(event); },
+    });
+    (session as unknown as { _threadId: string | null })._threadId = "root-thread";
+
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "thread/started",
+      params: { thread: { id: "child-thread", parentThreadId: "root-thread" } },
+    }));
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "turn/completed",
+      params: { threadId: "root-thread", turn: { id: "root-turn", status: "completed" } },
+    }));
+    await expect(turnResult).resolves.toMatchObject({ status: "completed" });
+
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "item/completed",
+      params: {
+        threadId: "child-thread",
+        turnId: "child-turn",
+        item: { type: "agentMessage", id: "child-final", text: "late child result", phase: "final_answer" },
+      },
+    }));
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "turn/completed",
+      params: {
+        threadId: "child-thread",
+        turn: { id: "child-turn", status: "completed" },
+      },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(events.filter((event) => event.type === "background_task")).toEqual([
+      expect.objectContaining({ taskId: "child-thread", phase: "started", status: "running" }),
+      expect.objectContaining({
+        taskId: "child-thread",
+        phase: "completed",
+        status: "completed",
+        summary: "late child result",
+      }),
+    ]);
+    expect(events.filter((event) => event.type === "result")).toHaveLength(1);
   });
 
   it("does not let a foreign legacy thread.started replace the root id", () => {
@@ -596,7 +764,9 @@ class RpcError {
  * per-method handler map, and records every message the session writes to
  * stdin. A handler returning an RpcError yields a JSON-RPC error response.
  */
-function makeRpcProc(handlers: Record<string, (params: Record<string, unknown>) => unknown>): {
+function makeRpcProc(
+  handlers: Record<string, (params: Record<string, unknown>) => unknown | Promise<unknown>>,
+): {
   proc: ChildProcess;
   writes: Array<Record<string, unknown>>;
 } {
@@ -617,11 +787,11 @@ function makeRpcProc(handlers: Record<string, (params: Record<string, unknown>) 
           const id = msg["id"] as number;
           const handler = handlers[msg["method"] as string];
           const out = handler ? handler((msg["params"] as Record<string, unknown>) ?? {}) : {};
-          queueMicrotask(() => {
+          void Promise.resolve(out).then((resolved) => {
             const response =
-              out instanceof RpcError
-                ? { jsonrpc: "2.0", id, error: { code: out.code, message: out.rpcMessage } }
-                : { jsonrpc: "2.0", id, result: out };
+              resolved instanceof RpcError
+                ? { jsonrpc: "2.0", id, error: { code: resolved.code, message: resolved.rpcMessage } }
+                : { jsonrpc: "2.0", id, result: resolved };
             stdout.emit("data", JSON.stringify(response) + "\n");
           });
         }
@@ -644,6 +814,304 @@ function paramsFor(writes: Array<Record<string, unknown>>, method: string): Reco
   const msg = writes.find((w) => w["method"] === method);
   return (msg?.["params"] as Record<string, unknown>) ?? {};
 }
+
+function writesFor(
+  writes: Array<Record<string, unknown>>,
+  method: string,
+): Array<Record<string, unknown>> {
+  return writes.filter((write) => write["method"] === method);
+}
+
+describe("CodexSession — interrupt", () => {
+  it("targets the active root turn and maps interrupted completion to aborted", async () => {
+    const events: StreamEvent[] = [];
+    let turnNumber = 0;
+    const { proc, writes } = makeRpcProc({
+      initialize: () => ({}),
+      "thread/start": () => ({ thread: { id: "root-thread" } }),
+      "turn/start": () => ({
+        turn: { id: `root-turn-${++turnNumber}`, status: "inProgress" },
+      }),
+      "turn/interrupt": () => ({}),
+    });
+    const session = new CodexSessionImpl(
+      proc,
+      { onEvent: (event) => { events.push(event); } },
+      "/tmp",
+      "test-model",
+      null,
+    );
+    await session.handshake();
+
+    const first = await session.send("Stop this turn");
+    await session.interrupt();
+
+    expect(writesFor(writes, "turn/interrupt")).toHaveLength(1);
+    expect(paramsFor(writes, "turn/interrupt")).toEqual({
+      threadId: "root-thread",
+      turnId: "root-turn-1",
+    });
+    expect(methodsWritten(writes)).not.toContain("turn/cancel");
+
+    feedCodex(session, {
+      jsonrpc: "2.0",
+      method: "turn/completed",
+      params: {
+        threadId: "root-thread",
+        turn: { id: "root-turn-1", status: "interrupted" },
+        usage: { input_tokens: 1, output_tokens: 1 },
+      },
+    });
+
+    await expect(first.result).resolves.toMatchObject({
+      status: "aborted",
+      errorCode: "aborted",
+      errorMessage: "Turn was interrupted",
+    });
+    expect(events.find((event) => event.type === "result")).toMatchObject({
+      type: "result",
+      isError: false,
+      terminalReason: "interrupted",
+    });
+
+    const second = await session.send("Stop the next turn too");
+    await session.interrupt();
+    expect(writesFor(writes, "turn/interrupt")).toHaveLength(2);
+    expect(writesFor(writes, "turn/interrupt")[1]?.["params"]).toEqual({
+      threadId: "root-thread",
+      turnId: "root-turn-2",
+    });
+
+    feedCodex(session, {
+      jsonrpc: "2.0",
+      method: "turn/completed",
+      params: {
+        threadId: "root-thread",
+        turn: { id: "root-turn-2", status: "interrupted" },
+        usage: { input_tokens: 1, output_tokens: 1 },
+      },
+    });
+    await expect(second.result).resolves.toMatchObject({ status: "aborted" });
+  });
+
+  it("waits for the root turn id and coalesces repeated interrupt calls", async () => {
+    let resolveTurnStart!: (value: unknown) => void;
+    const delayedTurnStart = new Promise<unknown>((resolve) => {
+      resolveTurnStart = resolve;
+    });
+    const { proc, writes } = makeRpcProc({
+      initialize: () => ({}),
+      "thread/start": () => ({ thread: { id: "root-thread" } }),
+      "turn/start": () => delayedTurnStart,
+      "turn/interrupt": () => ({}),
+    });
+    const session = new CodexSessionImpl(proc, {}, "/tmp", "test-model", null);
+    await session.handshake();
+
+    const handle = await session.send("Interrupt immediately");
+    const firstInterrupt = session.interrupt();
+    const secondInterrupt = session.interrupt();
+    await Promise.resolve();
+    expect(writesFor(writes, "turn/interrupt")).toHaveLength(0);
+
+    feedCodex(session, {
+      jsonrpc: "2.0",
+      method: "turn/started",
+      params: {
+        threadId: "child-thread",
+        turn: { id: "child-turn", status: "inProgress" },
+      },
+    });
+    await Promise.resolve();
+    expect(writesFor(writes, "turn/interrupt")).toHaveLength(0);
+
+    feedCodex(session, {
+      jsonrpc: "2.0",
+      method: "turn/started",
+      params: {
+        threadId: "root-thread",
+        turn: { id: "root-turn", status: "inProgress" },
+      },
+    });
+    resolveTurnStart({ turn: { id: "late-response-turn", status: "inProgress" } });
+    await Promise.all([firstInterrupt, secondInterrupt]);
+    await session.interrupt();
+
+    expect(writesFor(writes, "turn/interrupt")).toHaveLength(1);
+    expect(paramsFor(writes, "turn/interrupt")).toEqual({
+      threadId: "root-thread",
+      turnId: "root-turn",
+    });
+
+    feedCodex(session, {
+      jsonrpc: "2.0",
+      method: "turn/completed",
+      params: {
+        threadId: "root-thread",
+        turn: { id: "root-turn", status: "interrupted" },
+        usage: { input_tokens: 1, output_tokens: 1 },
+      },
+    });
+    await handle.result;
+  });
+
+  it("releases an interrupt waiting for an id as soon as the turn terminates", async () => {
+    let resolveTurnStart!: (value: unknown) => void;
+    const delayedTurnStart = new Promise<unknown>((resolve) => {
+      resolveTurnStart = resolve;
+    });
+    let releaseResultEvent!: () => void;
+    const resultEventGate = new Promise<void>((resolve) => {
+      releaseResultEvent = resolve;
+    });
+    const { proc, writes } = makeRpcProc({
+      initialize: () => ({}),
+      "thread/start": () => ({ thread: { id: "root-thread" } }),
+      "turn/start": () => delayedTurnStart,
+    });
+    const session = new CodexSessionImpl(
+      proc,
+      {
+        onEvent: async (event) => {
+          if (event.type === "result") await resultEventGate;
+        },
+      },
+      "/tmp",
+      "test-model",
+      null,
+    );
+    await session.handshake();
+
+    const handle = await session.send("Finish before the turn id arrives");
+    let resultSettled = false;
+    void handle.result.then(() => { resultSettled = true; });
+    const interrupt = session.interrupt();
+
+    feedCodex(session, {
+      jsonrpc: "2.0",
+      method: "turn/completed",
+      params: {
+        threadId: "root-thread",
+        turn: { id: "root-turn", status: "completed" },
+        usage: { input_tokens: 1, output_tokens: 1 },
+      },
+    });
+    resolveTurnStart({ turn: { id: "late-turn", status: "completed" } });
+
+    await interrupt;
+    expect(writesFor(writes, "turn/interrupt")).toHaveLength(0);
+    expect(resultSettled).toBe(false);
+
+    releaseResultEvent();
+    await expect(handle.result).resolves.toMatchObject({ status: "completed" });
+  });
+
+  it("falls back to turn/started when the turn/start response omits the id", async () => {
+    const { proc, writes } = makeRpcProc({
+      initialize: () => ({}),
+      "thread/start": () => ({ thread: { id: "root-thread" } }),
+      "turn/start": () => ({}),
+      "turn/interrupt": () => ({}),
+    });
+    const session = new CodexSessionImpl(proc, {}, "/tmp", "test-model", null);
+    await session.handshake();
+
+    const handle = await session.send("Use the lifecycle notification");
+    const interrupt = session.interrupt();
+    await Promise.resolve();
+    expect(writesFor(writes, "turn/interrupt")).toHaveLength(0);
+
+    feedCodex(session, {
+      jsonrpc: "2.0",
+      method: "turn/started",
+      params: {
+        threadId: "root-thread",
+        turn: { id: "notification-turn", status: "inProgress" },
+      },
+    });
+    await interrupt;
+
+    expect(paramsFor(writes, "turn/interrupt")).toEqual({
+      threadId: "root-thread",
+      turnId: "notification-turn",
+    });
+
+    feedCodex(session, {
+      jsonrpc: "2.0",
+      method: "turn/completed",
+      params: {
+        threadId: "root-thread",
+        turn: { id: "notification-turn", status: "interrupted" },
+        usage: { input_tokens: 1, output_tokens: 1 },
+      },
+    });
+    await handle.result;
+  });
+
+  it("keeps the leader turn id when concurrent sends return different ids", async () => {
+    let turnNumber = 0;
+    const { proc, writes } = makeRpcProc({
+      initialize: () => ({}),
+      "thread/start": () => ({ thread: { id: "root-thread" } }),
+      "turn/start": () => ({
+        turn: { id: ++turnNumber === 1 ? "leader-turn" : "queued-turn", status: "inProgress" },
+      }),
+      "turn/interrupt": () => ({}),
+    });
+    const session = new CodexSessionImpl(proc, {}, "/tmp", "test-model", null);
+    await session.handshake();
+
+    const [leader, queued] = await Promise.all([
+      session.send("Leader"),
+      session.send("Queued"),
+    ]);
+    await session.interrupt();
+
+    expect(paramsFor(writes, "turn/interrupt")).toEqual({
+      threadId: "root-thread",
+      turnId: "leader-turn",
+    });
+
+    feedCodex(session, {
+      jsonrpc: "2.0",
+      method: "turn/completed",
+      params: {
+        threadId: "root-thread",
+        turn: { id: "leader-turn", status: "interrupted" },
+        usage: { input_tokens: 1, output_tokens: 1 },
+      },
+    });
+    const [leaderResult, queuedResult] = await Promise.all([leader.result, queued.result]);
+    expect(leaderResult).toBe(queuedResult);
+    expect(leaderResult.status).toBe("aborted");
+  });
+
+  it("propagates turn/interrupt RPC failures to the caller", async () => {
+    const { proc, writes } = makeRpcProc({
+      initialize: () => ({}),
+      "thread/start": () => ({ thread: { id: "root-thread" } }),
+      "turn/start": () => ({ turn: { id: "root-turn", status: "inProgress" } }),
+      "turn/interrupt": () => new RpcError(-32600, "Invalid request"),
+    });
+    const session = new CodexSessionImpl(proc, {}, "/tmp", "test-model", null);
+    await session.handshake();
+
+    const handle = await session.send("This interrupt will fail");
+    await expect(session.interrupt()).rejects.toThrow("JSON-RPC error -32600: Invalid request");
+    expect(writesFor(writes, "turn/interrupt")).toHaveLength(1);
+
+    feedCodex(session, {
+      jsonrpc: "2.0",
+      method: "turn/completed",
+      params: {
+        threadId: "root-thread",
+        turn: { id: "root-turn", status: "completed" },
+        usage: { input_tokens: 1, output_tokens: 1 },
+      },
+    });
+    await handle.result;
+  });
+});
 
 describe("CodexSession — turn selection overrides", () => {
   it("forwards ProviderConfig model and effort to turn/start", async () => {
