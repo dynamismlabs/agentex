@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.0.34 - Codex collaboration task lifecycle
+
+### Fixed
+
+- Codex 0.144 collaboration tool calls now register spawned child threads as
+  provider-neutral `background_task` events, including children launched after
+  the root turn has already completed.
+- Child completion, failure, and interruption reconcile against authoritative
+  Codex thread state when live child notifications race or are unavailable.
+  Reconciliation remains independent of root turn settlement.
+- Duplicate start and terminal edges are suppressed across collaboration,
+  child-thread, and reconciliation signals. Session shutdown also closes any
+  still-active child lifecycle instead of leaving a permanent running state.
+
+### Compatibility
+
+- The change is isolated to Codex collaboration events. Claude and the other
+  provider transports keep their existing background-task behavior.
+
 ## 0.0.33 — Reliable Codex control and background tasks
 
 ### Added

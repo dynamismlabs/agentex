@@ -64,6 +64,28 @@ function parseObject(value: unknown): Record<string, unknown> {
   return {};
 }
 
+function parseStringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === "string" && entry.length > 0)
+    : [];
+}
+
+function codexBackgroundTaskState(
+  value: unknown,
+): { phase: "started" | "completed"; status: "running" | "completed" | "failed" | "stopped"; summary: string | null } {
+  const state = parseObject(value);
+  const nativeStatus = asString(state["status"], "");
+  const summary = asNullableString(state["message"]);
+  if (nativeStatus === "completed") return { phase: "completed", status: "completed", summary };
+  if (nativeStatus === "errored" || nativeStatus === "notFound") {
+    return { phase: "completed", status: "failed", summary };
+  }
+  if (nativeStatus === "interrupted" || nativeStatus === "shutdown") {
+    return { phase: "completed", status: "stopped", summary };
+  }
+  return { phase: "started", status: "running", summary };
+}
+
 /**
  * Build base fields. For Codex, `eventId` is always null (neither wire
  * format emits a per-line UUID). `sessionId` and `turnId` come from the
@@ -431,6 +453,34 @@ function parseV2Notification(event: Record<string, unknown>): StreamEvent | null
         status: kind === "interrupted" ? "stopped" : "running",
         description: asNullableString(item["agentPath"]),
         summary: null,
+        parentTaskId: null,
+        ...base,
+      };
+    }
+    if (itemType === "collabAgentToolCall") {
+      const tool = asString(item["tool"], "");
+      const taskIds = parseStringArray(item["receiverThreadIds"]);
+      const states = parseObject(item["agentsStates"]);
+      const taskId = taskIds[0] ?? Object.keys(states)[0] ?? "";
+      // A completed spawnAgent call means the child exists, not that the
+      // child's own turn is complete. Its state (usually pendingInit) and a
+      // later thread/read response carry the child lifecycle.
+      if (!taskId || (tool !== "spawnAgent" && !(taskId in states))) {
+        return {
+          type: "unknown",
+          subtype: `item/completed:${itemType}`,
+          ...base,
+        };
+      }
+      const state = codexBackgroundTaskState(states[taskId]);
+      return {
+        type: "background_task",
+        taskId,
+        taskType: "subagent",
+        phase: state.phase,
+        status: state.status,
+        description: asNullableString(item["prompt"]),
+        summary: state.summary,
         parentTaskId: null,
         ...base,
       };

@@ -11,9 +11,13 @@ import type {
   UserInputRequest,
 } from "../../../src/types.js";
 
-function makeFakeProc(): { proc: ChildProcess } {
+function makeFakeProc(): { proc: ChildProcess; writes: string[] } {
+  const writes: string[] = [];
   const stdin = {
-    write: (_chunk: string) => true,
+    write: (chunk: string) => {
+      writes.push(chunk);
+      return true;
+    },
     end: () => {},
   };
   const stdout = new EventEmitter() as EventEmitter & { setEncoding: (e: string) => void };
@@ -23,7 +27,7 @@ function makeFakeProc(): { proc: ChildProcess } {
 
   const proc = new EventEmitter() as unknown as ChildProcess;
   Object.assign(proc, { stdin, stdout, stderr, kill: () => true });
-  return { proc };
+  return { proc, writes };
 }
 
 /**
@@ -35,8 +39,9 @@ function makeDrivenSession(ctx: SessionContext): {
   session: CodexSessionImpl;
   feed: (line: string) => void;
   turnResult: Promise<TurnResult>;
+  writes: string[];
 } {
-  const { proc } = makeFakeProc();
+  const { proc, writes } = makeFakeProc();
   const session = new CodexSessionImpl(proc, ctx, "/tmp", "test-model", null);
   const turnResult = new Promise<TurnResult>((resolve, reject) => {
     const s = session as unknown as {
@@ -54,7 +59,7 @@ function makeDrivenSession(ctx: SessionContext): {
   const feed = (line: string): void => {
     (session as unknown as { handleLine: (l: string) => void }).handleLine(line);
   };
-  return { session, feed, turnResult };
+  return { session, feed, turnResult, writes };
 }
 
 function ndjson(obj: Record<string, unknown>): string {
@@ -118,7 +123,14 @@ describe("CodexSession — onEvent dispatch", () => {
     feed(ndjson({
       jsonrpc: "2.0",
       method: "turn/completed",
-      params: { threadId: "child-thread", turn: { id: "child-turn", status: "completed" } },
+      params: {
+        threadId: "child-thread",
+        turn: {
+          id: "child-turn",
+          status: "completed",
+          items: [{ type: "commandExecution", aggregatedOutput: "x".repeat(10_000) }],
+        },
+      },
     }));
     await new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -208,6 +220,511 @@ describe("CodexSession — onEvent dispatch", () => {
     expect(assistants).toHaveLength(2);
     expect(assistants[0]?.type === "assistant" && assistants[0].phase).toBe("commentary");
     expect(assistants[1]?.type === "assistant" && assistants[1].phase).toBe("final_answer");
+  });
+
+  it("tracks a collab spawn past the root result and reconciles it with thread/read", async () => {
+    const events: StreamEvent[] = [];
+    const { session, feed, turnResult, writes } = makeDrivenSession({
+      onEvent: (event) => { events.push(event); },
+    });
+    (session as unknown as { _threadId: string | null })._threadId = "root-thread";
+
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "item/completed",
+      params: {
+        threadId: "root-thread",
+        turnId: "root-turn",
+        item: {
+          type: "collabAgentToolCall",
+          id: "spawn-call",
+          tool: "spawnAgent",
+          status: "completed",
+          senderThreadId: "root-thread",
+          receiverThreadIds: ["child-thread"],
+          prompt: "Run the lifecycle probe",
+          agentsStates: {
+            "child-thread": { status: "pendingInit", message: null },
+          },
+        },
+      },
+    }));
+
+    const readRequest = writes
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .find((message) => message["method"] === "thread/read");
+    expect(readRequest).toMatchObject({
+      method: "thread/read",
+      params: { threadId: "child-thread", includeTurns: true },
+    });
+
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "item/completed",
+      params: {
+        threadId: "root-thread",
+        turnId: "root-turn",
+        item: { type: "agentMessage", id: "root-final", text: "ROOT_COMPLETE", phase: "final_answer" },
+      },
+    }));
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "turn/completed",
+      params: { threadId: "root-thread", turn: { id: "root-turn", status: "completed" } },
+    }));
+    expect((await turnResult).summary).toBe("ROOT_COMPLETE");
+
+    feed(ndjson({
+      jsonrpc: "2.0",
+      id: readRequest?.["id"],
+      result: {
+        thread: {
+          id: "child-thread",
+          parentThreadId: "root-thread",
+          status: { type: "notLoaded" },
+          turns: [{
+            id: "child-turn",
+            status: "completed",
+            error: null,
+            items: [
+              { type: "userMessage", id: "child-input", content: [] },
+              { type: "agentMessage", id: "child-final", text: "CHILD_COMPLETE", phase: "final_answer" },
+            ],
+          }],
+        },
+      },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const background = events.filter((event) => event.type === "background_task");
+    expect(background).toEqual([
+      expect.objectContaining({
+        taskId: "child-thread",
+        phase: "started",
+        status: "running",
+        description: "Run the lifecycle probe",
+      }),
+      expect.objectContaining({
+        taskId: "child-thread",
+        phase: "completed",
+        status: "completed",
+        summary: "CHILD_COMPLETE",
+        turnId: "child-turn",
+      }),
+    ]);
+    const terminal = background[1];
+    expect(terminal?.type === "background_task" ? terminal.raw : null).toEqual({
+      method: "thread/read",
+      reconciled: true,
+      threadId: "child-thread",
+      turnId: "child-turn",
+      status: "completed",
+      error: null,
+    });
+    expect(JSON.stringify(terminal?.raw).length).toBeLessThan(256);
+    expect(events.findIndex((event) => event.type === "result"))
+      .toBeLessThan(events.findIndex((event) => event.type === "background_task" && event.phase === "completed"));
+  });
+
+  it("emits one terminal edge when foreign completion races thread/read", async () => {
+    const events: StreamEvent[] = [];
+    const { session, feed, writes } = makeDrivenSession({
+      onEvent: (event) => { events.push(event); },
+    });
+    (session as unknown as { _threadId: string | null })._threadId = "root-thread";
+
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "item/completed",
+      params: {
+        threadId: "root-thread",
+        turnId: "root-turn",
+        item: {
+          type: "collabAgentToolCall",
+          id: "spawn-call",
+          tool: "spawnAgent",
+          status: "completed",
+          senderThreadId: "root-thread",
+          receiverThreadIds: ["child-thread"],
+          prompt: "Review",
+          agentsStates: { "child-thread": { status: "running", message: null } },
+        },
+      },
+    }));
+    const readRequest = writes
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .find((message) => message["method"] === "thread/read");
+
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "thread/started",
+      params: { thread: { id: "child-thread", parentThreadId: "root-thread" } },
+    }));
+
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "item/completed",
+      params: {
+        threadId: "child-thread",
+        turnId: "child-turn",
+        item: { type: "agentMessage", id: "child-final", text: "done", phase: "final_answer" },
+      },
+    }));
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "turn/completed",
+      params: {
+        threadId: "child-thread",
+        turn: {
+          id: "child-turn",
+          status: "completed",
+          items: [{ type: "commandExecution", aggregatedOutput: "x".repeat(10_000) }],
+        },
+      },
+    }));
+    feed(ndjson({
+      jsonrpc: "2.0",
+      id: readRequest?.["id"],
+      result: {
+        thread: {
+          id: "child-thread",
+          status: { type: "notLoaded" },
+          turns: [{
+            id: "child-turn",
+            status: "completed",
+            error: null,
+            items: [{ type: "agentMessage", id: "child-final", text: "done", phase: "final_answer" }],
+          }],
+        },
+      },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(events.filter((event) => event.type === "background_task" && event.phase === "started"))
+      .toHaveLength(1);
+    expect(events.filter((event) => event.type === "background_task" && event.phase === "completed"))
+      .toHaveLength(1);
+    const terminal = events.find((event) => event.type === "background_task" && event.phase === "completed");
+    expect(terminal?.raw).toEqual({
+      method: "turn/completed",
+      reconciled: false,
+      threadId: "child-thread",
+      turnId: "child-turn",
+      status: "completed",
+      error: null,
+    });
+    expect(JSON.stringify(terminal?.raw).length).toBeLessThan(256);
+  });
+
+  it("merges collab prompt metadata when thread/started wins the spawn race", async () => {
+    const events: StreamEvent[] = [];
+    const { session, feed } = makeDrivenSession({
+      onEvent: (event) => { events.push(event); },
+    });
+    (session as unknown as { _threadId: string | null })._threadId = "root-thread";
+
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "thread/started",
+      params: { thread: { id: "child-thread", parentThreadId: "root-thread" } },
+    }));
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "item/completed",
+      params: {
+        threadId: "root-thread",
+        turnId: "root-turn",
+        item: {
+          type: "collabAgentToolCall",
+          id: "spawn-call",
+          tool: "spawnAgent",
+          status: "completed",
+          senderThreadId: "root-thread",
+          receiverThreadIds: ["child-thread"],
+          prompt: "Inspect the provider lifecycle",
+          agentsStates: { "child-thread": { status: "running", message: null } },
+        },
+      },
+    }));
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "item/completed",
+      params: {
+        threadId: "child-thread",
+        turnId: "child-turn",
+        item: { type: "agentMessage", id: "child-final", text: "done", phase: "final_answer" },
+      },
+    }));
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "turn/completed",
+      params: { threadId: "child-thread", turn: { id: "child-turn", status: "completed" } },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const background = events.filter((event) => event.type === "background_task");
+    expect(background.filter((event) => event.type === "background_task" && event.phase === "started"))
+      .toHaveLength(1);
+    expect(background).toEqual([
+      expect.objectContaining({ taskId: "child-thread", phase: "started" }),
+      expect.objectContaining({
+        taskId: "child-thread",
+        phase: "progress",
+        description: "Inspect the provider lifecycle",
+      }),
+      expect.objectContaining({
+        taskId: "child-thread",
+        phase: "completed",
+        description: "Inspect the provider lifecycle",
+      }),
+    ]);
+  });
+
+  it("reconciles a reactivated child only against its authoritative foreign turn id", async () => {
+    const events: StreamEvent[] = [];
+    const { session, feed, writes } = makeDrivenSession({
+      onEvent: (event) => { events.push(event); },
+    });
+    (session as unknown as { _threadId: string | null })._threadId = "root-thread";
+
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "item/completed",
+      params: {
+        threadId: "root-thread",
+        turnId: "root-turn",
+        item: {
+          type: "collabAgentToolCall",
+          id: "spawn-call",
+          tool: "spawnAgent",
+          status: "completed",
+          senderThreadId: "root-thread",
+          receiverThreadIds: ["child-thread"],
+          prompt: "First task",
+          agentsStates: { "child-thread": { status: "completed", message: "FIRST_COMPLETE" } },
+        },
+      },
+    }));
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "turn/started",
+      params: { threadId: "child-thread", turn: { id: "child-turn-2" } },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const readRequests = writes
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .filter((message) => message["method"] === "thread/read");
+    expect(readRequests).toHaveLength(1);
+    feed(ndjson({
+      jsonrpc: "2.0",
+      id: readRequests[0]?.["id"],
+      result: {
+        thread: {
+          id: "child-thread",
+          status: { type: "notLoaded" },
+          turns: [{
+            id: "child-turn-1",
+            status: "completed",
+            error: null,
+            items: [{ type: "agentMessage", id: "first-final", text: "FIRST_COMPLETE", phase: "final_answer" }],
+          }],
+        },
+      },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(events.filter((event) => event.type === "background_task" && event.phase === "completed"))
+      .toHaveLength(1);
+    const internal = session as unknown as {
+      _backgroundTaskPollTimers: Map<string, { timer: ReturnType<typeof setTimeout>; resolve: () => void }>;
+    };
+    for (const [key, pending] of internal._backgroundTaskPollTimers) {
+      clearTimeout(pending.timer);
+      internal._backgroundTaskPollTimers.delete(key);
+      pending.resolve();
+    }
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const retriedReads = writes
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .filter((message) => message["method"] === "thread/read");
+    expect(retriedReads).toHaveLength(2);
+    feed(ndjson({
+      jsonrpc: "2.0",
+      id: retriedReads[1]?.["id"],
+      result: {
+        thread: {
+          id: "child-thread",
+          status: { type: "notLoaded" },
+          turns: [
+            {
+              id: "child-turn-1",
+              status: "completed",
+              error: null,
+              items: [{ type: "agentMessage", id: "first-final", text: "FIRST_COMPLETE", phase: "final_answer" }],
+            },
+            {
+              id: "child-turn-2",
+              status: "completed",
+              error: null,
+              items: [{ type: "agentMessage", id: "second-final", text: "SECOND_COMPLETE", phase: "final_answer" }],
+            },
+          ],
+        },
+      },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const background = events.filter((event) => event.type === "background_task");
+    expect(background.map((event) => event.type === "background_task" ? event.phase : null))
+      .toEqual(["started", "completed", "progress", "completed"]);
+    expect(background.filter((event) => event.type === "background_task" && event.phase === "completed"))
+      .toEqual([
+        expect.objectContaining({ summary: "FIRST_COMPLETE" }),
+        expect.objectContaining({ summary: "SECOND_COMPLETE", turnId: "child-turn-2" }),
+      ]);
+  });
+
+  it("maps a successful closeAgent with no agentsStates to stopped", async () => {
+    const events: StreamEvent[] = [];
+    const { session, feed } = makeDrivenSession({
+      onEvent: (event) => { events.push(event); },
+    });
+    (session as unknown as { _threadId: string | null })._threadId = "root-thread";
+
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "item/completed",
+      params: {
+        threadId: "root-thread",
+        turnId: "root-turn",
+        item: {
+          type: "collabAgentToolCall",
+          id: "spawn-call",
+          tool: "spawnAgent",
+          status: "completed",
+          senderThreadId: "root-thread",
+          receiverThreadIds: ["child-thread"],
+          prompt: "Long task",
+          agentsStates: {},
+        },
+      },
+    }));
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "item/completed",
+      params: {
+        threadId: "root-thread",
+        turnId: "root-turn",
+        item: {
+          type: "collabAgentToolCall",
+          id: "close-call",
+          tool: "closeAgent",
+          status: "completed",
+          senderThreadId: "root-thread",
+          receiverThreadIds: ["child-thread"],
+          prompt: null,
+          agentsStates: {},
+        },
+      },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(events.filter((event) => event.type === "background_task")).toEqual([
+      expect.objectContaining({ taskId: "child-thread", phase: "started", status: "running" }),
+      expect.objectContaining({ taskId: "child-thread", phase: "completed", status: "stopped" }),
+    ]);
+  });
+
+  it("closes active children and clears reconciliation state", async () => {
+    const events: StreamEvent[] = [];
+    const { session, feed, turnResult } = makeDrivenSession({
+      config: { graceSec: 0 },
+      onEvent: (event) => { events.push(event); },
+    });
+    void turnResult.catch(() => {});
+    (session as unknown as { _threadId: string | null })._threadId = "root-thread";
+
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "item/completed",
+      params: {
+        threadId: "root-thread",
+        turnId: "root-turn",
+        item: {
+          type: "collabAgentToolCall",
+          id: "spawn-call",
+          tool: "spawnAgent",
+          status: "completed",
+          senderThreadId: "root-thread",
+          receiverThreadIds: ["child-thread"],
+          prompt: "Long task",
+          agentsStates: {},
+        },
+      },
+    }));
+    await session.close();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(events.filter((event) => event.type === "background_task")).toEqual([
+      expect.objectContaining({ taskId: "child-thread", phase: "started", status: "running" }),
+      expect.objectContaining({
+        taskId: "child-thread",
+        phase: "completed",
+        status: "stopped",
+        summary: "Codex session closed",
+      }),
+    ]);
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "item/completed",
+      params: {
+        threadId: "root-thread",
+        turnId: "late-root-turn",
+        item: {
+          type: "collabAgentToolCall",
+          id: "late-resume",
+          tool: "resumeAgent",
+          status: "completed",
+          senderThreadId: "root-thread",
+          receiverThreadIds: ["child-thread"],
+          prompt: "Too late",
+          agentsStates: {},
+        },
+      },
+    }));
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "turn/started",
+      params: { threadId: "child-thread", turn: { id: "late-child-turn" } },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(events.filter((event) => event.type === "background_task")).toHaveLength(2);
+    const internal = session as unknown as {
+      _pendingRpc: Map<number, unknown>;
+      _backgroundTaskPollers: Map<string, unknown>;
+      _backgroundTaskPollTimers: Map<string, unknown>;
+    };
+    expect(internal._pendingRpc.size).toBe(0);
+    expect(internal._backgroundTaskPollers.size).toBe(0);
+    expect(internal._backgroundTaskPollTimers.size).toBe(0);
+  });
+
+  it("removes an ignored bounded thread/read request from the pending map", async () => {
+    const { session } = makeDrivenSession({});
+    const internal = session as unknown as {
+      boundedRpcRequest: (method: string, params: Record<string, unknown>, timeoutMs: number) => Promise<unknown>;
+      _pendingRpc: Map<number, unknown>;
+    };
+
+    const request = internal.boundedRpcRequest("thread/read", {
+      threadId: "missing-child",
+      includeTurns: true,
+    }, 5);
+    expect(internal._pendingRpc.size).toBe(1);
+    await expect(request).rejects.toThrow("thread/read timed out");
+    expect(internal._pendingRpc.size).toBe(0);
   });
 
   it("tracks fast and nested child threads without settling the root handle", async () => {

@@ -400,6 +400,74 @@ describe("parseCodexStreamLine — v2 JSON-RPC (codex --json app-server)", () =>
     },
   );
 
+  it("normalizes the Codex 0.144 collab spawn item into a running subagent", () => {
+    const line = JSON.stringify({
+      jsonrpc: "2.0",
+      method: "item/completed",
+      params: {
+        threadId: "root-thread",
+        turnId: "root-turn",
+        item: {
+          type: "collabAgentToolCall",
+          id: "spawn-call",
+          tool: "spawnAgent",
+          status: "completed",
+          senderThreadId: "root-thread",
+          receiverThreadIds: ["child-thread"],
+          prompt: "Run the lifecycle probe",
+          model: "gpt-5.5",
+          reasoningEffort: "medium",
+          agentsStates: {
+            "child-thread": { status: "pendingInit", message: null },
+          },
+        },
+      },
+    });
+
+    expect(parseCodexStreamLine(line)).toMatchObject({
+      type: "background_task",
+      taskId: "child-thread",
+      taskType: "subagent",
+      phase: "started",
+      status: "running",
+      description: "Run the lifecycle probe",
+      summary: null,
+      parentTaskId: null,
+      sessionId: "root-thread",
+      turnId: "root-turn",
+    });
+  });
+
+  it("uses terminal collab agent state when Codex includes it", () => {
+    const line = JSON.stringify({
+      jsonrpc: "2.0",
+      method: "item/completed",
+      params: {
+        threadId: "root-thread",
+        turnId: "root-turn",
+        item: {
+          type: "collabAgentToolCall",
+          id: "wait-call",
+          tool: "wait",
+          status: "completed",
+          senderThreadId: "root-thread",
+          receiverThreadIds: ["child-thread"],
+          agentsStates: {
+            "child-thread": { status: "completed", message: "CHILD_COMPLETE" },
+          },
+        },
+      },
+    });
+
+    expect(parseCodexStreamLine(line)).toMatchObject({
+      type: "background_task",
+      taskId: "child-thread",
+      phase: "completed",
+      status: "completed",
+      summary: "CHILD_COMPLETE",
+    });
+  });
+
   it("v2 item/completed reasoning emits a thinking event", () => {
     const line = JSON.stringify({
       jsonrpc: "2.0",

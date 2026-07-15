@@ -138,7 +138,18 @@ interface TrackedBackgroundTask {
   summary: string | null;
   parentTaskId: string | null;
   terminal: boolean;
+  generation: number;
+  activeTurnId: string | null;
 }
+
+interface CodexBackgroundTaskState {
+  terminal: boolean;
+  status: "running" | "completed" | "failed" | "stopped";
+  summary: string | null;
+}
+
+const BACKGROUND_TASK_POLL_INTERVAL_MS = 2_000;
+const BACKGROUND_TASK_READ_TIMEOUT_MS = 5_000;
 
 /** Identity latch for the root turn currently represented by this session. */
 interface ActiveTurnReady {
@@ -177,6 +188,32 @@ function asObj(parent: Record<string, unknown>, key: string): Record<string, unk
   return typeof v === "object" && v !== null && !Array.isArray(v)
     ? (v as Record<string, unknown>)
     : {};
+}
+
+function obj(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === "string" && entry.length > 0)
+    : [];
+}
+
+function codexAgentState(value: unknown): CodexBackgroundTaskState {
+  const state = obj(value);
+  const nativeStatus = str(state, "status");
+  const summary = str(state, "message") || null;
+  if (nativeStatus === "completed") return { terminal: true, status: "completed", summary };
+  if (nativeStatus === "errored" || nativeStatus === "notFound") {
+    return { terminal: true, status: "failed", summary };
+  }
+  if (nativeStatus === "interrupted" || nativeStatus === "shutdown") {
+    return { terminal: true, status: "stopped", summary };
+  }
+  return { terminal: false, status: "running", summary };
 }
 
 /** Discriminated incoming message from the Codex CLI. */
@@ -387,6 +424,16 @@ export class CodexSessionImpl implements AgentSession {
   /** Child-agent lifecycle is informational and never participates in root turn settlement. */
   private readonly _backgroundTasks = new Map<string, TrackedBackgroundTask>();
   private readonly _backgroundTaskIdsByPath = new Map<string, string>();
+  /** One protocol-native thread/read poller per child when Codex does not multiplex its notifications. */
+  private readonly _backgroundTaskPollers = new Map<string, {
+    generation: number;
+    promise: Promise<void>;
+  }>();
+  /** Cancellable retry delay for each poller. Cleared when the session closes. */
+  private readonly _backgroundTaskPollTimers = new Map<string, {
+    timer: ReturnType<typeof setTimeout>;
+    resolve: () => void;
+  }>();
 
   /**
    * Serial dispatch chain for `onEvent`. Each dispatched event appends a
@@ -456,7 +503,14 @@ export class CodexSessionImpl implements AgentSession {
     proc.on("exit", (code, signal) => {
       if (this._state !== "closed") {
         this._state = "closed";
-        const err = new Error(`Codex process exited unexpectedly (code=${code}, signal=${signal})`);
+        const message = `Codex process exited unexpectedly (code=${code}, signal=${signal})`;
+        this.finalizeActiveBackgroundTasks("failed", message, {
+          method: "process/exit",
+          code,
+          signal,
+        });
+        this.cancelBackgroundTaskPollTimers();
+        const err = new Error(message);
         this.rejectAllPending(err);
       }
     });
@@ -464,9 +518,41 @@ export class CodexSessionImpl implements AgentSession {
     proc.on("error", (err) => {
       if (this._state !== "closed") {
         this._state = "closed";
+        this.finalizeActiveBackgroundTasks("failed", err.message, {
+          method: "process/error",
+          message: err.message,
+        });
+        this.cancelBackgroundTaskPollTimers();
         this.rejectAllPending(err);
       }
     });
+  }
+
+  private cancelBackgroundTaskPollTimers(): void {
+    for (const pending of this._backgroundTaskPollTimers.values()) {
+      clearTimeout(pending.timer);
+      pending.resolve();
+    }
+    this._backgroundTaskPollTimers.clear();
+  }
+
+  private finalizeActiveBackgroundTasks(
+    status: "failed" | "stopped",
+    summary: string,
+    raw: Record<string, unknown>,
+  ): void {
+    for (const task of this._backgroundTasks.values()) {
+      if (task.terminal) continue;
+      this.dispatchEvent(this.backgroundTaskEvent(task.taskId, "completed", status, {
+        description: task.description,
+        summary,
+        parentTaskId: task.parentTaskId,
+        eventId: this._threadId
+          ? `codex:${this._threadId}:background-task:${task.taskId}:session-${status}:completed`
+          : null,
+        raw,
+      }));
+    }
   }
 
   /** Reject every pending send() Promise and outgoing JSON-RPC call. */
@@ -581,6 +667,35 @@ export class CodexSessionImpl implements AgentSession {
 
     return new Promise((resolve, reject) => {
       this._pendingRpc.set(id, { resolve, reject });
+    });
+  }
+
+  /** A bounded RPC whose pending-map entry is removed if Codex never replies. */
+  private boundedRpcRequest(
+    method: string,
+    params: Record<string, unknown>,
+    timeoutMs = BACKGROUND_TASK_READ_TIMEOUT_MS,
+  ): Promise<Record<string, unknown>> {
+    const id = this._nextId++;
+    this.proc.stdin!.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (!this._pendingRpc.delete(id)) return;
+        reject(new Error(`codex ${method} timed out`));
+      }, timeoutMs);
+      if (typeof timer.unref === "function") timer.unref();
+
+      this._pendingRpc.set(id, {
+        resolve: (result) => {
+          clearTimeout(timer);
+          resolve(result);
+        },
+        reject: (err) => {
+          clearTimeout(timer);
+          reject(err);
+        },
+      });
     });
   }
 
@@ -953,6 +1068,10 @@ export class CodexSessionImpl implements AgentSession {
   async close(): Promise<void> {
     if (this._state === "closed") return;
     this._state = "closed";
+    this.finalizeActiveBackgroundTasks("stopped", "Codex session closed", {
+      method: "session/closed",
+    });
+    this.cancelBackgroundTaskPollTimers();
     this.rejectAllPending(new Error("Codex session closed"));
 
     this.proc.stdin!.end();
@@ -1175,6 +1294,276 @@ export class CodexSessionImpl implements AgentSession {
     return null;
   }
 
+  private backgroundTaskEvent(
+    taskId: string,
+    phase: "started" | "progress" | "completed",
+    status: "running" | "completed" | "failed" | "stopped",
+    options: {
+      description?: string | null;
+      summary?: string | null;
+      parentTaskId?: string | null;
+      turnId?: string | null;
+      eventId?: string | null;
+      raw: Record<string, unknown>;
+    },
+  ): Extract<StreamEvent, { type: "background_task" }> {
+    const rootThreadId = this._threadId ?? this._expectedThreadId;
+    return {
+      type: "background_task",
+      taskId,
+      taskType: "subagent",
+      phase,
+      status,
+      description: options.description ?? null,
+      summary: options.summary ?? null,
+      parentTaskId: options.parentTaskId ?? null,
+      timestamp: new Date().toISOString(),
+      providerType: "codex",
+      sessionId: rootThreadId,
+      messageId: null,
+      eventId: options.eventId ?? null,
+      turnId: options.turnId ?? null,
+      parentToolCallId: null,
+      raw: options.raw,
+    };
+  }
+
+  private reconciledBackgroundTaskRaw(
+    threadId: string,
+    turn: Record<string, unknown> | null,
+  ): Record<string, unknown> {
+    const error = turn ? str(asObj(turn, "error"), "message") || null : null;
+    return {
+      method: "thread/read",
+      reconciled: true,
+      threadId,
+      turnId: turn ? str(turn, "id") || null : null,
+      status: turn ? str(turn, "status") || null : null,
+      error,
+    };
+  }
+
+  /**
+   * Codex 0.144+ represents collaboration as a root collabAgentToolCall item.
+   * A completed spawn call only means the child was created. Register every
+   * receiver and then follow the child thread itself for the real terminus.
+   */
+  private handleCollabAgentToolCall(
+    item: Record<string, unknown>,
+    raw: Record<string, unknown>,
+    parentTaskId: string | null,
+  ): void {
+    if (this._state === "closed" || !this.ctx.onEvent) return;
+
+    const tool = str(item, "tool");
+    const states = asObj(item, "agentsStates");
+    const receiverIds = stringArray(item["receiverThreadIds"]);
+    const taskIds = [...new Set([...receiverIds, ...Object.keys(states)])];
+    const canStart = tool === "spawnAgent";
+    const metadataOnly = tool === "resumeAgent" || tool === "sendInput";
+    const canStopWithoutState = tool === "closeAgent" && str(item, "status") === "completed";
+
+    for (const taskId of taskIds) {
+      let previous = this._backgroundTasks.get(taskId);
+      const description = str(item, "prompt") || previous?.description || null;
+      const resolvedParentTaskId = previous?.parentTaskId ?? parentTaskId;
+
+      // The child thread's own turn/started notification is the only
+      // authoritative reactivation edge. Root resume/send calls can arrive
+      // before or after that child turn, so they only enrich an active task.
+      if (metadataOnly) {
+        if (!previous || previous.terminal) continue;
+        if (description && description !== previous.description) {
+          this.dispatchEvent(this.backgroundTaskEvent(taskId, "progress", "running", {
+            description,
+            summary: previous.summary,
+            parentTaskId: resolvedParentTaskId,
+            eventId: this._threadId
+              ? `codex:${this._threadId}:background-task:${taskId}:${str(item, "id") || "metadata"}:progress`
+              : null,
+            raw,
+          }));
+        }
+        continue;
+      }
+
+      if (!previous && !canStart) continue;
+      if (!canStart && !canStopWithoutState && !(taskId in states)) continue;
+
+      const hasState = taskId in states;
+      const state = !hasState && tool === "closeAgent" && str(item, "status") === "completed"
+        ? { terminal: true, status: "stopped" as const, summary: null }
+        : codexAgentState(states[taskId]);
+
+      if (!previous) {
+        this.dispatchEvent(this.backgroundTaskEvent(taskId, "started", "running", {
+          description,
+          summary: null,
+          parentTaskId: resolvedParentTaskId,
+          eventId: this._threadId
+            ? `codex:${this._threadId}:background-task:${taskId}:started`
+            : null,
+          raw,
+        }));
+        previous = this._backgroundTasks.get(taskId);
+      } else if (previous.terminal) {
+        continue;
+      } else if (description && description !== previous.description) {
+        // thread/started can beat the richer root collab item. Preserve one
+        // start edge, then publish the prompt as ordinary progress metadata.
+        this.dispatchEvent(this.backgroundTaskEvent(taskId, "progress", "running", {
+          description,
+          summary: previous.summary,
+          parentTaskId: resolvedParentTaskId,
+          eventId: this._threadId
+            ? `codex:${this._threadId}:background-task:${taskId}:${str(item, "id") || "metadata"}:progress`
+            : null,
+          raw,
+        }));
+      }
+
+      if (state.terminal) {
+        this.dispatchEvent(this.backgroundTaskEvent(taskId, "completed", state.status, {
+          description,
+          summary: state.summary,
+          parentTaskId: resolvedParentTaskId,
+          eventId: this._threadId
+            ? `codex:${this._threadId}:background-task:${taskId}:${str(item, "id") || "state"}:completed`
+            : null,
+          raw,
+        }));
+      } else {
+        this.startBackgroundTaskPoller(taskId);
+      }
+    }
+  }
+
+  private waitForBackgroundTaskPoll(pollKey: string): Promise<void> {
+    if (this._state === "closed") return Promise.resolve();
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this._backgroundTaskPollTimers.delete(pollKey);
+        resolve();
+      }, BACKGROUND_TASK_POLL_INTERVAL_MS);
+      if (typeof timer.unref === "function") timer.unref();
+      this._backgroundTaskPollTimers.set(pollKey, { timer, resolve });
+    });
+  }
+
+  private startBackgroundTaskPoller(taskId: string): void {
+    if (this._state === "closed") return;
+    const task = this._backgroundTasks.get(taskId);
+    if (!task || task.terminal) return;
+    const existing = this._backgroundTaskPollers.get(taskId);
+    if (existing?.generation === task.generation) return;
+
+    const generation = task.generation;
+    const pollKey = `${taskId}:${generation}`;
+    let poller!: Promise<void>;
+    poller = this.pollBackgroundTask(taskId, generation, pollKey).finally(() => {
+      if (this._backgroundTaskPollers.get(taskId)?.promise === poller) {
+        this._backgroundTaskPollers.delete(taskId);
+      }
+      const pending = this._backgroundTaskPollTimers.get(pollKey);
+      if (pending) clearTimeout(pending.timer);
+      this._backgroundTaskPollTimers.delete(pollKey);
+    });
+    this._backgroundTaskPollers.set(taskId, { generation, promise: poller });
+  }
+
+  private async pollBackgroundTask(
+    taskId: string,
+    generation: number,
+    pollKey: string,
+  ): Promise<void> {
+    while (this._state !== "closed") {
+      const task = this._backgroundTasks.get(taskId);
+      if (!task || task.generation !== generation || task.terminal) return;
+
+      try {
+        const response = await this.boundedRpcRequest("thread/read", {
+          threadId: taskId,
+          includeTurns: true,
+        });
+        if (this.observeBackgroundTaskThread(response, taskId, generation)) return;
+      } catch {
+        // A child can briefly be pendingInit before thread/read can load it.
+      }
+
+      const current = this._backgroundTasks.get(taskId);
+      if (!current || current.generation !== generation || current.terminal) return;
+      await this.waitForBackgroundTaskPoll(pollKey);
+    }
+  }
+
+  /** Return true once thread/read proves that the child's latest turn ended. */
+  private observeBackgroundTaskThread(
+    response: Record<string, unknown>,
+    taskId: string,
+    generation: number,
+  ): boolean {
+    const task = this._backgroundTasks.get(taskId);
+    if (!task || task.generation !== generation || task.terminal) return true;
+
+    const thread = asObj(response, "thread");
+    const turns = Array.isArray(thread["turns"])
+      ? thread["turns"].map(obj)
+      : [];
+
+    const latestTurn = turns[turns.length - 1];
+    if (!latestTurn) {
+      const threadStatus = str(asObj(thread, "status"), "type");
+      if (threadStatus !== "systemError") return false;
+      const failureTurn = { status: "systemError", error: { message: "Subagent failed to initialize" } };
+      this.dispatchEvent(this.backgroundTaskEvent(taskId, "completed", "failed", {
+        description: task.description,
+        summary: "Subagent failed to initialize",
+        parentTaskId: task.parentTaskId,
+        eventId: this._threadId
+          ? `codex:${this._threadId}:background-task:${taskId}:system-error:completed`
+          : null,
+        raw: this.reconciledBackgroundTaskRaw(taskId, failureTurn),
+      }));
+      return true;
+    }
+
+    const nativeStatus = str(latestTurn, "status");
+    if (nativeStatus === "inProgress" || !nativeStatus) return false;
+
+    const turnId = str(latestTurn, "id") || null;
+    // The child turn/started notification is authoritative for a reactivated
+    // generation. thread/read can briefly lag and still end at an older turn.
+    if (task.activeTurnId && turnId !== task.activeTurnId) return false;
+
+    const items = Array.isArray(latestTurn["items"])
+      ? latestTurn["items"].map(obj)
+      : [];
+    let summary: string | null = null;
+    for (let index = items.length - 1; index >= 0; index--) {
+      const item = items[index]!;
+      if (str(item, "type") !== "agentMessage") continue;
+      summary = this.agentMessageText(item);
+      if (summary) break;
+    }
+    const errorMessage = str(asObj(latestTurn, "error"), "message") || null;
+    const status = nativeStatus === "failed"
+      ? "failed"
+      : nativeStatus === "interrupted" || nativeStatus === "cancelled"
+        ? "stopped"
+        : "completed";
+    this.dispatchEvent(this.backgroundTaskEvent(taskId, "completed", status, {
+      description: task.description,
+      summary: summary ?? errorMessage,
+      parentTaskId: task.parentTaskId,
+      turnId,
+      eventId: this._threadId && turnId
+        ? `codex:${this._threadId}:background-task:${taskId}:${turnId}:completed`
+        : null,
+      raw: this.reconciledBackgroundTaskRaw(taskId, latestTurn),
+    }));
+    return true;
+  }
+
   /**
    * Maintain just enough child metadata to turn a later foreign-thread
    * terminal notification into one provider-neutral task event. This reducer
@@ -1188,6 +1577,9 @@ export class CodexSessionImpl implements AgentSession {
     // a task that already reached a terminal state. A later child turn/started
     // explicitly reactivates the record below in handleForeignNotification.
     if (previous?.terminal) return false;
+    // collabAgentToolCall and child thread/started can both announce the same
+    // spawn. The first edge is sufficient and gives hosts one durable start.
+    if (previous && event.phase === "started") return false;
 
     const description = event.description ?? previous?.description ?? null;
     const summary = event.summary ?? previous?.summary ?? null;
@@ -1205,6 +1597,10 @@ export class CodexSessionImpl implements AgentSession {
       summary,
       parentTaskId,
       terminal: event.phase === "completed",
+      generation: previous?.generation ?? 0,
+      activeTurnId: event.phase === "completed"
+        ? null
+        : event.turnId ?? previous?.activeTurnId ?? null,
     });
     if (description) this._backgroundTaskIdsByPath.set(description, event.taskId);
     return true;
@@ -1265,6 +1661,7 @@ export class CodexSessionImpl implements AgentSession {
         parentToolCallId: null,
         raw: parseJson(rawLine) ?? params,
       });
+      this.startBackgroundTaskPoller(childThreadId);
       return;
     }
 
@@ -1275,6 +1672,7 @@ export class CodexSessionImpl implements AgentSession {
       if (!task.terminal) return;
       task.terminal = false;
       task.summary = null;
+      task.generation += 1;
       const turn = asObj(params, "turn");
       const turnId = str(turn, "id") || str(params, "turnId") || null;
       const rootThreadId = this._threadId ?? this._expectedThreadId;
@@ -1298,12 +1696,17 @@ export class CodexSessionImpl implements AgentSession {
         parentToolCallId: null,
         raw: parseJson(rawLine) ?? params,
       });
+      this.startBackgroundTaskPoller(childThreadId);
       return;
     }
 
     if (method === "item/completed") {
       const item = asObj(params, "item");
       const itemType = str(item, "type");
+      if (itemType === "collabAgentToolCall") {
+        this.handleCollabAgentToolCall(item, parseJson(rawLine) ?? params, childThreadId);
+        return;
+      }
       if ((itemType === "agentMessage" || itemType === "agent_message") && str(item, "phase") !== "commentary") {
         const summary = this.agentMessageText(item);
         if (summary) task.summary = summary;
@@ -1344,11 +1747,19 @@ export class CodexSessionImpl implements AgentSession {
         : null,
       turnId,
       parentToolCallId: null,
-      raw: parseJson(rawLine) ?? params,
+      raw: {
+        method,
+        reconciled: false,
+        threadId: childThreadId,
+        turnId,
+        status: nativeStatus || null,
+        error: errorMessage || null,
+      },
     });
   }
 
   private handleNotification(method: string, params: Record<string, unknown>, rawLine: string): void {
+    if (this._state === "closed") return;
     // codex/event — legacy wrapper
     if (method === "codex/event") {
       const innerMsg = str(params, "msg");
@@ -1394,6 +1805,11 @@ export class CodexSessionImpl implements AgentSession {
     if (method === "item/completed") {
       this._state = "thinking";
       this.extractSummaryFromItem(params);
+      const item = asObj(params, "item");
+      if (str(item, "type") === "collabAgentToolCall") {
+        this.handleCollabAgentToolCall(item, parseJson(rawLine) ?? params, null);
+        return;
+      }
       this.emitStreamEvent(rawLine);
       return;
     }
@@ -1434,6 +1850,7 @@ export class CodexSessionImpl implements AgentSession {
   // -------------------------------------------------------------------------
 
   private handleLegacyEvent(event: Record<string, unknown>, rawLine: string): void {
+    if (this._state === "closed") return;
     const type = str(event, "type");
     const eventThreadId =
       str(event, "thread_id") || str(event, "threadId") || str(event, "session_id") || null;
