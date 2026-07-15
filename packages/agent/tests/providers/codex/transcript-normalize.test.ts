@@ -24,13 +24,47 @@ describe("codexLineToStreamEvents — §5.4 mapping table", () => {
         mk({
           type: "response_item",
           timestamp: "2026-05-08T22:01:59.250Z",
-          payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "hi there" }] },
+          payload: {
+            type: "message",
+            role: "assistant",
+            phase: "final_answer",
+            content: [{ type: "output_text", text: "hi there" }],
+          },
         }),
         CTX,
       ),
     );
     expect(ev.type).toBe("assistant");
-    if (ev.type === "assistant") expect(ev.text).toBe("hi there");
+    if (ev.type === "assistant") {
+      expect(ev.text).toBe("hi there");
+      expect(ev.phase).toBe("final_answer");
+    }
+  });
+
+  it("response_item/message preserves commentary and omits unknown phases", () => {
+    const commentary = only(codexLineToStreamEvents(mk({
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "assistant",
+        phase: "commentary",
+        content: [{ type: "output_text", text: "still working" }],
+      },
+    }), CTX));
+    expect(commentary.type).toBe("assistant");
+    if (commentary.type === "assistant") expect(commentary.phase).toBe("commentary");
+
+    const unknown = only(codexLineToStreamEvents(mk({
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "assistant",
+        phase: "future_phase",
+        content: [{ type: "output_text", text: "text" }],
+      },
+    }), CTX));
+    expect(unknown.type).toBe("assistant");
+    if (unknown.type === "assistant") expect(unknown).not.toHaveProperty("phase");
   });
 
   it("response_item/message (user|developer) → [] (dropped)", () => {

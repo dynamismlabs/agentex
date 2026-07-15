@@ -307,9 +307,16 @@ export { codexGoalCapability } from "./goal-capability.js";
 
 export class CodexSessionImpl implements AgentSession {
   private _state: SessionState = "idle";
+  /**
+   * The root thread represented by this AgentSession. Codex app-server also
+   * reports child-agent threads on the same stdout connection, so this id is
+   * pinned once discovered and must never be promoted to a child thread.
+   */
   private _threadId: string | null = null;
   /** Thread id to resume (from ctx.sessionParams); null starts a fresh thread. */
   private readonly _resumeThreadId: string | null;
+  /** Expected root during handshake, cleared when resume falls back to fresh. */
+  private _expectedThreadId: string | null;
   private _lineBuffer = "";
   private _nextId = 1;
 
@@ -366,6 +373,7 @@ export class CodexSessionImpl implements AgentSession {
     private readonly instructions: string | null,
   ) {
     this._resumeThreadId = readCodexResumeId(ctx.sessionParams);
+    this._expectedThreadId = this._resumeThreadId;
 
     this._goals = new GoalController({
       providerType: "codex",
@@ -527,12 +535,18 @@ export class CodexSessionImpl implements AgentSession {
         // thread/resume may echo the thread back or return {}; fall back to the
         // id we resumed with so `sessionId` is always populated.
         this._threadId = str(thread, "id") || str(thread, "sessionId") || this._resumeThreadId;
+        this._expectedThreadId = this._threadId;
         // Rehydrate a durable Codex goal so getGoal() reflects it immediately
         // (goals live in SQLite, not the transcript, so a resumed thread would
         // otherwise report null until the next goal notification).
         await this.hydrateGoalFromThread();
         return;
       } catch (err) {
+        // A failed resume can emit thread/started before its error response.
+        // Clear that provisional identity so the fresh thread's init event is
+        // accepted instead of being mistaken for a foreign child thread.
+        if (this._threadId === this._expectedThreadId) this._threadId = null;
+        this._expectedThreadId = null;
         // The thread is unknown to this codex install (different machine, pruned
         // history). Don't fail the whole session — fall back to a fresh thread
         // and surface the downgrade on stderr. The new id flows back out via
@@ -586,6 +600,7 @@ export class CodexSessionImpl implements AgentSession {
     // codex-cli 0.130.0+ shape: { thread: { id, sessionId, ... }, model, ... }
     const thread = asObj(res, "thread");
     this._threadId = str(thread, "id") || str(thread, "sessionId") || null;
+    this._expectedThreadId = this._threadId;
   }
 
   // -------------------------------------------------------------------------
@@ -971,6 +986,23 @@ export class CodexSessionImpl implements AgentSession {
   // Notification handling (v2 format)
   // -------------------------------------------------------------------------
 
+  /** Extract the thread scope carried by a v2 app-server notification. */
+  private notificationThreadId(params: Record<string, unknown>): string | null {
+    const thread = asObj(params, "thread");
+    return str(params, "threadId") || str(thread, "id") || str(thread, "sessionId") || null;
+  }
+
+  /**
+   * Whether an explicitly-scoped event belongs to another app-server thread.
+   * `_expectedThreadId` protects the resume handshake window before `_threadId`
+   * has been populated and is cleared if resume falls back to a fresh thread.
+   * Unscoped global notifications remain eligible.
+   */
+  private isForeignThread(threadId: string | null): boolean {
+    const rootThreadId = this._threadId ?? this._expectedThreadId;
+    return !!threadId && !!rootThreadId && threadId !== rootThreadId;
+  }
+
   private handleNotification(method: string, params: Record<string, unknown>, rawLine: string): void {
     // codex/event — legacy wrapper
     if (method === "codex/event") {
@@ -983,11 +1015,17 @@ export class CodexSessionImpl implements AgentSession {
       return;
     }
 
+    // One Codex app-server connection multiplexes notifications for the root
+    // thread and any child agents it spawns. An AgentSession represents only
+    // its root thread, so foreign items must not change root state/summary and,
+    // most importantly, a child turn/completed must not resolve the root send.
+    const notificationThreadId = this.notificationThreadId(params);
+    if (this.isForeignThread(notificationThreadId)) return;
+
     // Map v2 notification methods to processing
     if (method === "thread/started") {
       // codex-cli 0.130.0+ shape: { thread: { id, sessionId, ... } }
-      const thread = asObj(params, "thread");
-      this._threadId = str(thread, "id") || str(thread, "sessionId") || this._threadId;
+      if (!this._threadId) this._threadId = notificationThreadId;
       this.emitStreamEvent(rawLine);
       return;
     }
@@ -1041,9 +1079,15 @@ export class CodexSessionImpl implements AgentSession {
 
   private handleLegacyEvent(event: Record<string, unknown>, rawLine: string): void {
     const type = str(event, "type");
+    const eventThreadId =
+      str(event, "thread_id") || str(event, "threadId") || str(event, "session_id") || null;
+
+    // Older NDJSON-shaped events can also carry explicit thread scope. Keep
+    // the same root-only invariant when that scope is available.
+    if (this.isForeignThread(eventThreadId)) return;
 
     if (type === "thread.started") {
-      this._threadId = str(event, "thread_id") || this._threadId;
+      if (!this._threadId) this._threadId = eventThreadId;
       this.emitStreamEvent(rawLine);
       return;
     }
@@ -1092,6 +1136,11 @@ export class CodexSessionImpl implements AgentSession {
     // `agent_message`. Accept both or v2 turns return a null TurnResult.summary.
     const itemType = str(item, "type");
     if (itemType !== "agent_message" && itemType !== "agentMessage") return;
+
+    // Commentary is progress, not the terminal answer. Keep phase-absent
+    // legacy events as a compatibility fallback, while known final_answer
+    // items remain eligible for TurnResult.summary.
+    if (str(item, "phase") === "commentary") return;
 
     // Direct text (Codex 0.30+)
     const directText = str(item, "text");
@@ -1280,8 +1329,9 @@ export class CodexSessionImpl implements AgentSession {
     // share an id; the last write wins. It also does NOT match the transcript
     // reader's `codex:<sessionId>:<offset>` scheme (different wire vocabulary
     // on disk) — cross-shape dedup remains a host concern.
-    if (!event.eventId && this._threadId && event.turnId && event.messageId) {
-      event.eventId = `codex:${this._threadId}:${event.turnId}:${event.messageId}:${event.type}`;
+    const eventThreadId = event.sessionId ?? this._threadId;
+    if (!event.eventId && eventThreadId && event.turnId && event.messageId) {
+      event.eventId = `codex:${eventThreadId}:${event.turnId}:${event.messageId}:${event.type}`;
     }
     // Enrich synchronously (in stream order) so tool_result events carry the
     // name of the tool_call they answer.

@@ -53,6 +53,10 @@ function asNullableNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+function asMessagePhase(value: unknown): "commentary" | "final_answer" | undefined {
+  return value === "commentary" || value === "final_answer" ? value : undefined;
+}
+
 function parseObject(value: unknown): Record<string, unknown> {
   if (typeof value === "object" && value !== null && !Array.isArray(value)) {
     return value as Record<string, unknown>;
@@ -333,10 +337,11 @@ function parseV2Notification(event: Record<string, unknown>): StreamEvent | null
       asNullableString(item["id"]) ??
       asNullableString(item["call_id"]);
     const base = makeBase(itemId);
+    const isCommandExecution = itemType === "command_execution" || itemType === "commandExecution";
 
     // Tool starts — emit tool_call on item/started only.
     if (method === "item/started") {
-      if (itemType === "command_execution") {
+      if (isCommandExecution) {
         return {
           type: "tool_call",
           toolCallId: itemId,
@@ -359,14 +364,15 @@ function parseV2Notification(event: Record<string, unknown>): StreamEvent | null
     }
 
     // item/completed — emit the terminal event for each item type.
-    if (itemType === "command_execution") {
-      const exitCode = asNullableNumber(item["exit_code"]);
+    if (isCommandExecution) {
+      const exitCode = asNullableNumber(item["exit_code"] ?? item["exitCode"]);
+      const status = asString(item["status"], "");
       return {
         type: "tool_result",
         toolCallId: itemId,
         toolName: "command_execution",
-        content: asString(item["aggregated_output"], ""),
-        isError: exitCode !== null && exitCode !== 0,
+        content: asString(item["aggregated_output"], asString(item["aggregatedOutput"], "")),
+        isError: status === "failed" || status === "declined" || (exitCode !== null && exitCode !== 0),
         exitCode,
         ...base,
       };
@@ -386,9 +392,11 @@ function parseV2Notification(event: Record<string, unknown>): StreamEvent | null
     if (itemType === "agentMessage") {
       const directText = asString(item["text"], "");
       if (directText || directText === "") {
+        const phase = asMessagePhase(item["phase"]);
         return {
           type: "assistant",
           text: directText,
+          ...(phase ? { phase } : {}),
           ...base,
         };
       }
@@ -575,11 +583,13 @@ function parseNdjsonEvent(
       };
     }
     if (itemType === "agent_message") {
+      const phase = asMessagePhase(item["phase"]);
       const directText = asString(item["text"], "");
       if (directText) {
         return {
           type: "assistant",
           text: directText,
+          ...(phase ? { phase } : {}),
           ...base,
         };
       }
@@ -591,6 +601,7 @@ function parseNdjsonEvent(
           return {
             type: "assistant",
             text: asString(block["text"], ""),
+            ...(phase ? { phase } : {}),
             ...base,
           };
         }

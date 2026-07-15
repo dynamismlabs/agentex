@@ -232,6 +232,7 @@ describe("parseCodexStreamLine", () => {
       type: "item.completed",
       item: {
         type: "agent_message",
+        phase: "commentary",
         content: [{ type: "output_text", text: "Done." }],
       },
     });
@@ -240,6 +241,7 @@ describe("parseCodexStreamLine", () => {
     expect(event!.type).toBe("assistant");
     if (event?.type === "assistant") {
       expect(event.text).toBe("Done.");
+      expect(event.phase).toBe("commentary");
     }
   });
 
@@ -333,10 +335,31 @@ describe("parseCodexStreamLine — v2 JSON-RPC (codex --json app-server)", () =>
     expect(event!.type).toBe("assistant");
     if (event?.type === "assistant") {
       expect(event.text).toBe("Hello");
+      expect(event.phase).toBe("final_answer");
       expect(event.sessionId).toBe("thread-uuid");
       expect(event.turnId).toBe("turn-uuid");
       expect(event.messageId).toBe("msg_abc123");
     }
+  });
+
+  it("v2 agentMessage preserves commentary and omits unknown phases", () => {
+    const make = (phase: unknown) => parseCodexStreamLine(JSON.stringify({
+      jsonrpc: "2.0",
+      method: "item/completed",
+      params: {
+        threadId: "thread-uuid",
+        turnId: "turn-uuid",
+        item: { type: "agentMessage", id: "msg_1", text: "update", phase },
+      },
+    }));
+
+    const commentary = make("commentary");
+    expect(commentary?.type).toBe("assistant");
+    if (commentary?.type === "assistant") expect(commentary.phase).toBe("commentary");
+
+    const unknown = make("future_phase");
+    expect(unknown?.type).toBe("assistant");
+    if (unknown?.type === "assistant") expect(unknown).not.toHaveProperty("phase");
   });
 
   it("v2 item/completed reasoning emits a thinking event", () => {
@@ -392,7 +415,7 @@ describe("parseCodexStreamLine — v2 JSON-RPC (codex --json app-server)", () =>
     }
   });
 
-  it("v2 item/started command_execution emits tool_call with turnId", () => {
+  it("v2 item/started current commandExecution emits tool_call with turnId", () => {
     const line = JSON.stringify({
       jsonrpc: "2.0",
       method: "item/started",
@@ -400,7 +423,7 @@ describe("parseCodexStreamLine — v2 JSON-RPC (codex --json app-server)", () =>
         threadId: "t1",
         turnId: "turn-xyz",
         item: {
-          type: "command_execution",
+          type: "commandExecution",
           id: "call_1",
           command: "echo hi",
         },
@@ -414,6 +437,34 @@ describe("parseCodexStreamLine — v2 JSON-RPC (codex --json app-server)", () =>
       expect(event.name).toBe("command_execution");
       expect(event.input).toBe("echo hi");
       expect(event.turnId).toBe("turn-xyz");
+    }
+  });
+
+  it("v2 item/completed current commandExecution maps camelCase output fields", () => {
+    const line = JSON.stringify({
+      jsonrpc: "2.0",
+      method: "item/completed",
+      params: {
+        threadId: "t1",
+        turnId: "turn-xyz",
+        item: {
+          type: "commandExecution",
+          id: "call_1",
+          command: "false",
+          status: "failed",
+          aggregatedOutput: "command failed",
+          exitCode: 1,
+        },
+      },
+    });
+    const event = parseCodexStreamLine(line);
+    expect(event?.type).toBe("tool_result");
+    if (event?.type === "tool_result") {
+      expect(event.toolCallId).toBe("call_1");
+      expect(event.toolName).toBe("command_execution");
+      expect(event.content).toBe("command failed");
+      expect(event.exitCode).toBe(1);
+      expect(event.isError).toBe(true);
     }
   });
 

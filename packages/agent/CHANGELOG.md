@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.0.32 — Codex root-thread completion isolation
+
+### Fixed
+
+- Codex live sessions now pin their root thread and ignore notifications from
+  child-agent threads multiplexed over the same app-server connection. A child
+  `turn/completed`, `turn/failed`, or item event can no longer resolve the root
+  send, set the root session idle, overwrite its summary, or replace its
+  resumable thread id.
+- Codex assistant events now preserve the optional `commentary` and
+  `final_answer` phase in live, transcript, and local-history normalization. Known
+  commentary items remain progress events and are no longer reused as the
+  synthesized terminal result summary.
+- Current app-server `commandExecution` items and their camelCase output fields
+  now normalize to the existing `tool_call` and `tool_result` event shapes.
+- Live Codex event identity prefers the event's own thread scope while retaining
+  the pinned root id as a compatibility fallback for older unscoped events.
+
+### Compatibility
+
+- Unscoped global Codex notifications continue to flow through. The documented
+  concurrent-send behavior is unchanged: coalesced root sends still share the
+  same root `TurnResult`.
+- Other provider transports and completion semantics are unchanged.
+
 ## 0.0.31 — OpenCode saved history import and synchronization
 
 ### Added

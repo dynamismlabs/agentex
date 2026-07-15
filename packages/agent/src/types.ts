@@ -1037,7 +1037,12 @@ export type StreamEvent =
       slashCommands?: string[];
       skills?: string[];
     } & BaseStreamEventFields)
-  | ({ type: "assistant"; text: string } & BaseStreamEventFields)
+  | ({
+      type: "assistant";
+      text: string;
+      /** Codex message role within a turn. Omitted by other providers and older wire formats. */
+      phase?: "commentary" | "final_answer";
+    } & BaseStreamEventFields)
   | ({
       /**
        * Incremental assistant text (typewriter). Only emitted when

@@ -373,7 +373,7 @@ interface BaseStreamEventFields {
 Variants:
 
 - `system` — Session init (`subtype`, `model`, `cwd`, `tools`, `permissionMode`). Claude init events also include `slashCommands?: string[]` and `skills?: string[]` when Claude Code reports them.
-- `assistant` — Text output from the agent (`text`)
+- `assistant` — Text output from the agent (`text`). Codex also includes an optional `phase: "commentary" | "final_answer"` so progress updates can be distinguished from the terminal answer.
 - `assistant_delta` — Incremental assistant text for typewriter UIs (`text`, `blockIndex`). Opt-in via `config.includePartialMessages` (claude). Purely additive: the consolidated `assistant` event still fires when the block completes, with a matching `messageId` so you can reconcile optimistic delta text against the durable event.
 - `thinking` — Agent's internal reasoning (`text`)
 - `thinking_delta` — Incremental thinking text (`text`, `blockIndex`), same flag, best-effort. On current Claude versions these deltas are the *only* place thinking prose appears — the consolidated thinking block is withheld (signature-only). Treat as advisory UI sugar.

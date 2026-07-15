@@ -136,6 +136,7 @@ describe("provider local history", () => {
         payload: {
           type: "message",
           role: "assistant",
+          phase: "final_answer",
           content: [{ type: "output_text", text: "Codex history is ready." }],
         },
       },
@@ -253,6 +254,7 @@ describe("provider local history", () => {
     expect(first.map((value) => value.event.type)).toEqual(["user", "assistant", "result"]);
     expect(first.map(identity)).toEqual(second.map(identity));
     expect(first.every((value) => value.event.eventId.startsWith(`codex:${CODEX_ID}:`))).toBe(true);
+    expect(first[1]!.event).toMatchObject({ type: "assistant", phase: "final_answer" });
   });
 
   it("resumes local reads only after a committed source-line boundary", async () => {
@@ -311,6 +313,7 @@ describe("provider local history", () => {
       {
         type: "message",
         role: "assistant",
+        phase: "commentary",
         content: [{ type: "output_text", text: "I will read the file." }],
       },
       {
@@ -338,6 +341,7 @@ describe("provider local history", () => {
       "tool_call",
       "tool_result",
     ]);
+    expect(events[1]!.event).toMatchObject({ type: "assistant", phase: "commentary" });
     expect(events[2]!.event).toMatchObject({
       type: "tool_call",
       toolCallId: "legacy-call",

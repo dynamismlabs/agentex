@@ -61,7 +61,13 @@ function mapLine(line: CodexTranscriptLine, sessionId: string | null): StreamEve
       // Only assistant messages surface; developer/user messages are
       // system-prompt material we don't replay.
       if (payload["role"] !== "assistant") return [];
-      return [{ type: "assistant", text: extractMessageText(payload["content"]) ?? "", ...base }];
+      const phase = messagePhase(payload["phase"]);
+      return [{
+        type: "assistant",
+        text: extractMessageText(payload["content"]) ?? "",
+        ...(phase ? { phase } : {}),
+        ...base,
+      }];
     }
 
     if (innerType === "reasoning") {
@@ -127,6 +133,10 @@ function mapLine(line: CodexTranscriptLine, sessionId: string | null): StreamEve
 /** Non-empty string or null. */
 function str(v: unknown): string | null {
   return typeof v === "string" && v.length > 0 ? v : null;
+}
+
+function messagePhase(v: unknown): "commentary" | "final_answer" | undefined {
+  return v === "commentary" || v === "final_answer" ? v : undefined;
 }
 
 /**

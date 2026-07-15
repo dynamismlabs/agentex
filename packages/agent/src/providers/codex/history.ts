@@ -246,7 +246,9 @@ function legacyCodexEvents(
   const base = baseFields(session, line, eventId);
   if (line.type === "message" && line.raw["role"] === "assistant") {
     const text = textFromContent(line.raw["content"], new Set(["text", "output_text"]));
-    return text ? [{ type: "assistant", text, ...base }] : [];
+    const rawPhase = line.raw["phase"];
+    const phase = rawPhase === "commentary" || rawPhase === "final_answer" ? rawPhase : undefined;
+    return text ? [{ type: "assistant", text, ...(phase ? { phase } : {}), ...base }] : [];
   }
   if (line.type === "reasoning") {
     const text = textFromContent(line.raw["summary"] ?? line.raw["content"], new Set(["text", "summary_text"]));

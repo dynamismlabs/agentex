@@ -62,6 +62,123 @@ function ndjson(obj: Record<string, unknown>): string {
 }
 
 describe("CodexSession — onEvent dispatch", () => {
+  it("keeps child-agent notifications isolated from the root turn", async () => {
+    const events: StreamEvent[] = [];
+    const { session, feed, turnResult } = makeDrivenSession({
+      onEvent: (event) => { events.push(event); },
+    });
+    const internal = session as unknown as {
+      _threadId: string | null;
+      _state: string;
+      _turnSummary: string | null;
+    };
+    internal._threadId = "root-thread";
+
+    let settled = false;
+    void turnResult.then(() => { settled = true; });
+
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "thread/started",
+      params: { thread: { id: "child-thread", parentThreadId: "root-thread" } },
+    }));
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "item/started",
+      params: {
+        threadId: "child-thread",
+        turnId: "child-turn",
+        item: { type: "commandExecution", id: "child-command", command: "sleep 1" },
+      },
+    }));
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "item/completed",
+      params: {
+        threadId: "child-thread",
+        turnId: "child-turn",
+        item: { type: "agentMessage", id: "child-message", text: "child done", phase: "final_answer" },
+      },
+    }));
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "error",
+      params: { threadId: "child-thread", turnId: "child-turn", error: { message: "child error" } },
+    }));
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "turn/failed",
+      params: { threadId: "child-thread", turn: { id: "child-turn", status: "failed" }, message: "child failed" },
+    }));
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "turn/completed",
+      params: { threadId: "child-thread", turn: { id: "child-turn", status: "completed" } },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(settled).toBe(false);
+    expect(session.sessionId).toBe("root-thread");
+    expect(internal._state).toBe("thinking");
+    expect(internal._turnSummary).toBeNull();
+    expect(events.some((event) => event.sessionId === "child-thread")).toBe(false);
+    expect(events.some((event) => event.type === "result")).toBe(false);
+
+    // Global notifications have no thread scope and must still flow through.
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "account/rateLimits/updated",
+      params: { rateLimits: { limitId: "codex", primary: { usedPercent: 25 } } },
+    }));
+
+    // Root commentary is observable progress but must not become the terminal
+    // summary. The final_answer item supplies the root TurnResult summary.
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "item/completed",
+      params: {
+        threadId: "root-thread",
+        turnId: "root-turn",
+        item: { type: "agentMessage", id: "root-commentary", text: "working", phase: "commentary" },
+      },
+    }));
+    expect(internal._turnSummary).toBeNull();
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "item/completed",
+      params: {
+        threadId: "root-thread",
+        turnId: "root-turn",
+        item: { type: "agentMessage", id: "root-final", text: "root done", phase: "final_answer" },
+      },
+    }));
+    feed(ndjson({
+      jsonrpc: "2.0",
+      method: "turn/completed",
+      params: { threadId: "root-thread", turn: { id: "root-turn", status: "completed" } },
+    }));
+
+    const result = await turnResult;
+    expect(result.status).toBe("completed");
+    expect(result.summary).toBe("root done");
+    expect(events.some((event) => event.type === "rate_limit")).toBe(true);
+    const assistants = events.filter((event) => event.type === "assistant");
+    expect(assistants).toHaveLength(2);
+    expect(assistants[0]?.type === "assistant" && assistants[0].phase).toBe("commentary");
+    expect(assistants[1]?.type === "assistant" && assistants[1].phase).toBe("final_answer");
+  });
+
+  it("does not let a foreign legacy thread.started replace the root id", () => {
+    const events: StreamEvent[] = [];
+    const { session, feed } = makeDrivenSession({ onEvent: (event) => { events.push(event); } });
+    (session as unknown as { _threadId: string | null })._threadId = "root-thread";
+
+    feed(ndjson({ type: "thread.started", thread_id: "child-thread" }));
+
+    expect(session.sessionId).toBe("root-thread");
+    expect(events).toHaveLength(0);
+  });
+
   it("forwards a synthesized result event on turn.completed before resolving", async () => {
     const events: StreamEvent[] = [];
     let resolvedAt = -1;
@@ -286,6 +403,49 @@ describe("CodexSession — concurrent send", () => {
     expect(r1).toBe(r2);
     expect(r2).toBe(r3);
     expect(r1.summary).toBe("shared");
+  });
+
+  it("keeps every pending root send open when a child turn completes", async () => {
+    const { proc } = makeFakeProc();
+    const session = new CodexSessionImpl(proc, {}, "/tmp", "test-model", null);
+    (session as unknown as { _threadId: string | null })._threadId = "root-thread";
+
+    const h1 = await session.send("a");
+    const h2 = await session.send("b");
+    let settled = 0;
+    void h1.result.then(() => { settled += 1; });
+    void h2.result.then(() => { settled += 1; });
+
+    feedCodex(session, {
+      jsonrpc: "2.0",
+      method: "turn/completed",
+      params: { threadId: "child-thread", turn: { id: "child-turn", status: "completed" } },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(settled).toBe(0);
+
+    feedCodex(session, {
+      jsonrpc: "2.0",
+      method: "item/completed",
+      params: {
+        threadId: "root-thread",
+        turnId: "root-turn",
+        item: { type: "agentMessage", id: "root-final", text: "shared root result", phase: "final_answer" },
+      },
+    });
+    feedCodex(session, {
+      jsonrpc: "2.0",
+      method: "turn/completed",
+      params: {
+        threadId: "root-thread",
+        turn: { id: "root-turn", status: "completed" },
+        usage: { input_tokens: 1, output_tokens: 1 },
+      },
+    });
+
+    const [r1, r2] = await Promise.all([h1.result, h2.result]);
+    expect(r1).toBe(r2);
+    expect(r1.summary).toBe("shared root result");
   });
 
   it("per-turn accumulators reset between sequential turns", async () => {
@@ -684,10 +844,21 @@ describe("CodexSession — handshake resume", () => {
 
   it("falls back to a fresh thread (with a stderr notice) when resume is rejected", async () => {
     const stderr: string[] = [];
+    const events: StreamEvent[] = [];
     const { proc, writes } = makeRpcProc({
       initialize: () => ({}),
       "thread/resume": () => new RpcError(-32000, "unknown thread"),
-      "thread/start": () => ({ thread: { id: "thr_new" } }),
+      "thread/start": () => {
+        const stdout = (proc as unknown as { stdout: EventEmitter }).stdout;
+        // Real app-server can publish thread/started before returning the
+        // thread/start RPC response. Exercise that ordering after fallback.
+        queueMicrotask(() => stdout.emit("data", ndjson({
+          jsonrpc: "2.0",
+          method: "thread/started",
+          params: { thread: { id: "thr_new", cwd: "/tmp" } },
+        }) + "\n"));
+        return { thread: { id: "thr_new" } };
+      },
     });
     const session = new CodexSessionImpl(
       proc,
@@ -696,6 +867,7 @@ describe("CodexSession — handshake resume", () => {
         onOutput: (stream, chunk) => {
           if (stream === "stderr") stderr.push(chunk);
         },
+        onEvent: (event) => { events.push(event); },
       },
       "/tmp",
       "test-model",
@@ -708,6 +880,9 @@ describe("CodexSession — handshake resume", () => {
     expect(methods).toContain("thread/start"); // fell back to a fresh thread
     expect(session.sessionId).toBe("thr_new");
     expect(stderr.join("")).toMatch(/thread\/resume failed/);
+    expect(events.some((event) =>
+      event.type === "system" && event.subtype === "init" && event.sessionId === "thr_new"
+    )).toBe(true);
   });
 });
 
