@@ -1,10 +1,11 @@
 /**
  * Probe each provider CLI for a non-interactive model-listing subcommand.
  *
- * None of the Claude / Codex / Gemini CLIs currently expose one, so agentex
- * does NOT implement listModels() for any provider — the library refuses
- * to return curated fake data. This script re-runs the probes so we know
- * when a CLI ships a real subcommand and we can wire it up.
+ * Codex ships one (`codex debug models`) and it is wired up in
+ * providers/codex/discovery.ts. Claude still ships none, which is why its
+ * discovery has to validate a curated candidate list flag by flag instead
+ * (providers/claude/discovery.ts). This script re-runs the probes so we notice
+ * when a CLI gains a real subcommand and can replace a workaround with it.
  *
  * Usage:
  *   pnpm list-models                 # all providers
@@ -18,6 +19,7 @@ const PROBES: Record<string, { bin: string; args: string[] }[]> = {
     { bin: "claude", args: ["models"] },
   ],
   codex: [
+    { bin: "codex", args: ["debug", "models"] },
     { bin: "codex", args: ["models"] },
     { bin: "codex", args: ["models", "list"] },
   ],
@@ -82,7 +84,8 @@ async function main() {
 
   console.log(
     "Probing provider CLIs for model-listing subcommands.\n" +
-      "agentex does not ship listModels() anywhere, because none of these commands work today.\n",
+      "Codex ships one and it is wired up; Claude still ships none and is discovered\n" +
+      "by flag validation instead. Re-run this to notice when that changes.\n",
   );
 
   for (const name of targets) {

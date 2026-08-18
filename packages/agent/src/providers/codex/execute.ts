@@ -15,7 +15,7 @@ import type { PreparedWorkspace } from "../../utils/workspace.js";
 import { uuidv7 } from "../../utils/uuid.js";
 import {
   parseCodexJsonl,
-  parseCodexStreamLine,
+  parseCodexStreamLines,
   stripCodexRolloutNoise,
   isCodexAuthRequired,
   isCodexUnknownSessionError,
@@ -165,6 +165,11 @@ export async function executeCodexProvider(ctx: ExecutionContext): Promise<Execu
     // Correlates tool_call → tool_result so emitted tool_result events carry
     // toolName. One tracker per attempt (a retry restarts the stream).
     const trackToolName = createToolNameTracker();
+    // Children still running when the one-shot process ends. `execute()` has no
+    // session to reconcile against, so without a terminal edge here a host that
+    // trusts `capabilities.backgroundTaskEvents` shows those children as
+    // running forever. The session path does the same on shutdown.
+    const openTasks = new Map<string, { description: string | null; parentTaskId: string | null }>();
 
     const handleLine = async (trimmed: string) => {
       if (!trimmed) return;
@@ -177,8 +182,14 @@ export async function executeCodexProvider(ctx: ExecutionContext): Promise<Execu
         } catch { /* ignore */ }
       }
       if (!ctx.onEvent) return;
-      const event = parseCodexStreamLine(trimmed, streamThreadId);
-      if (event) {
+      for (const event of parseCodexStreamLines(trimmed, streamThreadId)) {
+        if (event.type === "background_task") {
+          if (event.phase === "completed") openTasks.delete(event.taskId);
+          else openTasks.set(event.taskId, {
+            description: event.description,
+            parentTaskId: event.parentTaskId,
+          });
+        }
         try { await ctx.onEvent(trackToolName(event)); } catch { /* swallow */ }
       }
     };
@@ -224,6 +235,34 @@ export async function executeCodexProvider(ctx: ExecutionContext): Promise<Execu
     if (lineBuffer.trim()) {
       await handleLine(lineBuffer.trim());
     }
+
+    for (const [taskId, task] of openTasks) {
+      if (!ctx.onEvent) break;
+      try {
+        await ctx.onEvent({
+          type: "background_task",
+          taskId,
+          taskType: "subagent",
+          phase: "completed",
+          // "stopped", not "completed": the run ended while this child was
+          // still going. Claiming success for work we never saw finish would
+          // be worse than reporting that it was cut short.
+          status: "stopped",
+          description: task.description,
+          summary: null,
+          parentTaskId: task.parentTaskId,
+          timestamp: new Date().toISOString(),
+          providerType: "codex",
+          sessionId: streamThreadId,
+          messageId: null,
+          eventId: streamThreadId ? `codex:${streamThreadId}:background-task:${taskId}:exit` : null,
+          turnId: null,
+          parentToolCallId: null,
+          raw: { reason: "process_exit" },
+        });
+      } catch { /* swallow */ }
+    }
+    openTasks.clear();
 
     return proc;
   };

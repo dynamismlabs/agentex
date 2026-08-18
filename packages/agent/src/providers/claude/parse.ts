@@ -802,9 +802,19 @@ function normalizedClaudeTaskType(task: ClaudeTaskDetails): "subagent" | "proces
   return "unknown";
 }
 
+/**
+ * Map a reported Claude status onto the neutral vocabulary.
+ *
+ * Returns null when the provider reported nothing, or reported a value this
+ * version does not model. Both mean "we do not know", and saying so is the
+ * point: a `task_updated` patch that only renames a task used to assert
+ * `running` over a real `paused`, and an unmodeled future status used to be
+ * asserted as running rather than left uncertain — which quietly undid the
+ * forward-compat that `claudeTaskDetailsFromRaw` establishes upstream.
+ */
 function normalizedClaudeTaskStatus(
   status: ClaudeTaskStatus | null,
-): "pending" | "running" | "paused" | "completed" | "failed" | "stopped" {
+): "pending" | "running" | "paused" | "completed" | "failed" | "stopped" | null {
   switch (status) {
     case "pending": return "pending";
     case "paused": return "paused";
@@ -812,8 +822,8 @@ function normalizedClaudeTaskStatus(
     case "failed": return "failed";
     case "killed":
     case "stopped": return "stopped";
-    case "running":
-    default: return "running";
+    case "running": return "running";
+    default: return null;
   }
 }
 
@@ -824,15 +834,27 @@ function backgroundTaskEventFromClaude(
   const task = claudeTaskDetailsFromRaw(raw);
   if (!task || !task.taskId) return null;
 
+  // A bare notification is Claude's "this task is done" signal. One that
+  // carries a status is reporting that status, and must be believed.
+  // Inference is allowed only where the event type itself carries the fact: a
+  // bare notification is Claude's "done" signal, and started/progress events
+  // are emitted BY a running task. `task_updated` is a patch — it can carry
+  // nothing but a rename, so it says nothing about liveness and must not
+  // assert `running` over a real `paused`.
+  const implied = task.phase === "started" || task.phase === "progress" ? "running" : null;
   const status = task.phase === "notification" && task.status === null
     ? "completed"
-    : normalizedClaudeTaskStatus(task.status);
+    : normalizedClaudeTaskStatus(task.status) ?? implied;
   const terminal = status === "completed" || status === "failed" || status === "stopped";
   return {
     type: "background_task",
     taskId: task.taskId,
     taskType: normalizedClaudeTaskType(task),
-    phase: terminal || task.phase === "notification"
+    // Terminality is decided by the status alone. Treating every notification
+    // as terminal emitted `phase: "completed"` alongside `status: "running"`,
+    // and hosts are told to drop a task on `phase === "completed"` — so a
+    // mid-flight notification evicted a task the same event said was running.
+    phase: terminal
       ? "completed"
       : task.phase === "started" ? "started" : "progress",
     status,

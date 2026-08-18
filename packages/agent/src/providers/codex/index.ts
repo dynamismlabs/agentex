@@ -8,7 +8,7 @@ export const codexProvider: ProviderModule = {
   type: "codex",
   capabilities: {
     sessions: true,
-    modelDiscovery: false,
+    modelDiscovery: true,
     quotaProbing: false,
     mcp: false,
     skills: true,
@@ -45,6 +45,7 @@ export const codexProvider: ProviderModule = {
   resolveAuth: (ctx) => resolveAuthForProvider("codex", ctx),
   sessionCodec: codexSessionCodec,
   transcript: codexTranscriptOps,
+  listModels: (options) => import("./discovery.js").then((m) => m.listCodexModels(options)),
   listModes: async (opts) => (await import("./modes.js")).listCodexModes(opts),
   attachSession: async (record, opts) =>
     (await import("./attach.js")).attachCodexSession(record, opts),

@@ -25,9 +25,10 @@ import { opencodeSessionCodec } from "./codec.js";
 import { prepareOpenCodeSkillConfig } from "./skill-config.js";
 import {
   assistantTextFromParts,
+  incompleteTurnMessage,
   mapOpenCodePart,
   mapOpenCodeToolCall,
-  turnStatusFromMessage,
+  terminalOutcome,
   usageFromMessage,
   type OcBaseInfo,
 } from "./event-parse.js";
@@ -83,6 +84,12 @@ class OpenCodeSession implements AgentSession {
   private readonly _seenTextLen = new Map<string, number>();
   private readonly _emittedToolCall = new Set<string>();
   private readonly _emittedToolResult = new Set<string>();
+  /**
+   * messageID → role, learned from `message.updated` SSE frames. Lets `emitPart`
+   * drop a user message's own text part, which opencode streams once a turn is
+   * active and would otherwise surface as an assistant bubble echoing the prompt.
+   */
+  private readonly _messageRoles = new Map<string, string>();
   private _sse: AbortController | null = null;
   private readonly _handledInput = new Set<string>();
   private readonly _inputInFlight = new Set<string>();
@@ -245,6 +252,17 @@ class OpenCodeSession implements AgentSession {
       if (request) await this.handleQuestion(request);
       return;
     }
+    if (payload["type"] === "message.updated") {
+      // Track message roles so emitPart can distinguish a user message's own
+      // text part (echoed onto the SSE feed) from real assistant output.
+      const info = rec(rec(payload["properties"])?.["info"]) ?? rec(payload["properties"]);
+      const mid = info ? str(info["id"]) : null;
+      const role = info ? str(info["role"]) : null;
+      if (mid && role && str(info!["sessionID"]) === this._sessionId) {
+        this._messageRoles.set(mid, role);
+      }
+      return;
+    }
     if (payload["type"] !== "message.part.updated") return;
     const props = rec(payload["properties"]);
     const part = rec(props?.["part"]);
@@ -403,6 +421,12 @@ class OpenCodeSession implements AgentSession {
     // The SSE feed is global and async: drop stragglers that arrive while no turn
     // is active so a finished turn's late parts don't surface against the next one.
     if (!this._turnActive) return;
+    // Drop parts belonging to a user message — opencode re-streams the prompt's
+    // own text part once the turn is active, which would echo as an assistant
+    // bubble. Unknown role (message.updated not seen yet) falls through and
+    // emits, so a race can never suppress genuine assistant output.
+    const messageId = str(part["messageID"]);
+    if (messageId && this._messageRoles.get(messageId) === "user") return;
     const info: OcBaseInfo = {
       provider: "opencode",
       sessionId: this._sessionId,
@@ -537,18 +561,20 @@ class OpenCodeSession implements AgentSession {
           const data = (await res.json()) as Record<string, unknown>;
           terminalRaw = data;
           const info = rec(data["info"]);
-          const status = turnStatusFromMessage(info);
           const usage = usageFromMessage(info);
           const summary = assistantTextFromParts(data["parts"]) || null;
           const costUsd = info ? num(info["cost"]) : null;
-          const errorMessage = status === "failed" ? JSON.stringify(info?.["error"] ?? null) : null;
+          const term = terminalOutcome(info, summary != null && summary.trim().length > 0);
+          // A silent empty turn (upstream dropped the stream) would otherwise
+          // render as a stall. Surface a visible note before the terminal result.
+          if (term.incomplete && info) await this.emitIncompleteNote(info);
           outcome = {
             summary,
             ...(usage ? { usage } : {}),
             costUsd,
-            status,
-            errorCode: status === "failed" ? "agent_error" : null,
-            errorMessage,
+            status: term.status,
+            errorCode: term.errorCode,
+            errorMessage: term.errorMessage,
           };
         }
       }
@@ -584,12 +610,35 @@ class OpenCodeSession implements AgentSession {
     return outcome;
   }
 
+  /**
+   * Surface a turn that ended with no reply as a visible assistant note. The
+   * stable `:incomplete` event id is shared with the reconcile path
+   * (`historicalEvents`) so a later catch-up dedups against this live note
+   * instead of duplicating it.
+   */
+  private async emitIncompleteNote(info: Record<string, unknown>): Promise<void> {
+    const messageId = str(info["id"]);
+    await this.emit({
+      type: "assistant",
+      text: incompleteTurnMessage(str(info["finish"])),
+      timestamp: new Date().toISOString(),
+      providerType: "opencode",
+      sessionId: this._sessionId,
+      messageId,
+      eventId: messageId ? `${messageId}:incomplete` : null,
+      turnId: null,
+      parentToolCallId: null,
+      raw: { synthetic: "incomplete_turn", info },
+    });
+  }
+
   private async emitTerminal(
     outcome: TurnResult,
     raw: Record<string, unknown>,
     startedAt: number,
   ): Promise<void> {
     const info = rec(raw["info"]);
+    const messageId = info ? str(info["id"]) : null;
     await this.emit({
       type: "result",
       text: outcome.summary ?? outcome.errorMessage ?? "",
@@ -602,8 +651,10 @@ class OpenCodeSession implements AgentSession {
       timestamp: new Date().toISOString(),
       providerType: "opencode",
       sessionId: this._sessionId,
-      messageId: info ? str(info["id"]) : null,
-      eventId: info ? str(info["id"]) : null,
+      messageId,
+      // Match the reconcile path's `${messageId}:result` id so the live and
+      // catch-up terminal markers dedup instead of both landing as rows.
+      eventId: messageId ? `${messageId}:result` : null,
       turnId: null,
       parentToolCallId: null,
       raw,

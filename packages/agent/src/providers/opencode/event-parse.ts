@@ -54,6 +54,69 @@ export function turnStatusFromMessage(info: unknown): "completed" | "failed" {
   return m && m["error"] ? "failed" : "completed";
 }
 
+/**
+ * Finish reasons that represent the model deliberately ending its turn. Anything
+ * outside this set that also produced no text is treated as an incomplete turn
+ * (see `terminalOutcome`). `tool-calls` is included because it's an intermediate
+ * step in the agent loop, not an empty terminal turn.
+ */
+const CLEAN_FINISH_REASONS = new Set(["stop", "length", "end_turn", "stop_sequence", "tool-calls"]);
+
+/** User-facing note for a turn that ended with no reply (provider dropped the stream). */
+export function incompleteTurnMessage(finish: string | null): string {
+  const reason = finish ? ` (finish reason "${finish}")` : "";
+  return (
+    `The model ended the turn without sending a reply${reason}. ` +
+    "The upstream provider returned no content, which usually means the stream was dropped. " +
+    "Send your message again to retry."
+  );
+}
+
+export interface TerminalOutcome {
+  status: "completed" | "failed";
+  errorCode: string | null;
+  errorMessage: string | null;
+  /**
+   * True when the turn ended with no reply, no tool output, and no error — the
+   * "silent empty turn" opencode records as a normal completion (typically after
+   * an upstream stream error, surfaced as `finish: "unknown"`). Distinct from a
+   * user interrupt, which opencode marks with a `MessageAbortedError` in
+   * `info.error` and so lands in the error branch below.
+   */
+  incomplete: boolean;
+}
+
+/**
+ * Classify a terminal assistant message. Extends `turnStatusFromMessage` by
+ * catching the empty-turn case so a dropped stream surfaces as `failed` (with a
+ * visible note) instead of rendering as a stall. Keyed on the message having no
+ * visible text and a non-clean finish reason; never fires when the model
+ * produced an answer or stopped cleanly, and never fires on an interrupt.
+ */
+export function terminalOutcome(info: unknown, hasVisibleText: boolean): TerminalOutcome {
+  const status = turnStatusFromMessage(info);
+  if (status === "failed") {
+    const m = rec(info);
+    return {
+      status,
+      errorCode: "agent_error",
+      errorMessage: JSON.stringify(m?.["error"] ?? null),
+      incomplete: false,
+    };
+  }
+  const finish = str(rec(info)?.["finish"] ?? null);
+  const cleanStop = finish !== null && CLEAN_FINISH_REASONS.has(finish);
+  if (!hasVisibleText && !cleanStop) {
+    return {
+      status: "failed",
+      errorCode: "incomplete_turn",
+      errorMessage: incompleteTurnMessage(finish),
+      incomplete: true,
+    };
+  }
+  return { status: "completed", errorCode: null, errorMessage: null, incomplete: false };
+}
+
 /** Map opencode's `tokens` (+ model identity) to agentex usage. */
 export function usageFromMessage(info: unknown): Record<string, TokenUsage> | undefined {
   const m = rec(info);

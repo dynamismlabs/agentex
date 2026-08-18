@@ -10,18 +10,26 @@ const CWD = process.cwd();
 
 // Isolate tests from the developer's real ~/.codex/auth.json so the Codex
 // billing-prediction logic (which prefers subscription when auth.json exists)
-// doesn't flip based on local state.
+// doesn't flip based on local state. An ambient OPENAI_API_KEY does the same
+// thing by a different route: buildEnv forwards it into the child, so
+// detectAuth reports api billing and the subscription assertion below fails on
+// any machine that exports one. The api-billing case supplies its own key
+// through ctx.env, so clearing the ambient value here is safe.
 let tmpCodexHome: string;
 const originalCodexHome = process.env.CODEX_HOME;
+const originalOpenAiKey = process.env.OPENAI_API_KEY;
 
 beforeEach(async () => {
   tmpCodexHome = await fs.mkdtemp(path.join(os.tmpdir(), "codex-test-"));
   process.env.CODEX_HOME = tmpCodexHome;
+  delete process.env.OPENAI_API_KEY;
 });
 
 afterEach(async () => {
   if (originalCodexHome !== undefined) process.env.CODEX_HOME = originalCodexHome;
   else delete process.env.CODEX_HOME;
+  if (originalOpenAiKey !== undefined) process.env.OPENAI_API_KEY = originalOpenAiKey;
+  else delete process.env.OPENAI_API_KEY;
   await fs.rm(tmpCodexHome, { recursive: true, force: true });
 });
 
@@ -53,6 +61,37 @@ describe("executeCodexProvider", () => {
     expect(result.billingType).toBe("subscription");
     expect(events.length).toBeGreaterThan(0);
     expect(outputs.length).toBeGreaterThan(0);
+  });
+
+  it("reports every spawned child, not just the first receiver", async () => {
+    const events: StreamEvent[] = [];
+    await executeCodexProvider(makeCtx({
+      config: { command: MOCK_CODEX },
+      env: { MOCK_BEHAVIOR: "collab_orphan" },
+      onEvent: (event) => { events.push(event); },
+    }));
+
+    const started = events.filter((e) => e.type === "background_task" && e.phase === "started");
+    expect(started.map((e) => e.type === "background_task" && e.taskId)).toEqual(["child-a", "child-b"]);
+  });
+
+  it("closes out children still running when the one-shot process exits", async () => {
+    // `capabilities.backgroundTaskEvents` is declared provider-wide, so the
+    // one-shot path has to honor it too. Without a terminal edge here a host
+    // shows these children as running forever, with no session to correct it.
+    const events: StreamEvent[] = [];
+    await executeCodexProvider(makeCtx({
+      config: { command: MOCK_CODEX },
+      env: { MOCK_BEHAVIOR: "collab_orphan" },
+      onEvent: (event) => { events.push(event); },
+    }));
+
+    const terminal = events.filter((e) => e.type === "background_task" && e.phase === "completed");
+    expect(terminal.map((e) => e.type === "background_task" && e.taskId)).toEqual(["child-a", "child-b"]);
+    for (const event of terminal) {
+      // "stopped", not "completed" — the run ended, we never saw them finish.
+      expect(event).toMatchObject({ status: "stopped" });
+    }
   });
 
   it("detects API billing type when OPENAI_API_KEY set", async () => {

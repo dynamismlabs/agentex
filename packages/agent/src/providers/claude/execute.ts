@@ -7,6 +7,7 @@ import { runChildProcess, deriveErrorCode } from "../../utils/process.js";
 import { detectAuth } from "../../utils/auth.js";
 import { buildSkillsDir, cleanupSkillsDir } from "../../utils/skills.js";
 import { claudeFeatureArgs, cleanupMcpConfig, stageMcpConfig } from "./mcp.js";
+import { claudeEffortFlagValue } from "./effort.js";
 import { createToolNameTracker } from "../../utils/tool-names.js";
 import { uuidv7 } from "../../utils/uuid.js";
 import { prepareWorkspace } from "../../utils/workspace.js";
@@ -109,7 +110,7 @@ export async function executeClaudeProvider(ctx: ExecutionContext): Promise<Exec
       args.push("--dangerously-skip-permissions");
     }
     if (model) args.push("--model", model);
-    if (config.effort) args.push("--effort", config.effort);
+    if (config.effort) args.push("--effort", claudeEffortFlagValue(config.effort));
     if (config.maxTurns && config.maxTurns > 0) args.push("--max-turns", String(config.maxTurns));
     if (config.instructionsFile) args.push("--append-system-prompt-file", config.instructionsFile);
     if (skillsDir) args.push("--add-dir", skillsDir);

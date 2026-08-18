@@ -2,6 +2,7 @@ import type { AgentMode, ListModelsOptions, ListModesOptions, ProviderModel } fr
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { runChildProcess } from "../../utils/process.js";
 import { findCursorBinary } from "./runtime.js";
+import { withModelCache } from "../../utils/model-cache.js";
 
 function rec(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -71,6 +72,10 @@ export function cursorModesFromHelp(output: string): AgentMode[] {
 }
 
 export async function listCursorModels(options: ListModelsOptions = {}): Promise<ProviderModel[]> {
+  return withModelCache("cursor", options, options.cacheTtlMs, () => discoverCursorModels(options));
+}
+
+async function discoverCursorModels(options: ListModelsOptions): Promise<ProviderModel[]> {
   const resolved = await findCursorBinary(options);
   const env = buildEnv(options.env);
   ensurePathInEnv(env);

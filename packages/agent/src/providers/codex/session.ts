@@ -27,7 +27,7 @@ import { translateEndpoint } from "../../utils/endpoint.js";
 import { injectWorkspaceSkills } from "../../utils/skills.js";
 import { resolveInstructions } from "../../utils/instructions.js";
 import { createToolNameTracker } from "../../utils/tool-names.js";
-import { parseCodexStreamLine } from "./parse.js";
+import { parseCodexStreamLines } from "./parse.js";
 import { withPlanModePreamble } from "./plan-mode.js";
 import { scanCodexSessionUsage } from "./usage-scanner.js";
 import { codexSessionCodec } from "./codec.js";
@@ -130,6 +130,12 @@ interface PendingResult {
   settled?: boolean;
   /** Tear down this send's timeout timer / abort listener. */
   cleanup?: () => void;
+  /**
+   * Turn generation this send joined. Result delivery drains only the
+   * generation it belongs to, so a send that starts a NEW turn while the
+   * previous turn's result is still draining cannot be settled by it.
+   */
+  generation: number;
 }
 
 interface TrackedBackgroundTask {
@@ -152,11 +158,28 @@ const BACKGROUND_TASK_POLL_INTERVAL_MS = 2_000;
 const BACKGROUND_TASK_READ_TIMEOUT_MS = 5_000;
 
 /** Identity latch for the root turn currently represented by this session. */
+/**
+ * One turn's outcome, frozen at the terminal frame.
+ *
+ * Delivery is asynchronous (event chain, and an on-disk usage scan when the
+ * stream carried no usage), so reading the live accumulators at delivery time
+ * reads whatever turn is running *then*. Snapshotting decouples the two: the
+ * accumulators reset immediately and belong to the next turn from that moment.
+ */
+interface TurnOutcome {
+  summary: string | null;
+  isError: boolean;
+  errorMessage: string | null;
+  wasInterrupted: boolean;
+}
+
 interface ActiveTurnReady {
   promise: Promise<string | null>;
   resolve: (turnId: string | null) => void;
   reject: (err: Error) => void;
   settled: boolean;
+  /** Monotonic id for this turn, used to fence late result delivery. */
+  generation: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +426,8 @@ export class CodexSessionImpl implements AgentSession {
    */
   private _activeTurnId: string | null = null;
   private _activeTurnReady: ActiveTurnReady | null = null;
+  /** Incremented per turn latch. Never reused, so staleness is decidable. */
+  private _turnGeneration = 0;
   /** Successful repeated interrupts coalesce until the terminal notification. */
   private _interruptPromise: Promise<void> | null = null;
   /** Prevents a late interrupt request after the terminal frame was observed. */
@@ -555,6 +580,22 @@ export class CodexSessionImpl implements AgentSession {
     }
   }
 
+  /**
+   * Remove and return the pending sends belonging to one turn generation.
+   *
+   * `undefined` matches entries with no generation, which is how tests that
+   * drive the session without `send()` enqueue resolvers.
+   */
+  private takePendingResults(generation: number | undefined): PendingResult[] {
+    const mine: PendingResult[] = [];
+    const others: PendingResult[] = [];
+    for (const entry of this._pendingResults) {
+      (entry.generation === generation ? mine : others).push(entry);
+    }
+    this._pendingResults = others;
+    return mine;
+  }
+
   /** Reject every pending send() Promise and outgoing JSON-RPC call. */
   private rejectAllPending(err: Error): void {
     const pending = this._pendingResults.splice(0);
@@ -589,6 +630,7 @@ export class CodexSessionImpl implements AgentSession {
       resolve: resolveFn,
       reject: rejectFn,
       settled: false,
+      generation: ++this._turnGeneration,
     };
     this._activeTurnId = null;
     this._activeTurnReady = ready;
@@ -614,9 +656,16 @@ export class CodexSessionImpl implements AgentSession {
     expected.reject(err);
   }
 
-  /** Clear the current turn and release an interrupt waiting for its id. */
-  private clearActiveTurn(err?: Error): void {
+  /**
+   * Clear the current turn and release an interrupt waiting for its id.
+   *
+   * `expected` fences the clear against a turn that started after the one being
+   * torn down. Without it, a late teardown nulls the latch a newer, running
+   * turn is relying on, which is the same silent-Stop failure by another route.
+   */
+  private clearActiveTurn(err?: Error, expected?: ActiveTurnReady): void {
     const ready = this._activeTurnReady;
+    if (expected && ready !== expected) return;
     if (ready && !ready.settled) {
       ready.settled = true;
       if (err) ready.reject(err);
@@ -834,9 +883,17 @@ export class CodexSessionImpl implements AgentSession {
     // and pass through. If the second `turn/start` lands during the first
     // turn, the per-turn accumulators continue collecting until the result
     // event fires; the result then drains all pending resolvers.
+    // Joining the active turn requires that it still be active. The latch
+    // survives the terminal frame until deliverTurnResult() clears it, and that
+    // gap is real time: it spans `await this._eventChain` (a host persisting
+    // events) and, when turn/completed carried no usage, an on-disk usage scan.
+    // A send landing in that gap belongs to a NEW turn — joining the dead one
+    // would leave it with no interrupt latch and no turn/start capture, so Stop
+    // would find nothing to interrupt and return as if it had succeeded.
     const existingTurnReady = this._activeTurnReady;
-    const isTurnLeader = existingTurnReady === null;
-    const turnReady = existingTurnReady ?? this.beginActiveTurn();
+    const canJoinActiveTurn = existingTurnReady !== null && !this._turnTerminalObserved;
+    const isTurnLeader = !canJoinActiveTurn;
+    const turnReady = canJoinActiveTurn ? existingTurnReady! : this.beginActiveTurn();
 
     if (this._state === "idle") {
       this._state = "thinking";
@@ -868,7 +925,11 @@ export class CodexSessionImpl implements AgentSession {
       rejectFn = reject;
     });
 
-    const entry: PendingResult = { resolve: resolveFn, reject: rejectFn };
+    const entry: PendingResult = {
+      resolve: resolveFn,
+      reject: rejectFn,
+      generation: turnReady.generation,
+    };
     this._pendingResults.push(entry);
 
     // Track the in-flight turn so drain() can await it; drop it on settle.
@@ -1072,6 +1133,10 @@ export class CodexSessionImpl implements AgentSession {
       method: "session/closed",
     });
     this.cancelBackgroundTaskPollTimers();
+    // finalizeActiveBackgroundTasks above has already emitted the terminal
+    // edges, so nothing downstream needs these records any more.
+    this._backgroundTasks.clear();
+    this._backgroundTaskIdsByPath.clear();
     this.rejectAllPending(new Error("Codex session closed"));
 
     this.proc.stdin!.end();
@@ -1162,6 +1227,8 @@ export class CodexSessionImpl implements AgentSession {
       method === "item/fileChange/requestApproval"
     ) {
       void this.handleApproval(id, method, params);
+    } else if (method === "item/permissions/requestApproval") {
+      void this.handlePermissionsApproval(id, params);
     } else if (
       method === "item/tool/requestUserInput" ||
       method === "tool/requestUserInput"
@@ -1169,7 +1236,13 @@ export class CodexSessionImpl implements AgentSession {
       // `tool/requestUserInput` is the legacy method name on older codex builds.
       void this.handleUserInputRequest(id, params);
     } else {
-      // Unknown server request — ack to unblock the turn.
+      // Unknown server request. `{}` is a best-effort reply, NOT a guarantee
+      // that the turn proceeds: every server request the protocol defines but
+      // this file does not handle declares required response fields, so an
+      // empty result is schema-invalid for all of them. A JSON-RPC error reply
+      // would be the honest answer, but `rpcResponse` has no error path and
+      // introducing one changes behavior (an error can abort a turn where this
+      // limps along), so that is a deliberate follow-up rather than a fix here.
       this.rpcResponse(id, {});
     }
   }
@@ -1186,14 +1259,23 @@ export class CodexSessionImpl implements AgentSession {
   }
 
   private async handleApproval(id: number, method: string, params: Record<string, unknown>): Promise<void> {
-    this._state = "waiting_for_approval";
+    // A child thread's approval still has to be answered — somebody must decide
+    // whether that subagent may run its command — but it is not the root turn's
+    // business. Driving root state from it would show the session as blocked on
+    // approval when the root turn is running fine, and `restoreStateAfter` would
+    // then recompute root state from a child's lifecycle. The protocol makes
+    // `threadId` mandatory on every approval, so the attribution is free.
+    const requestThreadId = str(params, "threadId") || null;
+    const foreign = this.isForeignThread(requestThreadId);
+    if (!foreign) this._state = "waiting_for_approval";
+    const restore = () => { if (!foreign) this.restoreStateAfter("waiting_for_approval"); };
 
     // Codex's app-server expects `{ decision: "accept" | "decline" | "cancel" }`
     // (NOT `{ approved: boolean }`). agentex's UserInputResponse has no interrupt
     // concept, so allow → accept and deny → decline.
     if (!this.ctx.onUserInputRequest) {
       this.rpcResponse(id, { decision: "accept" });
-      this.restoreStateAfter("waiting_for_approval");
+      restore();
       return;
     }
 
@@ -1205,15 +1287,67 @@ export class CodexSessionImpl implements AgentSession {
       const resp = await this.ctx.onUserInputRequest({
         toolName,
         input: params,
-        toolUseId: str(params, "id"),
-        description: str(params, "command") || str(params, "path") || undefined,
+        // `itemId`, not `id` — the protocol has no `id` here, so this was
+        // always "". It is the field that lets a host line an approval up with
+        // the tool_call event carrying the same item id.
+        toolUseId: str(params, "itemId"),
+        // FileChangeRequestApprovalParams carries `grantRoot`, never `path`,
+        // so file-change approvals reached hosts with no description at all.
+        description: str(params, "command")
+          || str(params, "grantRoot")
+          || str(params, "reason")
+          || undefined,
+        // Which subagent is asking. The child thread id is also its
+        // `background_task.taskId`, so a host can line the approval up with
+        // the task it already renders. Absent for the root turn.
+        ...(foreign && requestThreadId ? { agentId: requestThreadId } : {}),
       });
       this.rpcResponse(id, { decision: resp.allow ? "accept" : "decline" });
     } catch {
       this.rpcResponse(id, { decision: "decline" });
     }
 
-    this.restoreStateAfter("waiting_for_approval");
+    restore();
+  }
+
+  /**
+   * Handle `item/permissions/requestApproval`.
+   *
+   * Unlike the accept/decline approvals, the response here IS the grant: the
+   * schema requires a `permissions` profile, so the generic "ack with `{}` to
+   * unblock the turn" fallback this used to land in was schema-invalid.
+   * Granting means echoing back the profile the agent asked for; refusing means
+   * an empty profile, which is valid and grants nothing beyond what it already
+   * has. With no host handler we refuse, because silently widening a sandbox is
+   * not a safe default for an unattended session.
+   */
+  private async handlePermissionsApproval(id: number, params: Record<string, unknown>): Promise<void> {
+    const requestThreadId = str(params, "threadId") || null;
+    const foreign = this.isForeignThread(requestThreadId);
+    if (!foreign) this._state = "waiting_for_approval";
+    const restore = () => { if (!foreign) this.restoreStateAfter("waiting_for_approval"); };
+    const requested = asObj(params, "permissions");
+
+    if (!this.ctx.onUserInputRequest) {
+      this.rpcResponse(id, { permissions: {} });
+      restore();
+      return;
+    }
+
+    try {
+      const resp = await this.ctx.onUserInputRequest({
+        toolName: "permissions",
+        input: params,
+        toolUseId: str(params, "itemId"),
+        description: str(params, "reason") || undefined,
+        ...(foreign && requestThreadId ? { agentId: requestThreadId } : {}),
+      });
+      this.rpcResponse(id, { permissions: resp.allow ? requested : {} });
+    } catch {
+      this.rpcResponse(id, { permissions: {} });
+    }
+
+    restore();
   }
 
   /**
@@ -1223,9 +1357,17 @@ export class CodexSessionImpl implements AgentSession {
    * back in Codex's `{ answers: { [questionId]: { answers: string[] } } }` shape.
    */
   private async handleUserInputRequest(id: number, params: Record<string, unknown>): Promise<void> {
+    // Same scoping as the approval handlers: a child subagent's question still
+    // has to be answered, but it is not the root turn's business. Blocking root
+    // state on it shows the session as waiting for input when the root turn is
+    // running fine. `ToolRequestUserInputParams` requires `threadId`, so the
+    // attribution is read from the wire rather than inferred.
+    const requestThreadId = str(params, "threadId") || null;
+    const foreign = this.isForeignThread(requestThreadId);
     // Questions are user *input*, not a tool-permission gate — distinct state so a
     // host UI can render a question form vs an approval prompt.
-    this._state = "waiting_for_input";
+    if (!foreign) this._state = "waiting_for_input";
+    const restore = () => { if (!foreign) this.restoreStateAfter("waiting_for_input"); };
 
     const questions = parseCodexQuestions(params);
 
@@ -1233,7 +1375,7 @@ export class CodexSessionImpl implements AgentSession {
     // agent proceeds without hanging.
     if (!this.ctx.onUserInputRequest || questions.length === 0) {
       this.rpcResponse(id, { answers: {} });
-      this.restoreStateAfter("waiting_for_input");
+      restore();
       return;
     }
 
@@ -1241,14 +1383,16 @@ export class CodexSessionImpl implements AgentSession {
       const resp = await this.ctx.onUserInputRequest({
         toolName: "AskUserQuestion",
         input: { questions },
-        toolUseId: str(params, "id") || "codex-user-input",
+        toolUseId: str(params, "itemId") || "codex-user-input",
+        // Which subagent is asking, matching its `background_task.taskId`.
+        ...(foreign && requestThreadId ? { agentId: requestThreadId } : {}),
       });
       this.rpcResponse(id, { answers: buildCodexUserInputAnswers(questions, resp) });
     } catch {
       this.rpcResponse(id, { answers: {} });
     }
 
-    this.restoreStateAfter("waiting_for_input");
+    restore();
   }
 
   // -------------------------------------------------------------------------
@@ -1348,12 +1492,14 @@ export class CodexSessionImpl implements AgentSession {
    * A completed spawn call only means the child was created. Register every
    * receiver and then follow the child thread itself for the real terminus.
    */
+  /** @returns whether the item produced at least one background-task edge. */
   private handleCollabAgentToolCall(
     item: Record<string, unknown>,
     raw: Record<string, unknown>,
     parentTaskId: string | null,
-  ): void {
-    if (this._state === "closed" || !this.ctx.onEvent) return;
+  ): boolean {
+    if (this._state === "closed" || !this.ctx.onEvent) return false;
+    let dispatched = false;
 
     const tool = str(item, "tool");
     const states = asObj(item, "agentsStates");
@@ -1364,7 +1510,7 @@ export class CodexSessionImpl implements AgentSession {
     const canStopWithoutState = tool === "closeAgent" && str(item, "status") === "completed";
 
     for (const taskId of taskIds) {
-      let previous = this._backgroundTasks.get(taskId);
+      const previous = this._backgroundTasks.get(taskId);
       const description = str(item, "prompt") || previous?.description || null;
       const resolvedParentTaskId = previous?.parentTaskId ?? parentTaskId;
 
@@ -1383,6 +1529,7 @@ export class CodexSessionImpl implements AgentSession {
               : null,
             raw,
           }));
+          dispatched = true;
         }
         continue;
       }
@@ -1391,7 +1538,7 @@ export class CodexSessionImpl implements AgentSession {
       if (!canStart && !canStopWithoutState && !(taskId in states)) continue;
 
       const hasState = taskId in states;
-      const state = !hasState && tool === "closeAgent" && str(item, "status") === "completed"
+      const state = !hasState && canStopWithoutState
         ? { terminal: true, status: "stopped" as const, summary: null }
         : codexAgentState(states[taskId]);
 
@@ -1405,7 +1552,7 @@ export class CodexSessionImpl implements AgentSession {
             : null,
           raw,
         }));
-        previous = this._backgroundTasks.get(taskId);
+        dispatched = true;
       } else if (previous.terminal) {
         continue;
       } else if (description && description !== previous.description) {
@@ -1420,6 +1567,7 @@ export class CodexSessionImpl implements AgentSession {
             : null,
           raw,
         }));
+        dispatched = true;
       }
 
       if (state.terminal) {
@@ -1432,10 +1580,10 @@ export class CodexSessionImpl implements AgentSession {
             : null,
           raw,
         }));
-      } else {
-        this.startBackgroundTaskPoller(taskId);
+        dispatched = true;
       }
     }
+    return dispatched;
   }
 
   private waitForBackgroundTaskPoll(pollKey: string): Promise<void> {
@@ -1591,18 +1739,38 @@ export class CodexSessionImpl implements AgentSession {
     event.summary = summary;
     event.parentTaskId = parentTaskId;
 
+    const terminal = event.phase === "completed";
     this._backgroundTasks.set(event.taskId, {
       taskId: event.taskId,
+      // `description` survives termination: the reactivation path in
+      // handleForeignNotification reads it precisely BECAUSE the record is
+      // terminal, and dropping it lost a reactivated child's label forever.
+      // It is one bounded string per child. `summary` is the unbounded one —
+      // full agent messages, appended per item — and has no reader that
+      // outlives the task, so it is released.
       description,
-      summary,
+      summary: terminal ? null : summary,
       parentTaskId,
-      terminal: event.phase === "completed",
+      terminal,
       generation: previous?.generation ?? 0,
-      activeTurnId: event.phase === "completed"
-        ? null
-        : event.turnId ?? previous?.activeTurnId ?? null,
+      activeTurnId: terminal ? null : event.turnId ?? previous?.activeTurnId ?? null,
     });
+    // Kept past termination too: a grandchild can spawn after its parent has
+    // finished, and lineage resolves through this index.
     if (description) this._backgroundTaskIdsByPath.set(description, event.taskId);
+    // Every registration route converges here, so this is the one place that
+    // can guarantee a reconciliation poller exists. Registering by way of the
+    // parser's subAgentActivity branch previously produced a task with no
+    // safety net at all, wholly dependent on the child notification arriving.
+    //
+    // Correctness rests on `startBackgroundTaskPoller` and the poll loop both
+    // re-reading the record and bailing when it is terminal — NOT on the
+    // microtask. The deferral is an optimization: one wire item can emit
+    // several edges in a tick (a collab spawn whose child is already finished
+    // dispatches `started` then `completed`), and yielding first means the
+    // common case declines before spawning a `thread/read` rather than after.
+    // Do not remove the terminal checks on the grounds that this defers.
+    if (!terminal) queueMicrotask(() => this.startBackgroundTaskPoller(event.taskId));
     return true;
   }
 
@@ -1625,7 +1793,23 @@ export class CodexSessionImpl implements AgentSession {
       // App-server can publish child thread/started before the corresponding
       // root subAgentActivity item. Register only descendants of this session,
       // not unrelated foreign threads multiplexed by a future server version.
-      if (parentThreadId !== rootThreadId && !parentTask) return;
+      if (parentThreadId !== rootThreadId && !parentTask) {
+        // Say so. A wire shape that omits parentThreadId takes this branch for
+        // every child, which silently disables the whole registration and
+        // reconciliation path — the safety net that exists precisely because
+        // child notifications cannot be relied on. Degrading quietly here
+        // hides the one failure this machinery was built to survive.
+        if (!parentThreadId && this.ctx.onOutput) {
+          try {
+            void this.ctx.onOutput(
+              "stderr",
+              `agentex: codex child thread ${childThreadId} announced no parent thread id; `
+              + "background-task tracking and reconciliation are disabled for it\n",
+            );
+          } catch { /* swallow */ }
+        }
+        return;
+      }
 
       const source = asObj(thread, "source");
       const subAgent = Object.keys(asObj(source, "subAgent")).length > 0
@@ -1661,7 +1845,6 @@ export class CodexSessionImpl implements AgentSession {
         parentToolCallId: null,
         raw: parseJson(rawLine) ?? params,
       });
-      this.startBackgroundTaskPoller(childThreadId);
       return;
     }
 
@@ -1696,7 +1879,6 @@ export class CodexSessionImpl implements AgentSession {
         parentToolCallId: null,
         raw: parseJson(rawLine) ?? params,
       });
-      this.startBackgroundTaskPoller(childThreadId);
       return;
     }
 
@@ -1807,7 +1989,13 @@ export class CodexSessionImpl implements AgentSession {
       this.extractSummaryFromItem(params);
       const item = asObj(params, "item");
       if (str(item, "type") === "collabAgentToolCall") {
-        this.handleCollabAgentToolCall(item, parseJson(rawLine) ?? params, null);
+        // Shapes we model become background_task edges. Anything that produced
+        // no edge still reaches the host as a raw `unknown` event rather than
+        // vanishing — that escape hatch is how unmodeled wire shapes stay
+        // visible, and collab is exactly where new shapes keep appearing.
+        if (!this.handleCollabAgentToolCall(item, parseJson(rawLine) ?? params, null)) {
+          this.emitStreamEvent(rawLine);
+        }
         return;
       }
       this.emitStreamEvent(rawLine);
@@ -1994,10 +2182,36 @@ export class CodexSessionImpl implements AgentSession {
   }
 
   private resolveTurn(): void {
+    // Bind delivery to the turn that just terminated. Everything below this
+    // point can yield (usage scan, event chain), and a send() arriving in the
+    // meantime starts a new turn that must not be settled by this result.
+    const delivering = this._activeTurnReady;
     const resolvedModel = this._turnModel ?? this.model;
     let usage = this._turnUsage && resolvedModel
       ? { [resolvedModel]: { inputTokens: this._turnUsage.inputTokens, outputTokens: this._turnUsage.outputTokens } }
       : undefined;
+
+    // Freeze this turn's outcome and clear the accumulators NOW, while we are
+    // still synchronous with the terminal frame. Delivery reads the snapshot,
+    // so a turn that starts during the async gap below neither inherits these
+    // values nor has its own overwritten. Resetting inside beginActiveTurn()
+    // instead would not work: the usage-scan path re-reads state after an
+    // await, so the new turn's reset would eat the old turn's summary.
+    const outcome: TurnOutcome = {
+      summary: this._turnSummary,
+      isError: this._turnIsError,
+      errorMessage: this._turnErrorMessage,
+      wasInterrupted: this._turnWasInterrupted,
+    };
+    this._turnSummary = null;
+    this._turnUsage = null;
+    this._turnModel = null;
+    this._turnIsError = false;
+    this._turnWasInterrupted = false;
+    this._turnErrorMessage = null;
+    // Captured before clearing: the usage-scan fallback below still needs it.
+    const turnStartedAt = this._turnStartedAt;
+    this._turnStartedAt = null;
 
     // Usage precedence: the `turn.completed` payload is authoritative when
     // present (captured above into _turnUsage). Only when the stream carried no
@@ -2008,8 +2222,8 @@ export class CodexSessionImpl implements AgentSession {
     // latest turn or read partially-written totals. We therefore scan ONLY when
     // there is no in-band usage, and never let a scan failure fail the turn
     // (usage simply stays undefined). Prefer the in-band payload always.
-    if (!usage && this._turnStartedAt) {
-      const startedAt = this._turnStartedAt;
+    if (!usage && turnStartedAt) {
+      const startedAt = turnStartedAt;
       const threadId = this._threadId ?? undefined;
       // Fire-and-forget: scan logs then deliver result
       void scanCodexSessionUsage({ startedAfter: startedAt, threadId }).then((scanned) => {
@@ -2017,22 +2231,26 @@ export class CodexSessionImpl implements AgentSession {
       }).catch(() => {
         // Non-fatal — usage stays undefined
       }).finally(() => {
-        void this.deliverTurnResult(usage);
+        void this.deliverTurnResult(usage, delivering, outcome);
       });
       return;
     }
 
-    void this.deliverTurnResult(usage);
+    void this.deliverTurnResult(usage, delivering, outcome);
   }
 
-  private async deliverTurnResult(usage: Record<string, import("../../types.js").TokenUsage> | undefined): Promise<void> {
+  private async deliverTurnResult(
+    usage: Record<string, import("../../types.js").TokenUsage> | undefined,
+    delivering: ActiveTurnReady | null,
+    outcome: TurnOutcome,
+  ): Promise<void> {
     const result: TurnResult = {
-      summary: this._turnSummary,
+      summary: outcome.summary,
       usage,
       costUsd: null,
-      status: this._turnWasInterrupted ? "aborted" : this._turnIsError ? "failed" : "completed",
-      errorCode: this._turnWasInterrupted ? "aborted" : this._turnIsError ? "execution_error" : null,
-      errorMessage: this._turnWasInterrupted ? "Turn was interrupted" : this._turnErrorMessage,
+      status: outcome.wasInterrupted ? "aborted" : outcome.isError ? "failed" : "completed",
+      errorCode: outcome.wasInterrupted ? "aborted" : outcome.isError ? "execution_error" : null,
+      errorMessage: outcome.wasInterrupted ? "Turn was interrupted" : outcome.errorMessage,
     };
 
     // Drain pending onEvent handlers so callers awaiting send() see a settled
@@ -2048,22 +2266,29 @@ export class CodexSessionImpl implements AgentSession {
     // session whose stdin is dead.
     if (this._state === "closed") return;
 
-    this._state = "idle";
+    // A send() that landed while this delivery was suspended has already begun
+    // a new turn and owns the session. Its result is still owed to it, so this
+    // delivery settles only its OWN generation and touches neither the state
+    // nor the interrupt latch the new turn needs to stay stoppable.
+    //
+    // `delivering === null` must take this branch too. A duplicate terminal
+    // frame for an already-delivered turn (codex can report failure through
+    // both `turn/completed` with a failed status and a separate `turn/failed`)
+    // reaches here with a null latch, and exempting it restored every symptom
+    // the fence exists to prevent: silent Stop, idle-while-running, and a
+    // stale settle.
+    const superseded = this._activeTurnReady !== delivering;
 
-    // Drain ALL pending send() resolvers with this turn's result. Multiple
-    // concurrent sends coalesced into one turn share the same TurnResult.
-    const pending = this._pendingResults.splice(0);
+    // Drain the pending send() resolvers belonging to this turn. Several
+    // concurrent sends coalesced into one turn share the same TurnResult; a
+    // send from a later turn is left in place for its own delivery.
+    const pending = this.takePendingResults(delivering?.generation);
 
-    // Clear per-turn accumulators so a subsequent turn doesn't inherit
-    // stale summary / usage / model.
-    this._turnSummary = null;
-    this._turnUsage = null;
-    this._turnModel = null;
-    this._turnIsError = false;
-    this._turnWasInterrupted = false;
-    this._turnErrorMessage = null;
-    this._turnStartedAt = null;
-    this.clearActiveTurn();
+    if (!superseded) {
+      this._state = "idle";
+      // Accumulators were already snapshotted and cleared in resolveTurn().
+      this.clearActiveTurn(undefined, delivering ?? undefined);
+    }
 
     for (const p of pending) {
       // Skip sends already settled early by timeout / abort.
@@ -2084,8 +2309,9 @@ export class CodexSessionImpl implements AgentSession {
     // Pass current threadId so NDJSON-shaped events (via codex/event wrapper)
     // carry sessionId. v2 notifications parse threadId from params directly
     // and ignore this arg.
-    const event = parseCodexStreamLine(rawLine, this._threadId);
-    if (event) this.dispatchEvent(event);
+    for (const event of parseCodexStreamLines(rawLine, this._threadId)) {
+      this.dispatchEvent(event);
+    }
   }
 
   /**

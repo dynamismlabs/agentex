@@ -153,6 +153,36 @@ function emitCodex() {
       process.exit(0);
       break;
 
+    // Spawns two children and exits without ever reporting their terminus —
+    // the one-shot path has no session to reconcile against, so this is what
+    // an orphaned subagent looks like on the wire.
+    case "collab_orphan":
+      console.log(JSON.stringify({
+        type: "thread.started", thread_id: "codex-thread-1",
+      }));
+      console.log(JSON.stringify({
+        jsonrpc: "2.0",
+        method: "item/completed",
+        params: {
+          threadId: "codex-thread-1",
+          item: {
+            id: "collab-1",
+            type: "collabAgentToolCall",
+            tool: "spawnAgent",
+            prompt: "review the diff",
+            receiverThreadIds: ["child-a", "child-b"],
+            agentsStates: {},
+          },
+        },
+      }));
+      console.log(JSON.stringify({
+        type: "turn.completed",
+        usage: { input_tokens: 10, output_tokens: 5 },
+        model: "o4-mini",
+      }));
+      process.exit(0);
+      break;
+
     case "auth_required":
       process.stderr.write("Error: OPENAI_API_KEY is not set\n");
       process.exit(1);

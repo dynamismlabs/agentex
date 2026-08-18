@@ -679,6 +679,47 @@ describe("getClaudeTaskDetails", () => {
     });
   });
 
+  it("keeps a notification that reports a live status non-terminal", () => {
+    // Hosts are told to drop a task on `phase === "completed"`, so pairing that
+    // phase with `status: "running"` told them to evict a task the same event
+    // says is still running. Terminality follows the status, not the subtype.
+    const ev = parseOne({
+      type: "system",
+      subtype: "task_notification",
+      task_id: "task_live",
+      status: "running",
+      summary: "Still working",
+    });
+    expect(ev).toMatchObject({
+      type: "background_task",
+      taskId: "task_live",
+      phase: "progress",
+      status: "running",
+    });
+  });
+
+  it("keeps a notification reporting pending non-terminal too", () => {
+    const ev = parseOne({
+      type: "system",
+      subtype: "task_notification",
+      task_id: "task_queued",
+      status: "pending",
+    });
+    expect(ev).toMatchObject({ phase: "progress", status: "pending" });
+  });
+
+  it("still terminates on a notification that reports a terminal status", () => {
+    for (const [status, expected] of [["stopped", "stopped"], ["failed", "failed"], ["completed", "completed"]]) {
+      const ev = parseOne({
+        type: "system",
+        subtype: "task_notification",
+        task_id: "task_end",
+        status,
+      });
+      expect(ev).toMatchObject({ phase: "completed", status: expected });
+    }
+  });
+
   it("maps an out-of-range status to null (forward-compat; raw keeps the truth)", () => {
     const ev = parseOne({
       type: "system",

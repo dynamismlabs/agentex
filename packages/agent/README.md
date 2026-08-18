@@ -545,7 +545,8 @@ first-class `background_task` event. Its normalized contract is:
   taskId: string;
   taskType: "subagent" | "process" | "unknown";
   phase: "started" | "progress" | "completed";
-  status: "pending" | "running" | "paused" | "completed" | "failed" | "stopped";
+  // null = "no change reported" — keep the status you already have.
+  status: "pending" | "running" | "paused" | "completed" | "failed" | "stopped" | null;
   description: string | null;
   summary: string | null;
   parentTaskId: string | null;

@@ -20,7 +20,7 @@ export const claudeProvider: ProviderModule = {
   type: "claude",
   capabilities: {
     sessions: true,
-    modelDiscovery: false,
+    modelDiscovery: true,
     quotaProbing: true,
     mcp: true,
     skills: true,
@@ -56,6 +56,7 @@ export const claudeProvider: ProviderModule = {
   createSession: async (ctx: SessionContext): Promise<AgentSession> =>
     (await import("./session.js")).createClaudeSession(ctx),
   resolveAuth: (ctx) => resolveAuthForProvider("claude", ctx),
+  listModels: (options) => import("./discovery.js").then((m) => m.listClaudeModels(options)),
   sessionCodec: claudeSessionCodec,
   checkQuota,
   transcript: claudeTranscriptOps,

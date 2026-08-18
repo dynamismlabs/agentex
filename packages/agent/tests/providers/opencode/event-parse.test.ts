@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   assistantTextFromParts,
   turnStatusFromMessage,
+  terminalOutcome,
   usageFromMessage,
   mapOpenCodePart,
   mapOpenCodeToolCall,
@@ -29,6 +30,34 @@ describe("turnStatusFromMessage", () => {
     expect(turnStatusFromMessage({ error: { name: "x" } })).toBe("failed");
     expect(turnStatusFromMessage({})).toBe("completed");
     expect(turnStatusFromMessage(null)).toBe("completed");
+  });
+});
+
+describe("terminalOutcome", () => {
+  it("flags a silent empty turn: no text + non-clean finish → failed/incomplete", () => {
+    const o = terminalOutcome({ finish: "unknown" }, false);
+    expect(o.status).toBe("failed");
+    expect(o.incomplete).toBe(true);
+    expect(o.errorCode).toBe("incomplete_turn");
+    expect(o.errorMessage).toContain("without sending a reply");
+  });
+  it("does NOT flag when the turn produced an answer, even on an unknown finish", () => {
+    expect(terminalOutcome({ finish: "unknown" }, true)).toMatchObject({
+      status: "completed",
+      incomplete: false,
+    });
+  });
+  it("does NOT flag a clean stop with no text (model chose silence)", () => {
+    expect(terminalOutcome({ finish: "stop" }, false).incomplete).toBe(false);
+  });
+  it("does NOT flag an intermediate tool-calls step", () => {
+    expect(terminalOutcome({ finish: "tool-calls" }, false).incomplete).toBe(false);
+  });
+  it("treats a real error (e.g. an abort) as failed but not incomplete", () => {
+    const o = terminalOutcome({ error: { name: "MessageAbortedError" } }, false);
+    expect(o.status).toBe("failed");
+    expect(o.incomplete).toBe(false);
+    expect(o.errorCode).toBe("agent_error");
   });
 });
 

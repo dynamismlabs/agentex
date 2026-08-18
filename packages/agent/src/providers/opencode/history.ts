@@ -15,7 +15,14 @@ import { assertSessionRecord, createSessionRecord, MalformedSessionRecordError }
 import { acquireOpenCodeRuntime } from "./runtime.js";
 import { opencodeSessionCodec } from "./codec.js";
 import { createOpenCodeSession } from "./http-session.js";
-import { mapOpenCodePart, mapOpenCodeToolCall, type OcBaseInfo } from "./event-parse.js";
+import {
+  assistantTextFromParts,
+  incompleteTurnMessage,
+  mapOpenCodePart,
+  mapOpenCodeToolCall,
+  terminalOutcome,
+  type OcBaseInfo,
+} from "./event-parse.js";
 
 const PAGE_SIZE = 100;
 const MAX_PAGES = 100;
@@ -209,16 +216,37 @@ export function historicalEvents(
   const lastPartId = events.at(-1)?.partId;
   const finished = string(info["finish"]) !== null || info["error"] != null;
   if (messageId && lastPartId && finished) {
-    const error = info["error"] != null;
+    const hasVisibleText = assistantTextFromParts(message.parts).trim().length > 0;
+    const term = terminalOutcome(info, hasVisibleText);
+    // A turn that ended with no reply (upstream dropped the stream) gets a
+    // visible note, deduped against the live session's note by the shared
+    // `:incomplete` event id.
+    if (term.incomplete) {
+      events.push({
+        partId: lastPartId,
+        event: {
+          type: "assistant",
+          text: incompleteTurnMessage(string(info["finish"])),
+          timestamp,
+          providerType: "opencode",
+          sessionId,
+          messageId,
+          eventId: `${messageId}:incomplete`,
+          turnId: null,
+          parentToolCallId: null,
+          raw: { synthetic: "incomplete_turn", info },
+        },
+      });
+    }
     events.push({
       partId: lastPartId,
       event: {
         type: "result",
         text: "",
         costUsd: typeof info["cost"] === "number" ? info["cost"] : null,
-        isError: error,
+        isError: term.status !== "completed",
         stopReason: null,
-        terminalReason: error ? "failed" : "completed",
+        terminalReason: term.status,
         numTurns: 1,
         durationMs: null,
         timestamp,

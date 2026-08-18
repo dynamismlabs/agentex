@@ -1203,17 +1203,29 @@ export type StreamEvent =
    * `phase: "completed"` settles only this task. It is never a root turn
    * result and must not be used to resolve `SendHandle.result`.
    *
-   * Events are reducer-friendly snapshots. `status` is always populated,
-   * while description/summary may be null when the provider did not report
-   * them. `parentTaskId` identifies a nested background task when that lineage
-   * is available.
+   * Events are reducer-friendly snapshots, and every optional field follows one
+   * rule: null means the provider did not report it, so keep what you already
+   * have. That includes `status` — a sparse patch can rename a task without
+   * saying anything about whether it is still running. `parentTaskId`
+   * identifies a nested background task when that lineage is available.
    */
   | ({
       type: "background_task";
       taskId: string;
       taskType: BackgroundTaskType;
       phase: BackgroundTaskPhase;
-      status: BackgroundTaskStatus;
+      /**
+       * The task's state as the provider reported it, or `null` for "no change
+       * reported" — read it as "keep whatever you have".
+       *
+       * Null rather than a default because the alternative is asserting a state
+       * the provider never sent. A sparse patch that only renames a task would
+       * otherwise claim `running` and silently resurrect a `paused` one. This
+       * matches `description` and `summary`, where null already means "the
+       * provider did not report this"; status was the one field that invented a
+       * value instead of admitting absence.
+       */
+      status: BackgroundTaskStatus | null;
       description: string | null;
       summary: string | null;
       parentTaskId: string | null;
@@ -1373,6 +1385,8 @@ export interface AuthResolveContext {
 export interface ProviderModel {
   id: string;
   name: string;
+  /** One-line blurb from the provider's own catalog, when it ships one. */
+  description?: string;
   provider?: string;
   providerName?: string;
   variants?: Array<{

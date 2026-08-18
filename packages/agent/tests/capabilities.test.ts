@@ -25,7 +25,7 @@ describe("ProviderCapabilities", () => {
     const caps = getProvider("claude").capabilities;
     expect(caps).toEqual({
       sessions: true,
-      modelDiscovery: false,
+      modelDiscovery: true,
       quotaProbing: true,
       mcp: true,
       skills: true,
@@ -143,10 +143,10 @@ describe("ProviderCapabilities", () => {
     }
   });
 
-  it("codex has sessions but no model discovery, mcp, or quota", () => {
+  it("codex has sessions and model discovery but no mcp or quota", () => {
     const caps = getProvider("codex").capabilities;
     expect(caps.sessions).toBe(true);
-    expect(caps.modelDiscovery).toBe(false);
+    expect(caps.modelDiscovery).toBe(true);
     expect(caps.quotaProbing).toBe(false);
     expect(caps.mcp).toBe(false);
   });
@@ -218,11 +218,14 @@ describe("ProviderCapabilities", () => {
   });
 
   it("capabilities.modelDiscovery matches presence of listModels", () => {
+    // Both directions. Hosts branch on the flag to decide whether to offer a
+    // picker at all, so a provider that implements discovery while declaring
+    // none is just as broken as the reverse — the capability is never read and
+    // the implementation is never called.
     for (const name of listProviders()) {
       const provider = getProvider(name);
-      if (provider.capabilities.modelDiscovery) {
-        expect(provider.listModels).toBeDefined();
-      }
+      expect(Boolean(provider.listModels), `${name} listModels vs modelDiscovery`)
+        .toBe(Boolean(provider.capabilities.modelDiscovery));
     }
   });
 

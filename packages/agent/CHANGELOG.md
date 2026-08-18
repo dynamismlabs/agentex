@@ -1,5 +1,190 @@
 # Changelog
 
+## 0.0.35 — Codex turn-boundary correctness and model discovery
+
+### Fixed
+
+- A Codex `send()` issued while the previous turn's result was still being
+  delivered is now a turn of its own. It previously joined the finished turn,
+  which left it with no interrupt latch: `interrupt()` found nothing to target
+  and returned as though it had succeeded, so Stop was a silent no-op — the
+  exact failure 0.0.33 set out to remove. The same send could also be settled
+  with the *previous* turn's `TurnResult`, so `await send()` resolved
+  `completed` while the agent was still working. Turn latches now carry a
+  generation, result delivery drains only its own generation, and a superseded
+  delivery no longer clears the running turn's state, accumulators, or latch.
+  The window is real time: it spans `await this._eventChain` (any host
+  persisting events) and the on-disk usage scan when `turn/completed` carries
+  no usage.
+- Turn outcomes are now snapshotted at the terminal frame rather than read at
+  delivery time. Delivery is asynchronous, so reading the live accumulators
+  read whichever turn was running *then*: a turn that started during the window
+  inherited the previous turn's failure and reported its own summary alongside
+  someone else's error. Clearing on the way out was not an option either — the
+  usage-scan path re-reads state after an await.
+- A duplicate terminal frame for an already-delivered turn no longer bypasses
+  the generation fence. Codex can report failure through both `turn/completed`
+  with a failed status and a separate `turn/failed`; the second arrives with no
+  active latch, and exempting that case restored every symptom the fence
+  exists to prevent.
+- Claude `task_updated` patches no longer assert `running`. A patch that only
+  renames a task said nothing about liveness yet claimed the task was running,
+  silently resurrecting a `paused` one. `task_started` and `task_progress` still
+  imply `running`, because those events are emitted by a running task.
+- Codex approval requests now carry the right fields. `toolUseId` reads
+  `itemId` (the protocol has no `id` here, so it was always `""`), and
+  file-change approvals describe themselves from `grantRoot` rather than a
+  `path` field that does not exist. Confirmed against
+  `codex app-server generate-json-schema` on 0.148.
+- Child-thread approvals and questions no longer drive root session state, and
+  carry `agentId` so a host can attribute them to the subagent that asked. This
+  covers all three server-to-client request handlers: command-execution
+  approval, file-change approval, and `requestUserInput`. Every one of them
+  requires `threadId` in the protocol, so the scoping is read from the wire
+  rather than inferred.
+- `item/permissions/requestApproval` is handled instead of falling through to
+  the generic empty ack, which the schema rejects —
+  `PermissionsRequestApprovalResponse` requires a `permissions` profile.
+  Allowing echoes the requested profile; refusing, or having no host handler,
+  grants nothing.
+- Claude discovery no longer returns an ambiguous empty list. A control probe
+  proves the mechanism still works before any candidate is judged, so `[]` now
+  means "this CLI recognizes none of them" rather than doubling as "the probe
+  broke". A broken mechanism throws, which callers already treat as "use your
+  fallback catalog".
+- The redundant direct `startBackgroundTaskPoller` call sites are gone. They
+  fired mid-item, before a later line in the same chunk could mark a task
+  terminal, which spawned a `thread/read` for a task that was already finished.
+- Collaboration tool calls addressed to several receiver threads now emit a
+  `background_task` for every child. Only the first receiver was reported, so
+  the rest of a fan-out never existed as far as the host could tell. Added
+  `parseCodexStreamLines()`, which returns every event a line produces;
+  `parseCodexStreamLine()` remains as a first-event-only wrapper.
+- Root `collabAgentToolCall` items that map to no task edge (`sendInput` to an
+  unknown task, metadata-only calls with no change) are forwarded as `unknown`
+  events again instead of being dropped, restoring the forward-compat escape
+  hatch for wire shapes that are not modeled yet.
+- `executeCodexProvider` now emits a terminal `background_task` edge with
+  status `stopped` for children still running when the one-shot process exits.
+  The capability is declared provider-wide, but the one-shot path has no
+  session to reconcile against, so those children previously stayed `running`
+  forever from the host's view.
+- A Claude `task_notification` that reports a live status is no longer forced
+  terminal. Every notification produced `phase: "completed"` regardless of the
+  status it carried, so an event saying `status: "running"` also told hosts to
+  drop the task — the documented contract is to remove a task from the active
+  set on `phase === "completed"`. Terminality now follows the status. A
+  notification with no status is still the completion signal it has always been.
+- Codex background tasks registered through the parser's `subAgentActivity`
+  branch now get a reconciliation poller. Only the collaboration handler
+  started one, so those tasks had no safety net and depended entirely on the
+  child notification arriving — the exact failure 0.0.34 exists to survive.
+- A Codex child thread announced with no parent thread id now writes a stderr
+  notice instead of silently disabling background-task tracking and
+  reconciliation for that child.
+- Codex background-task bookkeeping no longer grows without bound. A terminal
+  task keeps its identity (that is what suppresses duplicate edges and blocks
+  resurrection) and its description (the reactivation path reads it precisely
+  because the record is terminal), but releases `summary`, which is the
+  genuinely unbounded field — full agent messages, appended per item. Both maps
+  are cleared on `close()`.
+- Claude's top reasoning rung is no longer a silent downgrade. `ProviderConfig.effort`
+  of `"ultra"` now reaches the CLI as `--effort ultracode`, the token Claude Code
+  actually accepts. Previously it was passed through verbatim, and the CLI answered
+  with a stderr warning and then ran the turn at the session default, so callers
+  asking for maximum reasoning got ordinary reasoning with no error to notice.
+  Codex is unaffected: it names that rung `ultra` natively.
+- `ListModelsOptions.cacheTtlMs` is now honored. It has been part of the public
+  shape since `listModels()` shipped but nothing read it, so callers passing a TTL
+  paid for a fresh CLI round trip every call. A TTL of `0` or `undefined` still
+  forces a refresh, and a rejected discovery is never cached.
+- An OpenCode turn that ends with no reply is no longer reported as a clean
+  completion. When the upstream provider drops the stream, OpenCode records the
+  assistant message with `finish: "unknown"`, no text, and no error, which the
+  adapter mapped to a successful empty turn — indistinguishable from a stall.
+  Such a turn now resolves `failed` and emits a visible assistant note
+  explaining the model returned no content, so the user can retry instead of
+  waiting on a turn that already ended. Detection keys on a terminal message
+  with no visible text and a non-clean finish reason, so a real answer or a
+  clean stop is never touched, and a user interrupt (which OpenCode marks with a
+  `MessageAbortedError`) still reports as an error rather than an empty turn.
+  Live and reconcile paths share a `${messageId}:incomplete` event id so a
+  catch-up dedups the note instead of duplicating it.
+- An OpenCode user prompt is no longer echoed back as an assistant message. The
+  live session mapped every streamed text part to assistant output, but OpenCode
+  re-streams the user message's own text part once a turn is active, so each
+  prompt surfaced a second time as if the agent had said it. The session now
+  tracks message roles from `message.updated` frames and drops parts belonging
+  to a user message; an as-yet-unknown role still emits, so a frame-ordering
+  race can never suppress genuine assistant output.
+- OpenCode's live terminal `result` event now uses the same `${messageId}:result`
+  id as the reconcile path. The two paths previously produced different ids for
+  the same turn terminus, so a reconcile after a live turn appended a duplicate
+  terminal marker instead of deduping against the one already written.
+
+### Added
+
+- `codex.listModels()` reads `codex debug models`, so Codex models arrive with the
+  reasoning levels each one actually supports and its own default. These are
+  genuinely per-model: 5.6 Sol advertises `ultra`, 5.5 stops at `xhigh`.
+- `claude.listModels()` validates the tier aliases (`opus`, `sonnet`, `haiku`,
+  `fable`) against the installed binary and reports the efforts it accepts.
+  Claude Code ships no catalog command, so this works by asking the CLI to
+  validate each value: `--help` enumerates the efforts it documents, and anything
+  it accepts without documenting (`ultracode`) is recovered by probing. Probes use
+  `--bare` where available so they cannot fire a user's hooks, and pass an empty
+  prompt so they exit before reaching the network. No probe costs a token.
+- `claude.listClaudeEfforts()` for hosts that want the effort ladder without a
+  model list. Claude applies one `--effort` per session rather than per model.
+- `ProviderModel.description` carries a provider's own one-line blurb through.
+- `capabilities.modelDiscovery` is now `true` for `claude` and `codex`, and the
+  contract test now checks both directions so a provider cannot declare
+  discovery it does not implement, or implement discovery it does not declare.
+
+### Compatibility
+
+- Discovery is curated-list-plus-validation for Claude, not enumeration. A tier
+  alias this library has never heard of cannot be discovered, and a recognized
+  `--model` value proves the binary knows the name, not that the account is
+  entitled to it.
+- A cold Claude discovery spawns the CLI several times: measured ~1.8-3s
+  depending on machine load, against ~0.1s for Codex. Two of those spawns
+  (`--help` and the control probe) are serial; the rest run concurrently. Pass
+  `cacheTtlMs` and keep a static fallback for first paint.
+- Concurrent sends still coalesce into one turn and share its `TurnResult`.
+  What changed is that a send arriving after the previous turn has terminated
+  is no longer treated as concurrent with it.
+- **Migration note for 0.0.32 and earlier.** 0.0.33 moved Claude task lifecycle
+  from `type: "unknown"` to `type: "background_task"`; that was listed under
+  Added, but for hosts it is a breaking change. Code shaped like
+  `if (event.type === "unknown") { getClaudeTaskDetails(event) }` stops seeing
+  tasks. `getClaudeTaskDetails()` still accepts legacy `unknown` events, which
+  covers replaying stored history but not a live handler keyed on the old
+  discriminator. Branch on `type === "background_task"` and treat the `unknown`
+  form as the compatibility path.
+- **`background_task.status` is now `BackgroundTaskStatus | null`.** Null means
+  "no change reported" — keep whatever you have. This is a type-level breaking
+  change and deliberately so: it fails loudly at compile time rather than
+  silently. Only Claude emits it, and only where the wire genuinely says
+  nothing; Codex always reports a concrete status.
+- The generic fallback for unhandled Codex server requests still replies `{}`.
+  Every server request the protocol defines but this library does not handle
+  declares required response fields, so that reply is schema-invalid for all of
+  them — the same class as the `item/permissions/requestApproval` fix in this
+  release. A JSON-RPC error reply is the honest answer, but `rpcResponse` has no
+  error path and adding one is a behavior change (an error can abort a turn
+  where `{}` limps along), so it is deferred rather than rushed in. Pre-existing;
+  the misleading "ack to unblock the turn" comment has been corrected.
+- Codex child reconciliation still polls `thread/read` every 2s per active
+  child regardless of whether notifications are flowing. Unchanged here and
+  still an open decision. `thread/status/changed` and `thread/closed` exist in
+  the app-server protocol and would allow a push-based design with polling
+  demoted to a silence-timeout fallback; worth evaluating before committing to
+  polling permanently.
+- Codex child reconciliation still polls `thread/read` every 2s for each active
+  child regardless of whether notifications are flowing. That cost is unchanged
+  here and remains an open decision, not a regression.
+
 ## 0.0.34 - Codex collaboration task lifecycle
 
 ### Fixed

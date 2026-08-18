@@ -117,6 +117,41 @@ describe("OpenCode durable history", () => {
       .toEqual(["assistant"]);
   });
 
+  it("surfaces a silent empty turn (dropped stream) as a note + failed result", () => {
+    const emptyTurn = {
+      info: { id: "msg_9001", role: "assistant", finish: "unknown", time: { created: 1 } },
+      parts: [
+        { id: "prt_start", messageID: "msg_9001", sessionID: "ses_test", type: "step-start" },
+        { id: "prt_reason", messageID: "msg_9001", sessionID: "ses_test", type: "reasoning", text: "thinking" },
+        { id: "prt_finish", messageID: "msg_9001", sessionID: "ses_test", type: "step-finish" },
+      ],
+    };
+    const events = historicalEvents(emptyTurn, "ses_test");
+    const note = events.find((item) => item.event.type === "assistant");
+    expect(note?.event).toMatchObject({ eventId: "msg_9001:incomplete" });
+    expect(note?.event.type === "assistant" && note.event.text).toContain("without sending a reply");
+    // Same id the live session emits, so a later catch-up dedups instead of duplicating.
+    const result = events.find((item) => item.event.type === "result");
+    expect(result?.event).toMatchObject({
+      eventId: "msg_9001:result",
+      isError: true,
+      terminalReason: "failed",
+    });
+  });
+
+  it("does not add an incomplete note to a normal answered turn", () => {
+    const events = historicalEvents(message(3), "ses_test");
+    expect(
+      events.some(
+        (item) => item.event.type === "assistant" && String(item.event.eventId).endsWith(":incomplete"),
+      ),
+    ).toBe(false);
+    expect(events.find((item) => item.event.type === "result")?.event).toMatchObject({
+      isError: false,
+      terminalReason: "completed",
+    });
+  });
+
   it("preserves empty-on-404 behavior for known-session attachment catch-up", async () => {
     const client = {
       async request() { return new Response(null, { status: 404 }); },

@@ -250,6 +250,10 @@ describe("CodexSession — onEvent dispatch", () => {
       },
     }));
 
+    // The poller now starts uniformly from observeBackgroundTask, deferred one
+    // microtask so an item that turns terminal on a later line does not spawn a
+    // read first. Same behavior, one tick later.
+    await Promise.resolve();
     const readRequest = writes
       .map((line) => JSON.parse(line) as Record<string, unknown>)
       .find((message) => message["method"] === "thread/read");
@@ -1409,6 +1413,252 @@ describe("CodexSession — interrupt", () => {
       },
     });
     await expect(second.result).resolves.toMatchObject({ status: "aborted" });
+  });
+
+  /**
+   * The result-delivery window. `markTurnTerminalObserved()` leaves the latch
+   * in place, and `deliverTurnResult()` only clears it after `await
+   * this._eventChain` — real time whenever a host persists events, and longer
+   * still when turn/completed carried no usage and the on-disk scan runs. Every
+   * other interrupt test awaits `first.result` before sending again, which is
+   * exactly the ordering that closes this window.
+   */
+  function slowHostSession(): {
+    session: CodexSessionImpl;
+    writes: Array<Record<string, unknown>>;
+  } {
+    let turnNumber = 0;
+    const { proc, writes } = makeRpcProc({
+      initialize: () => ({}),
+      "thread/start": () => ({ thread: { id: "root-thread" } }),
+      "turn/start": () => ({ turn: { id: `root-turn-${++turnNumber}`, status: "inProgress" } }),
+      "turn/interrupt": () => ({}),
+    });
+    const session = new CodexSessionImpl(
+      proc,
+      { onEvent: async () => { await new Promise((resolve) => setTimeout(resolve, 60)); } },
+      "/tmp",
+      "test-model",
+      null,
+    );
+    return { session, writes };
+  }
+
+  function completeTurn(session: CodexSessionImpl, id: string): void {
+    feedCodex(session, {
+      jsonrpc: "2.0",
+      method: "turn/completed",
+      params: {
+        threadId: "root-thread",
+        turn: { id, status: "completed" },
+        usage: { input_tokens: 1, output_tokens: 1 },
+      },
+    });
+  }
+
+  it("interrupts a turn started while the previous result is still draining", async () => {
+    const { session, writes } = slowHostSession();
+    await session.handshake();
+
+    const first = await session.send("turn one");
+    completeTurn(session, "root-turn-1");
+
+    // Land the second send inside the drain window: no await on first.result.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await session.send("turn two");
+    await new Promise((resolve) => setTimeout(resolve, 120));
+
+    await session.interrupt();
+
+    expect(writesFor(writes, "turn/interrupt")).toHaveLength(1);
+    expect(writesFor(writes, "turn/interrupt")[0]?.["params"]).toEqual({
+      threadId: "root-thread",
+      turnId: "root-turn-2",
+    });
+    await expect(first.result).resolves.toMatchObject({ status: "completed" });
+  });
+
+  it("does not settle a later turn's send with the previous turn's result", async () => {
+    const { session } = slowHostSession();
+    await session.handshake();
+
+    const first = await session.send("turn one");
+    completeTurn(session, "root-turn-1");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const second = await session.send("turn two");
+    await new Promise((resolve) => setTimeout(resolve, 120));
+
+    await expect(first.result).resolves.toMatchObject({ status: "completed" });
+    // Turn two is still running, so its handle must not have settled.
+    const settled = Symbol("pending");
+    expect(await Promise.race([
+      second.result,
+      new Promise((resolve) => setTimeout(() => resolve(settled), 50)),
+    ])).toBe(settled);
+
+    completeTurn(session, "root-turn-2");
+    await expect(second.result).resolves.toMatchObject({ status: "completed" });
+  });
+
+  it("keeps the session busy while a turn started during delivery is running", async () => {
+    const { session } = slowHostSession();
+    await session.handshake();
+
+    await session.send("turn one");
+    completeTurn(session, "root-turn-1");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await session.send("turn two");
+    await new Promise((resolve) => setTimeout(resolve, 120));
+
+    // Reporting idle here would tell a host the agent is done and free.
+    expect(session.state).not.toBe("idle");
+  });
+
+  it("does not let a superseded delivery clear the running turn's summary", async () => {
+    const { session } = slowHostSession();
+    await session.handshake();
+
+    await session.send("turn one");
+    completeTurn(session, "root-turn-1");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const second = await session.send("turn two");
+
+    // Summary accumulated by turn two while turn one is still delivering.
+    feedCodex(session, {
+      jsonrpc: "2.0",
+      method: "item/completed",
+      params: {
+        threadId: "root-thread",
+        item: { id: "item-2", type: "agentMessage", text: "turn two answer" },
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 120));
+
+    completeTurn(session, "root-turn-2");
+    await expect(second.result).resolves.toMatchObject({ summary: "turn two answer" });
+  });
+
+  it("does not leak a failed turn's outcome into the turn that supersedes it", async () => {
+    // The accumulators are shared mutable state. Skipping their reset to avoid
+    // wiping the new turn's values left the OLD turn's values in place instead,
+    // so turn two reported its own summary alongside turn one's failure.
+    const { session } = slowHostSession();
+    await session.handshake();
+
+    const first = await session.send("turn one");
+    feedCodex(session, {
+      jsonrpc: "2.0",
+      method: "turn/failed",
+      params: { threadId: "root-thread", turn: { id: "root-turn-1" }, error: { message: "boom" } },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const second = await session.send("turn two");
+    feedCodex(session, {
+      jsonrpc: "2.0",
+      method: "item/completed",
+      params: { threadId: "root-thread", item: { id: "i2", type: "agentMessage", text: "all good" } },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    await expect(first.result).resolves.toMatchObject({ status: "failed" });
+
+    completeTurn(session, "root-turn-2");
+    await expect(second.result).resolves.toMatchObject({
+      summary: "all good",
+      status: "completed",
+      errorCode: null,
+      errorMessage: null,
+    });
+  });
+
+  it("fences a duplicate terminal frame for an already-delivered turn", async () => {
+    // Codex can report failure through `turn/completed` with a failed status
+    // AND a separate `turn/failed`. The second frame reaches delivery with a
+    // null latch, which used to bypass the fence and clear a running turn.
+    const { session, writes } = slowHostSession();
+    await session.handshake();
+
+    const first = await session.send("turn one");
+    completeTurn(session, "root-turn-1");
+    await first.result;
+
+    feedCodex(session, {
+      jsonrpc: "2.0",
+      method: "turn/failed",
+      params: { threadId: "root-thread", turn: { id: "root-turn-1" }, error: { message: "late" } },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const second = await session.send("turn two");
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    const pending = Symbol("pending");
+    expect(await Promise.race([
+      second.result,
+      new Promise((resolve) => setTimeout(() => resolve(pending), 50)),
+    ])).toBe(pending);
+    expect(session.state).not.toBe("idle");
+
+    await session.interrupt();
+    expect(writesFor(writes, "turn/interrupt")).toHaveLength(1);
+    expect(writesFor(writes, "turn/interrupt")[0]?.["params"]).toEqual({
+      threadId: "root-thread",
+      turnId: "root-turn-2",
+    });
+  });
+
+  it("keeps turns separate across the on-disk usage scan, the longest gap", async () => {
+    // When turn/completed carries no usage, delivery detours through a
+    // filesystem scan before it resumes — a far wider window than the event
+    // chain alone, and the one branch that reads turn state after an await.
+    // It is also where clearing the accumulators cost us `_turnStartedAt` once.
+    const { session } = slowHostSession();
+    await session.handshake();
+
+    const first = await session.send("turn one");
+    (session as unknown as { _turnStartedAt: Date | null })._turnStartedAt = new Date();
+    feedCodex(session, {
+      jsonrpc: "2.0",
+      method: "item/completed",
+      params: { threadId: "root-thread", item: { id: "i1", type: "agentMessage", text: "A" } },
+    });
+    feedCodex(session, {
+      jsonrpc: "2.0",
+      method: "turn/failed",
+      params: { threadId: "root-thread", turn: { id: "root-turn-1" }, error: { message: "errA" }, message: "errA" },
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const second = await session.send("turn two");
+    feedCodex(session, {
+      jsonrpc: "2.0",
+      method: "item/completed",
+      params: { threadId: "root-thread", item: { id: "i2", type: "agentMessage", text: "B" } },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    await expect(first.result).resolves.toMatchObject({ status: "failed", summary: "A" });
+    expect(session.state).not.toBe("idle");
+
+    completeTurn(session, "root-turn-2");
+    await expect(second.result).resolves.toMatchObject({ status: "completed", summary: "B" });
+  });
+
+  it("still delivers normally when no send arrives during the window", async () => {
+    const { session, writes } = slowHostSession();
+    await session.handshake();
+
+    const first = await session.send("turn one");
+    completeTurn(session, "root-turn-1");
+    await expect(first.result).resolves.toMatchObject({ status: "completed" });
+    expect(session.state).toBe("idle");
+
+    // The latch was released, so the next turn becomes leader in the normal way.
+    await session.send("turn two");
+    await session.interrupt();
+    expect(writesFor(writes, "turn/interrupt")[0]?.["params"]).toEqual({
+      threadId: "root-thread",
+      turnId: "root-turn-2",
+    });
   });
 
   it("waits for the root turn id and coalesces repeated interrupt calls", async () => {

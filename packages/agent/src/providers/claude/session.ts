@@ -26,6 +26,7 @@ import { claudeTranscriptOps } from "./transcript.js";
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { translateEndpoint } from "../../utils/endpoint.js";
+import { claudeEffortFlagValue } from "./effort.js";
 import { buildSkillsDir, cleanupSkillsDir } from "../../utils/skills.js";
 import { claudeFeatureArgs, cleanupMcpConfig, stageMcpConfig } from "./mcp.js";
 import { createToolNameTracker } from "../../utils/tool-names.js";
@@ -193,7 +194,7 @@ export async function createClaudeSession(ctx: SessionContext): Promise<AgentSes
     args.push("--permission-prompt-tool", "stdio");
   }
   if (config.model) args.push("--model", config.model);
-  if (config.effort) args.push("--effort", config.effort);
+  if (config.effort) args.push("--effort", claudeEffortFlagValue(config.effort));
   if (config.maxTurns && config.maxTurns > 0) args.push("--max-turns", String(config.maxTurns));
   if (config.instructionsFile) args.push("--append-system-prompt-file", config.instructionsFile);
   if (skillsDir) args.push("--add-dir", skillsDir);

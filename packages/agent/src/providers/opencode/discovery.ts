@@ -1,5 +1,6 @@
 import type { ListModelsOptions, ProviderModel } from "../../types.js";
 import { acquireOpenCodeRuntime } from "./runtime.js";
+import { withModelCache } from "../../utils/model-cache.js";
 
 function record(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -59,11 +60,13 @@ export function openCodeModelsFromPayload(payload: Record<string, unknown>): Pro
 }
 
 export async function listOpenCodeModels(options: ListModelsOptions = {}): Promise<ProviderModel[]> {
-  const runtime = await acquireOpenCodeRuntime(options);
-  try {
-    const payload = await runtime.server.client.json<Record<string, unknown>>("/provider");
-    return openCodeModelsFromPayload(payload);
-  } finally {
-    runtime.server.release();
-  }
+  return withModelCache("opencode", options, options.cacheTtlMs, async () => {
+    const runtime = await acquireOpenCodeRuntime(options);
+    try {
+      const payload = await runtime.server.client.json<Record<string, unknown>>("/provider");
+      return openCodeModelsFromPayload(payload);
+    } finally {
+      runtime.server.release();
+    }
+  });
 }

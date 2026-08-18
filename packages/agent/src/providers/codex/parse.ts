@@ -254,10 +254,10 @@ export function parseCodexJsonl(stdout: string): CodexParsedResult {
  *                   v2 parses it from `params.threadId` directly and
  *                   ignores this arg.
  */
-export function parseCodexStreamLine(
+function parseCodexStreamLineRaw(
   line: string,
   sessionId: string | null = null,
-): StreamEvent | null {
+): StreamEvent | StreamEvent[] | null {
   const event = parseJson(line);
   if (!event) return null;
 
@@ -274,7 +274,7 @@ export function parseCodexStreamLine(
 // v2 JSON-RPC notifications (codex --json app-server mode)
 // ---------------------------------------------------------------------------
 
-function parseV2Notification(event: Record<string, unknown>): StreamEvent | null {
+function parseV2Notification(event: Record<string, unknown>): StreamEvent | StreamEvent[] | null {
   const method = asString(event["method"], "");
   const params = parseObject(event["params"]);
 
@@ -459,31 +459,41 @@ function parseV2Notification(event: Record<string, unknown>): StreamEvent | null
     }
     if (itemType === "collabAgentToolCall") {
       const tool = asString(item["tool"], "");
-      const taskIds = parseStringArray(item["receiverThreadIds"]);
       const states = parseObject(item["agentsStates"]);
-      const taskId = taskIds[0] ?? Object.keys(states)[0] ?? "";
+      // Every receiver, not just the first. One collab call can spawn a fan-out
+      // of children, and taking `[0]` reported one of them while the rest never
+      // existed as far as the host could tell. The session path already
+      // iterates all of them; this keeps the one-shot path consistent.
+      const taskIds = [...new Set([
+        ...parseStringArray(item["receiverThreadIds"]),
+        ...Object.keys(states),
+      ])];
       // A completed spawnAgent call means the child exists, not that the
       // child's own turn is complete. Its state (usually pendingInit) and a
       // later thread/read response carry the child lifecycle.
-      if (!taskId || (tool !== "spawnAgent" && !(taskId in states))) {
+      const tracked = taskIds.filter((id) => id && (tool === "spawnAgent" || id in states));
+      if (tracked.length === 0) {
         return {
           type: "unknown",
           subtype: `item/completed:${itemType}`,
           ...base,
         };
       }
-      const state = codexBackgroundTaskState(states[taskId]);
-      return {
-        type: "background_task",
-        taskId,
-        taskType: "subagent",
-        phase: state.phase,
-        status: state.status,
-        description: asNullableString(item["prompt"]),
-        summary: state.summary,
-        parentTaskId: null,
-        ...base,
-      };
+      const description = asNullableString(item["prompt"]);
+      return tracked.map((taskId) => {
+        const state = codexBackgroundTaskState(states[taskId]);
+        return {
+          type: "background_task" as const,
+          taskId,
+          taskType: "subagent" as const,
+          phase: state.phase,
+          status: state.status,
+          description,
+          summary: state.summary,
+          parentTaskId: null,
+          ...base,
+        };
+      });
     }
     if (itemType === "userMessage") {
       // Consumer persists user input on the write path before calling send().
@@ -558,6 +568,38 @@ function parseV2Notification(event: Record<string, unknown>): StreamEvent | null
     subtype: method,
     ...makeBase(null),
   };
+}
+
+/**
+ * Every event a single Codex stream line produces.
+ *
+ * One line is usually one event, but a collab tool call addressed to several
+ * receiver threads describes several children at once, and each needs its own
+ * `background_task` edge or the host never learns those children exist.
+ */
+export function parseCodexStreamLines(
+  line: string,
+  sessionId: string | null = null,
+): StreamEvent[] {
+  const parsed = parseCodexStreamLineRaw(line, sessionId);
+  if (parsed === null) return [];
+  return Array.isArray(parsed) ? parsed : [parsed];
+}
+
+/**
+ * First event only.
+ *
+ * @internal
+ * @deprecated Use {@link parseCodexStreamLines}. This exists for tests that
+ * assert on a single event; on a collab fan-out it discards every child after
+ * the first, which is the bug `parseCodexStreamLines` was added to fix. It is
+ * not re-exported from the package root and has no production callers.
+ */
+export function parseCodexStreamLine(
+  line: string,
+  sessionId: string | null = null,
+): StreamEvent | null {
+  return parseCodexStreamLines(line, sessionId)[0] ?? null;
 }
 
 function extractReasoningText(item: Record<string, unknown>): string {
