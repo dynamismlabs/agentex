@@ -491,6 +491,12 @@ class OpenCodeSession implements AgentSession {
   private finishTurn(): void {
     this._turnActive = false;
     this._inFlight = null;
+    // Cleared at turn end, not with the sibling dedup maps at turn start: the
+    // user message's role has to survive from its `message.updated` frame into
+    // the part stream that follows within the same turn, so clearing at the
+    // start would reintroduce the prompt echo. Bounding it here keeps the map
+    // from growing for the whole life of a long-running session.
+    this._messageRoles.clear();
     if (this._state !== "closed") this._state = "idle";
   }
 
@@ -615,6 +621,13 @@ class OpenCodeSession implements AgentSession {
    * stable `:incomplete` event id is shared with the reconcile path
    * (`historicalEvents`) so a later catch-up dedups against this live note
    * instead of duplicating it.
+   *
+   * This is library-authored prose, not model output. It is emitted as
+   * `type: "assistant"` because that is the only surface a host renders, and is
+   * tagged `raw.synthetic: "incomplete_turn"`. A host that replays transcript
+   * history back into a model (context rebuilding, summarization) should filter
+   * events carrying `raw.synthetic` so this note is never fed back as assistant
+   * turn content.
    */
   private async emitIncompleteNote(info: Record<string, unknown>): Promise<void> {
     const messageId = str(info["id"]);

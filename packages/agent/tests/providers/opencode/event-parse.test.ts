@@ -53,11 +53,23 @@ describe("terminalOutcome", () => {
   it("does NOT flag an intermediate tool-calls step", () => {
     expect(terminalOutcome({ finish: "tool-calls" }, false).incomplete).toBe(false);
   });
-  it("treats a real error (e.g. an abort) as failed but not incomplete", () => {
+  it("maps a MessageAbortedError to aborted (not agent_error), with a clean message", () => {
     const o = terminalOutcome({ error: { name: "MessageAbortedError" } }, false);
+    expect(o.status).toBe("aborted");
+    expect(o.incomplete).toBe(false);
+    expect(o.errorCode).toBe("aborted");
+    expect(o.errorMessage).not.toContain("{");
+  });
+  it("treats a genuine error as failed/agent_error, not incomplete", () => {
+    const o = terminalOutcome({ error: { name: "ProviderError" } }, false);
     expect(o.status).toBe("failed");
     expect(o.incomplete).toBe(false);
     expect(o.errorCode).toBe("agent_error");
+  });
+  it("does NOT reclassify an unfinished/malformed message (no finish, no error)", () => {
+    // Guards the live path: an empty `/message` body must not flip to failed.
+    expect(terminalOutcome(null, false)).toMatchObject({ status: "completed", incomplete: false });
+    expect(terminalOutcome({}, false)).toMatchObject({ status: "completed", incomplete: false });
   });
 });
 

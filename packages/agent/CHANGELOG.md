@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.0.36 — OpenCode empty-turn follow-ups
+
+Follow-ups to the OpenCode empty-turn handling in 0.0.35.
+
+### Fixed
+
+- The empty-turn classifier's "finished" guard now lives in `terminalOutcome`,
+  so the live and reconcile paths agree. The live path called it unconditionally
+  on the `/message` response, while the reconcile path gated on the message
+  having a finish reason or an error first. With `info` absent (an empty or
+  malformed body) `terminalOutcome` walked to `failed`/`incomplete_turn` but
+  suppressed the note — which needs `info` — producing a failed turn with
+  nothing in the transcript explaining it, the exact silent stall the 0.0.35
+  change removes, reached from the other side. A message with neither a finish
+  reason nor an error now stays `completed`.
+- `_messageRoles` (the map that suppresses the prompt echo) is now cleared at
+  turn end instead of never. It sat next to the per-turn dedup maps but was
+  omitted from their turn-start reset, and could not join it: a user message's
+  role has to survive from its `message.updated` frame into the part stream that
+  follows within the same turn, so clearing at the start would reintroduce the
+  echo. Clearing at turn end bounds the map to one turn's messages instead of
+  growing for the session's whole life.
+- A user interrupt performed through OpenCode's own UI now reports as `aborted`,
+  not `failed`. When OpenCode records a `MessageAbortedError`, the classifier
+  maps it to `status: "aborted"` with a plain message, matching self-aborts and
+  Codex's handling of the same action, rather than `agent_error` with a
+  JSON-stringified error object.
+
+### Compatibility
+
+- The incomplete-turn note is emitted as `type: "assistant"` (the only surface a
+  host renders) and tagged `raw.synthetic: "incomplete_turn"`. It is
+  library-authored prose, not model output: a host that replays transcript
+  history back into a model (context rebuilding, summarization) should filter
+  events carrying `raw.synthetic` so the note is never fed back as assistant turn
+  content.
+
 ## 0.0.35 — Codex turn-boundary correctness and model discovery
 
 ### Fixed
@@ -120,7 +157,12 @@
 - OpenCode's live terminal `result` event now uses the same `${messageId}:result`
   id as the reconcile path. The two paths previously produced different ids for
   the same turn terminus, so a reconcile after a live turn appended a duplicate
-  terminal marker instead of deduping against the one already written.
+  terminal marker instead of deduping against the one already written. Migration:
+  a host that already persisted a terminal row under the old bare `msg_x` id
+  won't dedup it against the incoming `msg_x:result`, so the first catch-up after
+  upgrading appends one duplicate terminal marker per previously-recorded live
+  turn. One-time and bounded; terminal `result` rows are analytics-only and not
+  rendered.
 
 ### Added
 

@@ -73,7 +73,7 @@ export function incompleteTurnMessage(finish: string | null): string {
 }
 
 export interface TerminalOutcome {
-  status: "completed" | "failed";
+  status: "completed" | "failed" | "aborted";
   errorCode: string | null;
   errorMessage: string | null;
   /**
@@ -81,7 +81,7 @@ export interface TerminalOutcome {
    * "silent empty turn" opencode records as a normal completion (typically after
    * an upstream stream error, surfaced as `finish: "unknown"`). Distinct from a
    * user interrupt, which opencode marks with a `MessageAbortedError` in
-   * `info.error` and so lands in the error branch below.
+   * `info.error` and so reports as `aborted` below.
    */
   incomplete: boolean;
 }
@@ -92,20 +92,34 @@ export interface TerminalOutcome {
  * visible note) instead of rendering as a stall. Keyed on the message having no
  * visible text and a non-clean finish reason; never fires when the model
  * produced an answer or stopped cleanly, and never fires on an interrupt.
+ *
+ * Both the live and reconcile paths call this, so the "finished" guard lives
+ * here: a message with neither a finish reason nor an error is still running (or
+ * a malformed response) and stays `completed`. Without it, an empty `/message`
+ * body would flip to `failed` with no note — the exact silent stall this exists
+ * to remove, reached from the other direction.
  */
 export function terminalOutcome(info: unknown, hasVisibleText: boolean): TerminalOutcome {
-  const status = turnStatusFromMessage(info);
-  if (status === "failed") {
-    const m = rec(info);
-    return {
-      status,
-      errorCode: "agent_error",
-      errorMessage: JSON.stringify(m?.["error"] ?? null),
-      incomplete: false,
-    };
+  const m = rec(info);
+  const rawError = m?.["error"] ?? null;
+  const finish = m ? str(m["finish"] ?? null) : null;
+
+  // Not a finished turn (no finish reason, no error): don't reclassify.
+  if (rawError == null && finish === null) {
+    return { status: "completed", errorCode: null, errorMessage: null, incomplete: false };
   }
-  const finish = str(rec(info)?.["finish"] ?? null);
-  const cleanStop = finish !== null && CLEAN_FINISH_REASONS.has(finish);
+
+  if (rawError != null) {
+    // A user interrupt (through opencode's own UI, on a session this process is
+    // attached to) is recorded as a MessageAbortedError. Report it as `aborted`
+    // to match self-aborts and Codex, not a generic error with a JSON blob.
+    if (rec(rawError)?.["name"] === "MessageAbortedError") {
+      return { status: "aborted", errorCode: "aborted", errorMessage: "The turn was interrupted.", incomplete: false };
+    }
+    return { status: "failed", errorCode: "agent_error", errorMessage: JSON.stringify(rawError), incomplete: false };
+  }
+
+  const cleanStop = CLEAN_FINISH_REASONS.has(finish!);
   if (!hasVisibleText && !cleanStop) {
     return {
       status: "failed",
