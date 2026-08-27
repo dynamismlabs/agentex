@@ -2,6 +2,7 @@ import type { ChildProcess } from "node:child_process";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type {
+  BackgroundTaskReport,
   AgentSession,
   CancelResult,
   ClearGoalResult,
@@ -27,7 +28,7 @@ import { translateEndpoint } from "../../utils/endpoint.js";
 import { injectWorkspaceSkills } from "../../utils/skills.js";
 import { resolveInstructions } from "../../utils/instructions.js";
 import { createToolNameTracker } from "../../utils/tool-names.js";
-import { parseCodexStreamLines } from "./parse.js";
+import { parseCodexStreamLines, codexBackgroundTaskReport } from "./parse.js";
 import { withPlanModePreamble } from "./plan-mode.js";
 import { scanCodexSessionUsage } from "./usage-scanner.js";
 import { codexSessionCodec } from "./codec.js";
@@ -1448,6 +1449,8 @@ export class CodexSessionImpl implements AgentSession {
       parentTaskId?: string | null;
       turnId?: string | null;
       eventId?: string | null;
+      /** Set on the edge that actually hands the child's result back. */
+      report?: BackgroundTaskReport | null;
       raw: Record<string, unknown>;
     },
   ): Extract<StreamEvent, { type: "background_task" }> {
@@ -1461,6 +1464,16 @@ export class CodexSessionImpl implements AgentSession {
       description: options.description ?? null,
       summary: options.summary ?? null,
       parentTaskId: options.parentTaskId ?? null,
+      // Codex identifies children by thread id, not by the id of the
+      // `spawn_agent` call that created them, so there is no tool-call link to
+      // report here.
+      toolUseId: null,
+      // Derived, not passed. Four of the five emitters that reach this helper
+      // never set it, and the omission was invisible until a host asked why
+      // reconciled completions produced no row.
+      report: options.report !== undefined
+        ? options.report
+        : codexBackgroundTaskReport(phase, status, options.summary ?? null),
       timestamp: new Date().toISOString(),
       providerType: "codex",
       sessionId: rootThreadId,
@@ -1833,6 +1846,8 @@ export class CodexSessionImpl implements AgentSession {
         status: "running",
         description,
         summary: null,
+        toolUseId: null,
+        report: null,
         parentTaskId: parentThreadId === rootThreadId ? null : parentThreadId,
         timestamp: new Date().toISOString(),
         providerType: "codex",
@@ -1867,6 +1882,8 @@ export class CodexSessionImpl implements AgentSession {
         status: "running",
         description: task.description,
         summary: null,
+        toolUseId: null,
+        report: null,
         parentTaskId: task.parentTaskId,
         timestamp: new Date().toISOString(),
         providerType: "codex",
@@ -1920,6 +1937,12 @@ export class CodexSessionImpl implements AgentSession {
       description: task.description,
       summary: task.summary ?? (errorMessage || null),
       parentTaskId: task.parentTaskId,
+      toolUseId: null,
+      // The child's turn ended and its result is being handed back — the same
+      // edge Claude expresses as `task_notification`. Same rule as every other
+      // emitter, so a host can render "one row per delivered result" across
+      // providers instead of special-casing each one.
+      report: codexBackgroundTaskReport("completed", status, task.summary ?? (errorMessage || null)),
       timestamp: new Date().toISOString(),
       providerType: "codex",
       sessionId: rootThreadId,

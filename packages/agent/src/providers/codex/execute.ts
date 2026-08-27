@@ -250,6 +250,9 @@ export async function executeCodexProvider(ctx: ExecutionContext): Promise<Execu
           status: "stopped",
           description: task.description,
           summary: null,
+          // Cut short, so there is no result to hand back.
+          toolUseId: null,
+          report: null,
           parentTaskId: task.parentTaskId,
           timestamp: new Date().toISOString(),
           providerType: "codex",

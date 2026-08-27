@@ -758,3 +758,118 @@ describe("getClaudeTaskDetails", () => {
     expect(getClaudeTaskDetails(foreign)).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Task completion: state change vs. delivered result
+//
+// Claude emits BOTH `task_updated` and `task_notification` for one completion.
+// They are different records — a state patch and a result delivery — and only
+// the notification carries the summary, the output file, and the tool_use_id
+// linking the task to the call that launched it. Collapsing them into one
+// indistinguishable "completed" event made hosts render every finished task
+// twice, once with its report and once empty.
+// ---------------------------------------------------------------------------
+
+describe("background_task — report vs. state change", () => {
+  const updated = () => parseStreamLine(JSON.stringify({
+    type: "system",
+    subtype: "task_updated",
+    session_id: "s1",
+    task_id: "a4bec5be",
+    patch: { status: "completed", end_time: 1787660387176 },
+  }))[0];
+
+  const notification = () => parseStreamLine(JSON.stringify({
+    type: "system",
+    subtype: "task_notification",
+    session_id: "s1",
+    task_id: "a4bec5be",
+    tool_use_id: "toolu_014YX2",
+    status: "completed",
+    output_file: "/tmp/tasks/a4bec5be.output",
+    summary: "I have the complete picture. Here is my report.",
+    usage: { total_tokens: 62328, tool_uses: 10, duration_ms: 76820 },
+  }))[0];
+
+  it("both report the task as completed", () => {
+    expect(updated()?.type).toBe("background_task");
+    expect(notification()?.type).toBe("background_task");
+    expect(updated()?.type === "background_task" && updated()!.status).toBe("completed");
+    expect(notification()?.type === "background_task" && notification()!.status).toBe("completed");
+  });
+
+  it("only the notification carries a report", () => {
+    const u = updated();
+    const n = notification();
+    expect(u?.type === "background_task" && u.report).toBeNull();
+    expect(n?.type === "background_task" && n.report).not.toBeNull();
+  });
+
+  it("the report carries the summary, output file and usage", () => {
+    const n = notification();
+    expect(n?.type === "background_task" && n.report).toEqual({
+      summary: "I have the complete picture. Here is my report.",
+      outputFile: "/tmp/tasks/a4bec5be.output",
+      usage: { totalTokens: 62328, toolUses: 10, durationMs: 76820 },
+    });
+  });
+
+  it("only the notification carries the launching tool call", () => {
+    // The sole structured task → tool_call link Claude gives us. Deduping the
+    // two events away would have discarded it.
+    const u = updated();
+    const n = notification();
+    expect(u?.type === "background_task" && u.toolUseId).toBeNull();
+    expect(n?.type === "background_task" && n.toolUseId).toBe("toolu_014YX2");
+  });
+
+  it("a start event is a state change, not a delivery", () => {
+    const started = parseStreamLine(JSON.stringify({
+      type: "system",
+      subtype: "task_started",
+      session_id: "s1",
+      task_id: "a4bec5be",
+      tool_use_id: "toolu_014YX2",
+      task_type: "subagent",
+      description: "Find playbank page implementation",
+    }))[0];
+    expect(started?.type === "background_task" && started.report).toBeNull();
+    expect(started?.type === "background_task" && started.toolUseId).toBe("toolu_014YX2");
+  });
+});
+
+describe("background_task — a task cut short delivered nothing", () => {
+  const notification = (status: string) => parseStreamLine(JSON.stringify({
+    type: "system",
+    subtype: "task_notification",
+    session_id: "s1",
+    task_id: "t1",
+    tool_use_id: "toolu_1",
+    status,
+    summary: "killed by host",
+  }))[0];
+
+  it("carries no report when the task was stopped", () => {
+    // A host `stopTask` or a kill. No result comes back and no resume turn
+    // follows, so treating it as a delivery left a stale attribution that
+    // mis-labelled the next provider-initiated turn.
+    const e = notification("stopped");
+    expect(e?.type === "background_task" && e.status).toBe("stopped");
+    expect(e?.type === "background_task" && e.report).toBeNull();
+  });
+
+  it("still reports a failure, which is a delivered outcome", () => {
+    const e = notification("failed");
+    expect(e?.type === "background_task" && e.report).not.toBeNull();
+  });
+
+  it("still reports a success", () => {
+    const e = notification("completed");
+    expect(e?.type === "background_task" && e.report).not.toBeNull();
+  });
+
+  it("carries no report while the task is still running", () => {
+    const e = notification("running");
+    expect(e?.type === "background_task" && e.report).toBeNull();
+  });
+});

@@ -998,6 +998,48 @@ export type BackgroundTaskType = "subagent" | "process" | "unknown";
 /** Lifecycle edge represented by one `background_task` StreamEvent. */
 export type BackgroundTaskPhase = "started" | "progress" | "completed";
 
+/**
+ * A background task's delivered output.
+ *
+ * Present only on the event where the provider actually *hands the result
+ * back* — distinct from a state patch that merely says the task reached a
+ * terminal status. Claude emits both for one completion (`task_updated` then
+ * `task_notification`), and they are different records, not duplicates: only
+ * the delivery carries the summary, the output file, and the `toolUseId`
+ * linking the task to the call that launched it.
+ *
+ * Collapsing the two into one indistinguishable "completed" event is what
+ * made hosts render every finished task twice: once with its report and once
+ * with nothing. Only the delivery carries the summary and the output file
+ * (`toolUseId` is also on the task's `started` record).
+ *
+ * Absent on a task that was cut short — a stop or a kill delivers no result.
+ */
+export interface BackgroundTaskReport {
+  /** The task's final output as the provider summarized it. */
+  summary: string | null;
+  /** Path to the task's full transcript/output on disk, when the provider writes one. */
+  outputFile: string | null;
+  /** What the task consumed, when reported. */
+  usage: {
+    totalTokens: number | null;
+    toolUses: number | null;
+    durationMs: number | null;
+  } | null;
+}
+
+/**
+ * Why a turn began.
+ *
+ * - `send` — dispatched through `send()`. Usually the host; agentex's own
+ *   emulated goal loop also continues a session this way, so this means
+ *   "someone called send()", not strictly "the user".
+ * - `resume` — the provider started it on its own. Claude does this when a
+ *   background task finishes: it enqueues a task-notification as user input,
+ *   which opens a fresh turn with no host involvement.
+ */
+export type TurnTrigger = "send" | "resume";
+
 /** Current normalized state carried by a `background_task` event. */
 export type BackgroundTaskStatus =
   | "pending"
@@ -1229,6 +1271,61 @@ export type StreamEvent =
       description: string | null;
       summary: string | null;
       parentTaskId: string | null;
+      /**
+       * The `tool_call` id that launched this task, when the provider reports
+       * it. This is the structured link between a task and the tool call it
+       * came from — the same id Claude writes into a subagent's `meta.json`.
+       */
+      toolUseId: string | null;
+      /**
+       * The task's delivered output, on the event that delivers it, else null.
+       * A terminal `status` says the task finished; a non-null `report` says
+       * its result is being handed back. See `BackgroundTaskReport`.
+       */
+      report: BackgroundTaskReport | null;
+    } & BaseStreamEventFields)
+  /**
+   * A turn opened. Pairs with `result`, which closes one.
+   *
+   * Hosts that track "is the agent working" cannot derive it from their own
+   * dispatch alone, because not every turn is theirs: when a background task
+   * finishes, Claude enqueues a notification as user input and starts a turn
+   * by itself. A host keying off its own `send()` sees that turn as idle and
+   * reports the session as finished while it is visibly working.
+   *
+   * Emitted for host-initiated turns too, so `turn_start` → `result` describes
+   * turn liveness straight off the stream.
+   *
+   * Deliberately does not name the background task behind a `resume`. Claude
+   * delivers a task's result and opens the turn as two unlinked records, and
+   * with several tasks in flight the pairing is not recoverable from the wire
+   * — every attempt to infer it produced a plausible id that was sometimes
+   * simply wrong. Correlate through `background_task.report` and `toolUseId`,
+   * which the provider does state.
+   */
+  | ({
+      type: "turn_start";
+      turnId: string;
+      trigger: TurnTrigger;
+    } & BaseStreamEventFields)
+  /**
+   * A turn closed. Every `turn_start` is followed by exactly one of these.
+   *
+   * `result` cannot serve as the close signal on its own: a message the CLI
+   * cancels, discards, or refuses opens a turn and produces no result at all,
+   * so a host tracking `turn_start` → `result` would stay busy forever. This
+   * is the guaranteed counterpart; `result` remains the outcome payload.
+   */
+  | ({
+      type: "turn_end";
+      turnId: string;
+      trigger: TurnTrigger;
+      /**
+       * Why the turn ended. `result` means a normal completion whose payload
+       * arrives as the accompanying `result` event; the rest are CLI verdicts
+       * on the message that produced no result.
+       */
+      reason: "result" | "cancelled" | "discarded" | "refused" | "session_closed";
     } & BaseStreamEventFields)
   | ({
       type: "result";

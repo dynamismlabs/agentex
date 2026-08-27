@@ -1,4 +1,5 @@
 import type {
+  BackgroundTaskReport,
   BaseStreamEventFields,
   GoalSource,
   StreamEvent,
@@ -68,6 +69,26 @@ function parseStringArray(value: unknown): string[] {
   return Array.isArray(value)
     ? value.filter((entry): entry is string => typeof entry === "string" && entry.length > 0)
     : [];
+}
+
+/**
+ * The delivered-result payload for a background task, or null.
+ *
+ * One rule for every Codex emitter: a child that reached a terminal outcome
+ * handed something back; one that was cut short did not. Defined here rather
+ * than at each construction site because there are five of them and four
+ * previously forgot, so a host keying on `report !== null` — which the README
+ * tells it to do — rendered no row for completions that reached it by the
+ * reconcile path. Mirrors the Claude gate in `claude/parse.ts`.
+ */
+export function codexBackgroundTaskReport(
+  phase: "started" | "progress" | "completed",
+  status: "pending" | "running" | "paused" | "completed" | "failed" | "stopped" | null,
+  summary: string | null,
+): BackgroundTaskReport | null {
+  if (phase !== "completed") return null;
+  if (status !== "completed" && status !== "failed") return null;
+  return { summary, outputFile: null, usage: null };
 }
 
 function codexBackgroundTaskState(
@@ -454,6 +475,8 @@ function parseV2Notification(event: Record<string, unknown>): StreamEvent | Stre
         description: asNullableString(item["agentPath"]),
         summary: null,
         parentTaskId: null,
+        toolUseId: null,
+        report: null,
         ...base,
       };
     }
@@ -491,6 +514,8 @@ function parseV2Notification(event: Record<string, unknown>): StreamEvent | Stre
           description,
           summary: state.summary,
           parentTaskId: null,
+          toolUseId: null,
+          report: codexBackgroundTaskReport(state.phase, state.status, state.summary),
           ...base,
         };
       });

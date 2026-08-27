@@ -2,6 +2,8 @@ import type { ChildProcess } from "node:child_process";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type {
+  BackgroundTaskType,
+  TurnTrigger,
   AgentSession,
   CancelResult,
   ClearGoalResult,
@@ -21,6 +23,7 @@ import type {
 import { GoalController, latestGoalFromEvents, isTerminalGoalStatus } from "../../goals/index.js";
 import { claudeGoalCapability } from "./goal-capability.js";
 import { claudeSessionCodec } from "./codec.js";
+import { backgroundTaskEventFromClaude } from "./parse.js";
 import { createSessionRecord } from "../../sessions/record.js";
 import { claudeTranscriptOps } from "./transcript.js";
 import { findBinary } from "../../utils/binary.js";
@@ -34,6 +37,12 @@ import { parseStreamLine, classifyClaudeAuthFromResult, CLAUDE_LOGIN_COMMAND, ty
 
 /** A pending `send()` whose `result` Promise hasn't settled yet. */
 interface PendingResult {
+  /**
+   * The `command_uuid` of the host message this send wrote. A turn claims a
+   * uuid when it opens, so the turn's `result` settles exactly the sends it
+   * actually ran — rather than whichever `result` happened to land next.
+   */
+  commandUuid: string;
   resolve: (result: TurnResult) => void;
   reject: (err: Error) => void;
   /** Set once the entry has been settled (by result, timeout, abort, or
@@ -246,9 +255,92 @@ export async function createClaudeSession(ctx: SessionContext): Promise<AgentSes
  */
 export { claudeGoalCapability } from "./goal-capability.js";
 
+/** Provider tag stamped on every event this session emits. */
+const CLAUDE_PROVIDER_TYPE = "claude";
+
+/**
+ * `command_lifecycle` states that retire a host message. `completed` follows a
+ * `result`; the rest do not produce one at all, which is why they have to
+ * close a turn themselves.
+ */
+const TERMINAL_COMMAND_STATES = new Set(["completed", "cancelled", "discarded", "refused"]);
+
 export class ClaudeSessionImpl implements AgentSession {
   private _state: SessionState = "idle";
   private _sessionId: string | null = null;
+  /**
+   * The open root turn, or null.
+   *
+   * `commandUuids` is a set because the CLI coalesces: a second host message
+   * dequeued while a turn is running joins that turn rather than starting its
+   * own. Modelling one uuid per turn left every coalesced message unsettled.
+   *
+   * An empty set means the provider opened this turn itself.
+   */
+  private _openTurn: { turnId: string; trigger: TurnTrigger; commandUuids: Set<string> } | null = null;
+  /** Monotonic turn counter, so `turn_start`/`turn_end` can be paired by id. */
+  private _turnSeq = 0;
+  /**
+   * Host messages the CLI has acknowledged and not yet claimed by a turn,
+   * keyed by the uuid `send()` generated.
+   *
+   * The CLI echoes that uuid back on every `command_lifecycle` record, so a
+   * turn opened by a `started` naming one of these *is* that message's turn —
+   * exact, not inferred. Entries leave only two ways: claimed by a turn, or
+   * retired by a terminal lifecycle record.
+   */
+  private _outstandingCommands = new Set<string>();
+  /** Background tasks currently live, by id, with the type they started as. */
+  private _activeTasks = new Map<string, BackgroundTaskType>();
+  /**
+   * Task ids whose results were delivered while no turn was open, and whose
+   * resume turn has not arrived yet.
+   *
+   * A set rather than a flag: two subagents finishing together deliver twice,
+   * and one bit could not represent that. Used only to hold `drain()` across
+   * the 24-71ms gap between a delivery and the turn it triggers — the task is
+   * no longer live by then, so nothing else covers it. Cleared when a turn
+   * opens or closes, so a delivery the CLI folds into a running turn cannot
+   * pin the session.
+   */
+  private _pendingDeliveries = new Set<string>();
+  /**
+   * Settlement batches captured but not yet resolved, one array per turn.
+   *
+   * Isolated so no turn can drain another's — that sharing is what made two
+   * back-to-back results resolve both sends with the first result — but still
+   * reachable, so a process exit mid-drain can reject them instead of
+   * stranding the caller forever.
+   */
+  private _settlingBatches = new Set<PendingResult[]>();
+  /**
+   * Whether this CLI build has ever emitted `command_lifecycle`. Learned once:
+   * builds that emit it do so for every host message, so after the first
+   * sighting an unnamed turn is genuinely provider-initiated and the
+   * oldest-unclaimed fallback must not fire.
+   */
+  private _seenCommandLifecycle = false;
+  /**
+   * Whether this stream has produced a `result` yet. `system/init` is session
+   * metadata at boot but heads every provider-initiated resume turn, and this
+   * is what tells the two apart.
+   */
+  private _seenResult = false;
+  /**
+   * Task type and description as first reported on `task_started`, keyed by
+   * task id. Later lifecycle records are sparse — `task_updated` is a bare
+   * patch and `task_notification` carries no type — so without this a
+   * finished subagent normalizes to `taskType: "unknown"` and hosts render
+   * "Background task completed" for what is plainly a subagent.
+   */
+  private _taskFacts = new Map<string, { taskType: BackgroundTaskType; description: string | null }>();
+  /**
+   * Cap on `_taskFacts`. Entries cannot be dropped on task completion, because
+   * a completion arrives as two records and the second still needs enriching,
+   * so the map is bounded by eviction instead. A session that ran this many
+   * background tasks will not miss the oldest one's label.
+   */
+  private static readonly TASK_FACT_LIMIT = 512;
   private _lineBuffer = "";
   private _stderrBuffer = "";
 
@@ -372,15 +464,182 @@ export class ClaudeSessionImpl implements AgentSession {
     });
   }
 
-  /** Reject every pending send() Promise and outgoing control_response. */
-  private rejectAllPending(err: Error): void {
+  /**
+   * Open a root turn and announce it. Returns the turn that was opened.
+   *
+   * `commandUuids` starts with the message that opened it, if any; a coalesced
+   * message dequeued later joins the same turn via `joinTurn`.
+   */
+  private openTurn(trigger: TurnTrigger, commandUuid: string | null, msg: Record<string, unknown>): void {
+    const turnId = `turn-${++this._turnSeq}`;
+    // The set holds every command associated with this turn, including one the
+    // CLI named that we have no record of sending. `trigger` says whether it
+    // was ours; the set is what lets a terminal lifecycle record close the turn
+    // it opened. Without that, a `started`/`refused` pair for an unrecognized
+    // uuid opened a turn nothing could close.
+    this._openTurn = {
+      turnId,
+      trigger,
+      commandUuids: new Set(commandUuid ? [commandUuid] : []),
+    };
+    // The delivery that prompted this turn has been answered by it opening.
+    this._pendingDeliveries.clear();
+    // A host turn takes `thinking` from send(); a provider-initiated one has
+    // nothing else to set it, and `state` must not contradict `turn_start`.
+    if (this._state === "idle") this._state = "thinking";
+    this.dispatchEvent({
+      type: "turn_start",
+      turnId,
+      trigger,
+      timestamp: new Date().toISOString(),
+      providerType: CLAUDE_PROVIDER_TYPE,
+      sessionId: this._sessionId,
+      messageId: null,
+      eventId: str(msg, "uuid") || null,
+      parentToolCallId: null,
+      raw: { type: str(msg, "type"), ...(commandUuid ? { command_uuid: commandUuid } : {}) },
+    });
+  }
+
+  /** Attach a coalesced host message to the turn already running. */
+  private joinTurn(commandUuid: string): void {
+    this._openTurn?.commandUuids.add(commandUuid);
+    this._outstandingCommands.delete(commandUuid);
+  }
+
+  /**
+   * Close the open turn and announce it. Returns what was closed, or null.
+   *
+   * Every `turn_start` gets exactly one `turn_end`, which is why this is the
+   * only place a turn is cleared. `result` alone could not serve: a cancelled,
+   * discarded, or refused message opens a turn and produces no result.
+   */
+  private closeTurn(
+    reason: "result" | "cancelled" | "discarded" | "refused" | "session_closed",
+  ): { turnId: string; trigger: TurnTrigger; commandUuids: Set<string> } | null {
+    const turn = this.takeOpenTurn();
+    this.emitTurnEnd(turn, reason);
+    return turn;
+  }
+
+  /**
+   * Clear the open turn and return it, without announcing the close.
+   *
+   * Split from the announcement because the state change has to be synchronous
+   * — the CLI can flush a result and the next turn's opening line in one chunk
+   * — while `turn_end` must be ordered *after* the `result` that carries the
+   * turn's payload.
+   */
+  private takeOpenTurn(): { turnId: string; trigger: TurnTrigger; commandUuids: Set<string> } | null {
+    const turn = this._openTurn;
+    this._openTurn = null;
+    this._pendingDeliveries.clear();
+    return turn;
+  }
+
+  /** Announce a close for a turn already taken. No-op for a null turn. */
+  private emitTurnEnd(
+    turn: { turnId: string; trigger: TurnTrigger; commandUuids: Set<string> } | null,
+    reason: "result" | "cancelled" | "discarded" | "refused" | "session_closed",
+  ): void {
+    if (!turn) return;
+    this.dispatchEvent({
+      type: "turn_end",
+      turnId: turn.turnId,
+      trigger: turn.trigger,
+      reason,
+      timestamp: new Date().toISOString(),
+      providerType: CLAUDE_PROVIDER_TYPE,
+      sessionId: this._sessionId,
+      messageId: null,
+      eventId: null,
+      parentToolCallId: null,
+      raw: { reason },
+    });
+  }
+
+  /**
+   * Remove and return the send resolvers belonging to `turn`.
+   *
+   * Synchronous and exhaustive by design: the caller holds the only reference
+   * to the returned array, so no later turn can drain it.
+   */
+  private claimSettlementBatch(
+    turn: { commandUuids: Set<string> } | null,
+  ): PendingResult[] {
+    const batch: PendingResult[] = [];
+    this._settlingBatches.add(batch);
+    if (!turn) {
+      // A result with no turn to attribute it to. Settling everything is the
+      // lesser evil: resolving with a neighbouring turn's result is wrong, but
+      // hanging every caller is worse.
+      batch.push(...this._pendingResults.splice(0));
+      return batch;
+    }
+    if (turn.commandUuids.size === 0) return batch; // provider-initiated
+    for (let i = this._pendingResults.length - 1; i >= 0; i--) {
+      if (turn.commandUuids.has(this._pendingResults[i]!.commandUuid)) {
+        batch.unshift(...this._pendingResults.splice(i, 1));
+      }
+    }
+    return batch;
+  }
+
+  /**
+   * Settle any send still waiting on a command the CLI has finished with.
+   *
+   * `completed` means its turn ran, so it takes that turn's result; the other
+   * terminal states mean it never ran at all.
+   */
+  private settleCommand(commandUuid: string, state: string): void {
+    for (let i = this._pendingResults.length - 1; i >= 0; i--) {
+      const entry = this._pendingResults[i]!;
+      if (entry.commandUuid !== commandUuid || entry.settled) continue;
+      this._pendingResults.splice(i, 1);
+      entry.settled = true;
+      entry.cleanup?.();
+      // Reaching here means no turn ever claimed this message, so there is no
+      // result of its own to give it. `completed` without a claiming turn is
+      // not expected — it is reported honestly rather than papered over with a
+      // neighbouring turn's payload.
+      entry.resolve({
+        status: state === "completed" ? "completed" : "aborted",
+        summary: null,
+        costUsd: null,
+        errorCode: `command_${state}`,
+        errorMessage: `Message was ${state} by the CLI without a turn of its own`,
+      } as TurnResult);
+    }
+  }
+
+  /**
+   * Reject every send still waiting on a turn, and clear the turn bookkeeping
+   * that described it. Shared by the fatal paths and by `close()`.
+   */
+  private rejectPendingSends(err: Error): void {
     const pending = this._pendingResults.splice(0);
+    // Batches already captured for a turn still settling. Their handler may
+    // never resume — the process is gone — so they are rejected here rather
+    // than left hanging their callers.
+    for (const captured of this._settlingBatches) pending.push(...captured);
+    this._settlingBatches.clear();
+    // No turn survives this, and the host is told so rather than left holding
+    // an unmatched `turn_start`.
+    this.closeTurn("session_closed");
+    this._outstandingCommands.clear();
+    this._activeTasks.clear();
+    this._taskFacts.clear();
     for (const p of pending) {
       if (p.settled) continue;
       p.settled = true;
       p.cleanup?.();
       p.reject(err);
     }
+  }
+
+  /** Reject every pending send() Promise and outgoing control_response. */
+  private rejectAllPending(err: Error): void {
+    this.rejectPendingSends(err);
     for (const [, p] of this._pendingControlResponses) p.reject(err);
     this._pendingControlResponses.clear();
   }
@@ -425,6 +684,9 @@ export class ClaudeSessionImpl implements AgentSession {
     if (this._state === "idle") this._state = "thinking";
 
     const uuid = randomUUID();
+    // The CLI echoes this back on every `command_lifecycle` record for the
+    // message, which is what lets a turn be attributed exactly.
+    this._outstandingCommands.add(uuid);
 
     // Write user message in stream-json format. `uuid` becomes the queue
     // key the CLI uses for `cancel_async_message`.
@@ -443,7 +705,7 @@ export class ClaudeSessionImpl implements AgentSession {
       rejectFn = reject;
     });
 
-    const entry: PendingResult = { resolve: resolveFn, reject: rejectFn };
+    const entry: PendingResult = { commandUuid: uuid, resolve: resolveFn, reject: rejectFn };
     this._pendingResults.push(entry);
 
     // Track the in-flight turn so drain() can await it; drop it on settle.
@@ -541,6 +803,8 @@ export class ClaudeSessionImpl implements AgentSession {
 
     try {
       const response = await responsePromise;
+      // No bookkeeping here: the CLI emits `command_lifecycle/cancelled` for
+      // the message, and that is what retires it.
       return { cancelled: response["cancelled"] === true };
     } catch {
       // Process exited / error before response — treat as "not cancelled."
@@ -617,14 +881,55 @@ export class ClaudeSessionImpl implements AgentSession {
       // Let every in-flight turn settle (resolve or reject) before closing, so
       // a running tool finishes rather than being killed mid-flight.
       await Promise.allSettled([...this._inFlight]);
+      // `_inFlight` only tracks turns this host dispatched. A provider-initiated
+      // turn — the CLI acting on a finished background task — has no send()
+      // behind it, so draining used to SIGTERM the CLI mid-turn and kill
+      // whatever that turn was doing. Now that the session can see those turns,
+      // the one API whose contract is "let in-flight work settle" honors them.
+      await this.awaitTurnClose();
       await this.close();
     })();
     return this._drainPromise;
   }
 
+  /**
+   * Resolve once no turn is open, or once the deadline passes.
+   *
+   * Bounded on purpose: a turn that never produces a `result` (a wedged CLI)
+   * must not make `drain()` hang forever. Polling rather than eventing because
+   * turn close is driven from the stream reader, and a missed edge here would
+   * be the same hang by another route.
+   */
+  private async awaitTurnClose(timeoutMs = 120_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    const settling = (): boolean => {
+      if (this._openTurn) return true;
+      // A running subagent will hand its result back and open a resume turn,
+      // so it is in-flight work. Closing during the gap between the root
+      // result and that turn — measured at 8-11s live — killed it outright.
+      //
+      // Background *processes* are excluded on purpose: a dev server started
+      // with run_in_background may never exit, and the contract is "let the
+      // agent's work settle", not "outlive whatever it launched".
+      // A delivered result whose resume turn has not opened yet. This is the
+      // provider's own signal that more work is coming, used where it matters.
+      if (this._pendingDeliveries.size > 0) return true;
+      for (const taskType of this._activeTasks.values()) {
+        if (taskType === "subagent") return true;
+      }
+      return false;
+    };
+    while (settling() && this._state !== "closed" && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  }
+
   async close(): Promise<void> {
     if (this._state === "closed") return;
     this._state = "closed";
+    // Anything still waiting has no turn left to settle it. Without this a
+    // bare `close()` with a send in flight hung that caller for good.
+    this.rejectPendingSends(new Error("Session closed before the turn completed"));
     // Final transcript scan so a goal_status (e.g. `met`) written since the last
     // ~800ms poll isn't lost on a fast close. No-op when no goal is observed.
     await this.scanGoalTranscript().catch(() => { /* best effort */ });
@@ -711,8 +1016,20 @@ export class ClaudeSessionImpl implements AgentSession {
     // await inside handleResult drains the chain so handlers settle before
     // the awaiting send() returns.
     if (type === "result") {
+      // Close the turn and snapshot its settlement batch synchronously, before
+      // any `await`. Both halves matter. Closing late swallows the next
+      // `turn_start`, because the CLI can flush this result and the following
+      // turn's opening line in one chunk. Snapshotting late is worse: the
+      // batch used to live in a field shared by every turn, so whichever
+      // async handler resumed first drained all of it and resolved the second
+      // turn's sends with the first turn's result.
+      const closingTurn = this.takeOpenTurn();
+      const batch = this.claimSettlementBatch(closingTurn);
+      this._seenResult = true;
       this.handleStreamMessage(msg, line);
-      void this.handleResult(msg);
+      // Announced after the result event, so the payload precedes the close.
+      this.emitTurnEnd(closingTurn, "result");
+      void this.handleResult(msg, batch);
       return;
     }
 
@@ -728,19 +1045,25 @@ export class ClaudeSessionImpl implements AgentSession {
     const requestId = str(msg, "request_id");
     const request = obj(msg, "request");
     const subtype = str(request, "subtype");
+    const nested = msg["parent_tool_use_id"] != null
+      || request["parent_tool_use_id"] != null;
 
     switch (subtype) {
       case "initialize":
         this.sendControlResponse(requestId, {});
         break;
 
+      // A detached subagent raises its own prompts, and those are the child
+      // being blocked, not this session. Parking the parent in
+      // `waiting_for_approval` there outlived the root turn with nothing able
+      // to clear it — the same nested-actor rule the stream path applies.
       case "can_use_tool":
-        this._state = "waiting_for_approval";
+        if (!nested) this._state = "waiting_for_approval";
         this.handlePermissionRequest(requestId, request);
         break;
 
       case "elicitation":
-        this._state = "waiting_for_input";
+        if (!nested) this._state = "waiting_for_input";
         this.handleElicitationRequest(requestId, request);
         break;
 
@@ -941,7 +1264,10 @@ export class ClaudeSessionImpl implements AgentSession {
   // Result handling
   // -------------------------------------------------------------------------
 
-  private async handleResult(msg: Record<string, unknown>): Promise<void> {
+  private async handleResult(
+    msg: Record<string, unknown>,
+    batch: PendingResult[] = [],
+  ): Promise<void> {
     const summary = typeof msg["result"] === "string" ? msg["result"] : null;
     const isError = msg["is_error"] === true;
     const costUsd = typeof msg["total_cost_usd"] === "number" ? msg["total_cost_usd"] : null;
@@ -1023,14 +1349,19 @@ export class ClaudeSessionImpl implements AgentSession {
     // session whose stdin is dead.
     if (this._state === "closed") return;
 
-    this._state = "idle";
+    // Only fall back to idle if no new turn opened while the chain drained.
+    // The CLI can start the next turn in the same chunk as this result, and
+    // asserting idle over a turn that is already running is the exact false
+    // "finished" this release exists to remove.
+    if (!this._openTurn) this._state = "idle";
 
-    // Drain ALL pending send() resolvers with this turn's result. Multiple
-    // concurrent sends coalesced by the CLI into one turn share the same
-    // TurnResult — documented in SendHandle JSDoc. Splice empties the list
-    // so subsequent sends queue against a fresh list for the next turn.
-    const pending = this._pendingResults.splice(0);
-    for (const p of pending) {
+    // Settle the batch this turn owns — and only that batch. It was captured
+    // synchronously when the result line was read, so a turn that opened while
+    // this handler was suspended cannot have its sends resolved here. That
+    // sharing is what made two back-to-back results resolve both sends with
+    // the first result.
+    this._settlingBatches.delete(batch);
+    for (const p of batch) {
       // Skip sends already settled early by timeout / abort.
       if (p.settled) continue;
       p.settled = true;
@@ -1047,19 +1378,90 @@ export class ClaudeSessionImpl implements AgentSession {
   // -------------------------------------------------------------------------
 
   private handleStreamMessage(msg: Record<string, unknown>, rawLine: string): void {
+    // A line can arrive during close()'s grace window. Acting on it would
+    // reopen a turn on a dead session, flip `state` off "closed", and emit a
+    // `turn_start` to a host that has already drained — with nothing left to
+    // ever close it again.
+    if (this._state === "closed") return;
+
     // Extract session ID from any message that has one
     if (typeof msg["session_id"] === "string" && msg["session_id"]) {
       this._sessionId = msg["session_id"];
     }
 
-    // Update session state based on message type
+    // Update session state based on message type. Nested-actor lines are
+    // excluded for the same reason they do not open a turn: a detached
+    // subagent streams its own output onto the parent after the root result,
+    // and letting it drive `state` left the session reporting "thinking" for
+    // the child's whole run — directly contradicting `turn_start`/`result`,
+    // with nothing to clear it if the child is stopped or killed.
     const type = str(msg, "type");
-    if (type === "assistant" || type === "thinking") {
-      this._state = "thinking";
-    } else if (type === "tool_use") {
-      this._state = "tool_executing";
-    } else if (type === "tool_result") {
-      this._state = "thinking";
+    if (msg["parent_tool_use_id"] == null) {
+      if (type === "assistant" || type === "thinking") {
+        this._state = "thinking";
+      } else if (type === "tool_use") {
+        this._state = "tool_executing";
+      } else if (type === "tool_result") {
+        this._state = "thinking";
+      }
+    }
+
+    // Retire host messages the CLI has finished with, before deciding what a
+    // turn opening means. `refused`/`discarded` never produce a `result`, so
+    // this is also the only thing that closes a turn they opened — without it
+    // the session would pin as working with no path back.
+    if (type === "command_lifecycle") {
+      this._seenCommandLifecycle = true;
+      const commandUuid = str(msg, "command_uuid");
+      const state = str(msg, "state");
+      if (commandUuid && TERMINAL_COMMAND_STATES.has(state)) {
+        this._outstandingCommands.delete(commandUuid);
+        // The CLI is done with this message. Anything still waiting on it will
+        // never be settled by a `result` — a cancelled or refused message
+        // produces none, and a `completed` one whose turn we could not attribute
+        // would otherwise wait forever.
+        this.settleCommand(commandUuid, state);
+        if (state !== "completed" && this._openTurn?.commandUuids.has(commandUuid)) {
+          // Nothing else will close this turn: these states never produce a
+          // `result`. (A closed session returned above, so state is live.)
+          this.closeTurn(state as "cancelled" | "discarded" | "refused");
+          this._state = "idle";
+        }
+      }
+    }
+
+    // Background-task state is session state: `drain()` waits on live
+    // subagents and turn attribution consumes delivered results. Decoded here
+    // from the wire rather than in the dispatch path, which only runs when a
+    // host subscribed — a host that reads `session.state` and calls `drain()`
+    // without an onEvent handler would otherwise get neither.
+    this.trackBackgroundTaskState(msg);
+
+    // Open a turn on the first line of turn content, before that line's own
+    // events, so a host sees turn_start → … → result → turn_end in order.
+    const namedUuid = type === "command_lifecycle" ? str(msg, "command_uuid") : "";
+    if (this._openTurn) {
+      // The CLI coalesces: a host message dequeued while a turn is running
+      // joins it rather than starting its own. Modelling one command per turn
+      // left every coalesced message permanently unsettled.
+      if (namedUuid && this._outstandingCommands.has(namedUuid)) this.joinTurn(namedUuid);
+    } else if (this.opensTurn(msg, type)) {
+      // Exact attribution: the CLI stamps every `command_lifecycle` for a host
+      // message with the uuid `send()` minted, so a `started` naming one we are
+      // still waiting on *is* that message's turn. Anything else opened the
+      // turn without us asking — which is what this event exists to expose.
+      const claimedUuid = namedUuid
+        ? (this._outstandingCommands.has(namedUuid) ? namedUuid : null)
+        // Only guess for a build that has never named a command. Once one has,
+        // it names every host message, so an unnamed turn is provider-initiated
+        // and consuming a uuid here would mislabel twice.
+        : this._seenCommandLifecycle
+          ? null
+          : this._outstandingCommands.values().next().value ?? null;
+      if (claimedUuid) this._outstandingCommands.delete(claimedUuid);
+      // Track the named command even when it is not one of ours, so its
+      // terminal lifecycle record can close this turn.
+      this.openTurn(claimedUuid ? "send" : "resume", claimedUuid ?? (namedUuid || null), msg);
     }
 
     // Parse + dispatch when there's an onEvent subscriber OR an active goal to
@@ -1073,20 +1475,144 @@ export class ClaudeSessionImpl implements AgentSession {
   }
 
   /**
-   * Queue an event for in-order delivery to `onEvent`. Each call appends a
-   * `.then` to `_eventChain` so handler N+1 only starts after handler N's
-   * returned promise settles. Errors are swallowed inside the chain so a
-   * throwing handler does not break delivery of subsequent events.
+   * Whether this wire line is the first content of a turn.
+   *
+   * Deliberately excludes two things.
+   *
+   * The background-task records (`task_started`, `task_updated`,
+   * `task_notification`, `background_tasks_changed`) arrive *between* turns —
+   * a detached child reporting in while nothing is running — so treating one
+   * as a turn opening would report the session as working every time a
+   * background process coughed.
+   *
+   * `system/init` is special. It is boot metadata the first time — before any
+   * result, opening a turn on it would create a phantom `resume` at startup,
+   * leave it open, and swallow the first real send's `turn_start`. But the
+   * CLI re-emits it at the head of every provider-initiated resume turn, and
+   * measured live it precedes that turn's first assistant line by 1.4–1.9s.
+   * Ignoring it outright traded a phantom turn for a second-long blind window
+   * on exactly the turns this event exists to expose, so it opens a turn once
+   * a result has been seen on this stream and not before.
+   *
+   * And anything carrying `parent_tool_use_id`, which is a nested actor's own
+   * output. Claude streams a detached subagent's assistant text, thinking and
+   * tool calls onto the parent stream while the root turn is over. Those are
+   * the child working, not this session, and counting them would hold the
+   * session "working" for the entire detached run — when the honest answer,
+   * and what the CLI shows, is that the root turn finished and its result is
+   * ready to read. The real resume turn arrives afterwards, at root level,
+   * once the child's result is delivered back.
    */
+  private opensTurn(msg: Record<string, unknown>, type: string): boolean {
+    if (msg["parent_tool_use_id"] != null) return false;
+    // `stream_event` is the partial-message wrapper. Without it, a host that
+    // opted into `includePartialMessages` receives the whole streamed reply
+    // before `turn_start` — the turn's output arriving before the event that
+    // says the turn began.
+    if (type === "stream_event") return true;
+    // `command_lifecycle/started` heads every host-dispatched turn and only
+    // those — never a resume — so it is safe to open on and carries no
+    // phantom-turn risk. It is also the earliest signal available: without it
+    // the session's very first turn has no opener until its first assistant
+    // line, measured live at 1.8-6.4s of reading as idle while working.
+    if (type === "command_lifecycle") return str(msg, "state") === "started";
+    if (type === "system") return this._seenResult && str(msg, "subtype") === "init";
+    // `thinking` and `tool_use` are content blocks inside an `assistant`
+    // message, not top-level wire types; they are listed because the state
+    // machine above accepts them and the two should not disagree about what
+    // counts as turn content.
+    return type === "assistant"
+      || type === "thinking"
+      || type === "tool_use"
+      || type === "user";
+  }
+
+  /**
+   * Fold one background-task wire record into session state.
+   *
+   * Separate from the enrichment below on purpose: this must run for every
+   * line regardless of whether anything is listening, because `drain()` and
+   * turn attribution read what it maintains.
+   */
+  private trackBackgroundTaskState(msg: Record<string, unknown>): void {
+    const event = backgroundTaskEventFromClaude(msg);
+    if (!event) return;
+
+    const terminal = event.status === "completed"
+      || event.status === "failed"
+      || event.status === "stopped";
+    if (terminal) {
+      this._activeTasks.delete(event.taskId);
+    } else if (event.status !== null || event.phase === "started") {
+      // `status: null` means "no change reported" — a sparse patch that only
+      // renames a task says nothing about liveness. Writing the task back into
+      // the live set there resurrected work that had already completed.
+      this._activeTasks.set(event.taskId, this._taskFacts.get(event.taskId)?.taskType ?? event.taskType);
+    }
+
+    // The provider stating that a turn is coming — held so `drain()` does not
+    // close in the gap before it opens. Keyed on the outcome rather than on
+    // the delivery record alone, because a completion arrives as two records
+    // (`task_updated` then `task_notification`) and the first already removes
+    // the task from the live set: waiting only for the second left a window
+    // where neither the task nor the delivery was visible.
+    //
+    // Only for outcomes that actually deliver. A stopped task hands nothing
+    // back and starts no turn, so holding for one would just burn the deadline.
+    const delivers = event.status === "completed" || event.status === "failed";
+    if ((event.report || delivers) && !this._openTurn) {
+      this._pendingDeliveries.add(event.taskId);
+    }
+
+    if (event.phase === "started") {
+      this._taskFacts.set(event.taskId, {
+        taskType: event.taskType,
+        description: event.description,
+      });
+      // Evict oldest-first. Map iteration is insertion-ordered, so the first
+      // key is the least recently started task.
+      while (this._taskFacts.size > ClaudeSessionImpl.TASK_FACT_LIMIT) {
+        const oldest = this._taskFacts.keys().next();
+        if (oldest.done) break;
+        this._taskFacts.delete(oldest.value);
+      }
+    }
+  }
+
+  /**
+   * Fill in what a sparse background-task record leaves out.
+   *
+   * `task_started` is the only record that names the task's type; the patches
+   * and the completion notification that follow identify it by id alone. This
+   * remembers the first description and carries it forward so a completion
+   * still knows it was a subagent.
+   */
+  private _trackTaskFacts(event: StreamEvent): StreamEvent {
+    if (event.type !== "background_task") return event;
+    const known = this._taskFacts.get(event.taskId);
+    if (!known) return event;
+    const needsType = event.taskType === "unknown" && known.taskType !== "unknown";
+    const needsDescription = event.description === null && known.description !== null;
+    if (!needsType && !needsDescription) return event;
+    return {
+      ...event,
+      taskType: needsType ? known.taskType : event.taskType,
+      description: needsDescription ? known.description : event.description,
+    };
+  }
+
   private dispatchEvent(event: StreamEvent): void {
+    // Enrich and record before anything can bail out. `_trackTaskFacts` also
+    // maintains session state — which tasks are live, which results are
+    // waiting for a resume turn — and gating that on a subscriber meant
+    // `session.state`, `drain()` and turn attribution all silently degraded
+    // for a host that reads the session without an onEvent handler.
+    const enriched = this._trackTaskFacts(this._trackToolName(event));
     // Let the goal engine track native goal_status transitions even when no
     // onEvent handler is attached (keeps getGoal() accurate).
-    this._goals.observe(event);
+    this._goals.observe(enriched);
     const cb = this.ctx.onEvent;
     if (!cb) return;
-    // Enrich synchronously (in stream order) so tool_result events carry the
-    // name of the tool_call they answer.
-    const enriched = this._trackToolName(event);
     this._eventChain = this._eventChain.then(async () => {
       try { await cb(enriched); } catch { /* swallow */ }
     });

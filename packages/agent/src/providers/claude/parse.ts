@@ -827,7 +827,7 @@ function normalizedClaudeTaskStatus(
   }
 }
 
-function backgroundTaskEventFromClaude(
+export function backgroundTaskEventFromClaude(
   raw: Record<string, unknown>,
 ): Extract<StreamEvent, { type: "background_task" }> | null {
   if (asString(raw["type"], "") !== "system") return null;
@@ -861,6 +861,28 @@ function backgroundTaskEventFromClaude(
     description: task.description,
     summary: task.summary,
     parentTaskId: null,
+    // Only `task_started` and `task_notification` carry the launching call;
+    // `task_updated` is a bare state patch keyed by task id alone.
+    toolUseId: task.toolUseId,
+    // The delivery, not the state change. Claude emits `task_updated` and
+    // `task_notification` for one completion — same task, same instant,
+    // different records. Only the notification hands back the result, so only
+    // it gets a report, and a host can render exactly one row per completion
+    // without guessing which of two identical-looking events to keep.
+    //
+    // Gated on the task having actually delivered an outcome. Claude emits
+    // notifications for a task that is still running (a mid-flight ping is not
+    // a result), and a `stopped` task was cut short by a host `stopTask` or a
+    // kill — there is nothing to hand back, no resume turn follows it, and
+    // treating it as a delivery left a stale id that mis-attributed the next
+    // self-started turn. `completed` and `failed` both delivered an outcome.
+    report: task.phase === "notification" && terminal && status !== "stopped"
+      ? {
+          summary: task.summary,
+          outputFile: task.outputFile,
+          usage: task.usage,
+        }
+      : null,
     ...baseFieldsFromEvent(raw, null),
   };
 }

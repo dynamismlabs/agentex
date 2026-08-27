@@ -1,8 +1,175 @@
 # Changelog
 
+## 0.0.37 — Turn liveness and background-task identity (Claude)
+
+Claude Code starts turns by itself. When a background task finishes, the CLI
+enqueues the notification as user input, which opens a fresh turn with no host
+involvement. A host that tracks "is the agent working" from its own `send()`
+cannot see those turns — `send()` already resolved — so the session reads as
+finished while the agent is visibly working. Verified against Claude Code
+2.1.241, where one user message produced two `result` events with a
+self-started turn between them.
+
+### Added
+
+- **`turn_start` StreamEvent.** Pairs with `result`, which closes a turn.
+  Carries `trigger: "send" | "resume"` — `resume` meaning the provider opened
+  the turn on its own. Emitted for host-initiated turns too, so `turn_start` →
+  `result` describes turn liveness straight off the stream rather than by
+  inference from dispatch.
+
+  It deliberately does not name the background task behind a `resume`. Claude
+  delivers a task's result and opens the turn as two unlinked records, and with
+  several tasks in flight the pairing is not recoverable from the wire; every
+  attempt to infer it produced a plausible id that was sometimes wrong.
+  Correlate through `background_task.report` and `toolUseId`, which the
+  provider does state.
+
+  Attribution is exact, not inferred. A host message carries a uuid and a
+  provider-initiated continuation does not: every dequeued input with a uuid
+  emits `command_lifecycle` naming it, while the task-notification continuation
+  is enqueued without one. So a turn opened by a `started` naming an
+  outstanding message *is* that message's turn. A build that has never emitted
+  `command_lifecycle` falls back to the oldest unclaimed send; once one has
+  been seen, the fallback is disabled, because guessing there would mislabel
+  twice.
+
+- **`turn_end` StreamEvent.** Every `turn_start` is followed by exactly one,
+  carrying the same `turnId` and a `reason`. `result` cannot serve as the close
+  signal on its own: a message the CLI cancels, discards, or refuses opens a
+  turn and produces no result, so a host pairing `turn_start` with `result`
+  would stay busy forever on those paths. `result` remains the outcome payload
+  and is ordered before the `turn_end` that follows it.
+
+- **`background_task.report`.** The task's delivered output (`summary`,
+  `outputFile`, `usage`), present only on the event that hands the result
+  back. Claude emits *both* `task_updated` and `task_notification` for a single
+  completion; they are different records, not duplicates, and only the
+  notification carries the result. Collapsing them into one indistinguishable
+  `phase: "completed"` event made hosts render every finished task twice, once
+  with its report and once empty. A task that was stopped or killed delivered
+  nothing and carries no report. Codex applies the identical rule at every
+  emitter, so "one row per delivered result" holds across providers.
+
+- **`background_task.toolUseId`.** The tool call that launched the task — the
+  same id Claude writes into a subagent's `meta.json`, and the only structured
+  task-to-tool_call link the wire provides. It was being discarded.
+
+### Changed
+
+- Turn, command, and task state is now reduced from the ordered wire in one
+  place, rather than held in mutable fields updated across `await` boundaries.
+  Each turn's settlement batch is captured synchronously before any suspension
+  point, so a turn that opens while an earlier handler is still draining cannot
+  have its sends resolved by that handler — the failure that made two
+  back-to-back results resolve both callers with the first result.
+
+- A turn owns a *set* of command uuids. The CLI coalesces: a host message
+  dequeued while a turn is running joins that turn instead of starting its own.
+  Modelling one command per turn left every coalesced message permanently
+  unsettled.
+
+### Fixed
+
+- A background task's `taskType` and `description` survive its whole lifetime.
+  `task_started` is the only record that names them; the patches and the
+  completion notification that follow identify the task by id alone, so every
+  finished subagent normalized to `taskType: "unknown"` and hosts rendered
+  "Background task completed" for what was plainly a subagent. A completion for
+  a task the session never saw start still reports `unknown` rather than
+  guessing. The cache is bounded at 512 entries, oldest evicted.
+
+- A detached subagent's own output no longer drives the parent session. Claude
+  streams a child's assistant text, thinking, and tool calls onto the parent
+  stream while the root turn is already over. Anything carrying
+  `parent_tool_use_id` is the child working, not the session: it does not open
+  a turn, does not move `session.state`, and a child's permission prompt no
+  longer parks the parent in `waiting_for_approval` with nothing able to clear
+  it.
+
+- `session.state` and `turn_start`/`result` agree. A host turn took `thinking`
+  from `send()`; a provider-initiated one had nothing to set it, so `state`
+  read `idle` for the whole head of every resume turn while `turn_start` had
+  already fired.
+
+- Turn settling is synchronous with the `result` line. The CLI can flush a
+  result and the next turn's opening line in one chunk; deferring the close
+  until the event chain drained swallowed the following `turn_start`, and
+  deferring the turn's send-resolvers with it let the next turn mistake them
+  for its own. The resolvers are appended to a settling list, never assigned
+  over — overwriting discarded the earlier turn's resolvers outright, hanging
+  that caller's `send()` and deadlocking `drain()` behind it.
+
+- Background-task state is tracked from the wire, not from the delivery path.
+  It was maintained inside event dispatch, which only runs when a host
+  subscribed, so `session.state`, `drain()`, and turn attribution silently
+  degraded for a host that reads the session without an `onEvent` handler.
+
+- A send resolves with its own turn. `_pendingResults` was a flat queue drained
+  by whatever `result` landed next, so a follow-up the CLI had merely queued
+  resolved against a turn that never contained it — the host then read
+  "finished" for a message still waiting to run. Each entry now carries its
+  command uuid and settles only when the turn that claimed it completes. A
+  terminal `command_lifecycle` settles a message the CLI retires without
+  running, which previously had nothing to settle it at all.
+
+- `drain()` waits for provider-initiated turns and for running subagents.
+  `_inFlight` only tracks turns the host dispatched, so draining during the gap
+  between a root result and the resume turn that follows it — measured at 8-11
+  seconds live — SIGTERM'd the CLI and killed the child outright. Background
+  *processes* are deliberately excluded: a dev server started with
+  `run_in_background` may never exit, and the contract is "let the agent's work
+  settle", not "outlive whatever it launched". Bounded by a deadline so a
+  wedged turn cannot hang the drain.
+
+  It also holds across the gap between a task's result being delivered and the
+  resume turn it triggers — 24ms for a subagent, 71ms for a background process.
+  The task is no longer live by then, so waiting on live tasks alone left
+  `drain()` landing in that window and killing the very turn it was extended to
+  protect. The delivery record is the provider stating a turn is coming, so it
+  is used as one; the wait is released by the next turn to open or close.
+
+- Turns opened by a command that ends in `refused`, `discarded`, or `cancelled`
+  are closed by that record. Those states never produce a `result`, so nothing
+  else would ever close them and the session pinned as working with no path
+  back.
+
+- Wire lines arriving after `close()` are ignored, and `close()` rejects sends
+  still waiting on a turn instead of stranding the caller forever.
+
+- `turn_start` carries the `eventId` of the line that opened it, and a minimal
+  `raw`. A resume turn is headed by `system/init`, whose payload runs to ~5KB
+  of tools, skills, plugins, and MCP config; echoing it whole made hosts that
+  persist `raw` pay that for every resume, twice.
+
+### Compatibility
+
+- Additive at the type level. `turn_start` is a new event type — consumers with
+  exhaustive `switch` statements over `StreamEvent` will need a case or a
+  default. `report` and `toolUseId` are new required fields on
+  `background_task`; every in-tree provider sets them, and both are `null`
+  where the provider reports nothing.
+- No behavior change for OpenCode, Cursor, or any other provider. Codex gains
+  `report`/`toolUseId` and is otherwise untouched; only the Claude provider
+  emits `turn_start`.
+
 ## 0.0.36 — OpenCode empty-turn follow-ups
 
 Follow-ups to the OpenCode empty-turn handling in 0.0.35.
+
+### Changed
+
+- Turn, command, and task state is now reduced from the ordered wire in one
+  place, rather than held in mutable fields updated across `await` boundaries.
+  Each turn's settlement batch is captured synchronously before any suspension
+  point, so a turn that opens while an earlier handler is still draining cannot
+  have its sends resolved by that handler — the failure that made two
+  back-to-back results resolve both callers with the first result.
+
+- A turn owns a *set* of command uuids. The CLI coalesces: a host message
+  dequeued while a turn is running joins that turn instead of starting its own.
+  Modelling one command per turn left every coalesced message permanently
+  unsettled.
 
 ### Fixed
 
@@ -28,6 +195,26 @@ Follow-ups to the OpenCode empty-turn handling in 0.0.35.
   Codex's handling of the same action, rather than `agent_error` with a
   JSON-stringified error object.
 
+- `session.state` no longer follows a detached child. The state machine set
+  `thinking` on any assistant line, including a subagent's, so `state` and
+  `turn_start`/`result` contradicted each other for the child's entire run —
+  measured at 7.6s live — with nothing to clear it if the child was stopped or
+  killed.
+- `stream_event` opens a turn. Under `includePartialMessages` the whole
+  streamed reply arrived before `turn_start`, which reintroduced the reported
+  bug one layer down: output visible while the session still read as finished.
+- A `send()` issued while a turn is settling is no longer classified as
+  `resume`. The trigger reads a counter of host messages still awaiting a
+  turn; the resolver list cannot answer that, because a turn's resolvers are
+  moved off it the moment its `result` is read.
+- `_pendingResumeTaskId` is consumed only by the resume turn it explains. It
+  was cleared on every turn open, so a host send landing between a task's
+  delivery and its resume turn wiped the attribution.
+- Turn state, the task-fact cache, and the unclaimed-send counter are all
+  reset when a session's pending work is rejected (exit, crash, close). A
+  `_turnOpen` left set would also suppress the `idle` fallback in
+  `handleResult` and pin a dead session as working with no path back.
+
 ### Compatibility
 
 - The incomplete-turn note is emitted as `type: "assistant"` (the only surface a
@@ -38,6 +225,20 @@ Follow-ups to the OpenCode empty-turn handling in 0.0.35.
   content.
 
 ## 0.0.35 — Codex turn-boundary correctness and model discovery
+
+### Changed
+
+- Turn, command, and task state is now reduced from the ordered wire in one
+  place, rather than held in mutable fields updated across `await` boundaries.
+  Each turn's settlement batch is captured synchronously before any suspension
+  point, so a turn that opens while an earlier handler is still draining cannot
+  have its sends resolved by that handler — the failure that made two
+  back-to-back results resolve both callers with the first result.
+
+- A turn owns a *set* of command uuids. The CLI coalesces: a host message
+  dequeued while a turn is running joins that turn instead of starting its own.
+  Modelling one command per turn left every coalesced message permanently
+  unsettled.
 
 ### Fixed
 
@@ -183,6 +384,26 @@ Follow-ups to the OpenCode empty-turn handling in 0.0.35.
   contract test now checks both directions so a provider cannot declare
   discovery it does not implement, or implement discovery it does not declare.
 
+- `session.state` no longer follows a detached child. The state machine set
+  `thinking` on any assistant line, including a subagent's, so `state` and
+  `turn_start`/`result` contradicted each other for the child's entire run —
+  measured at 7.6s live — with nothing to clear it if the child was stopped or
+  killed.
+- `stream_event` opens a turn. Under `includePartialMessages` the whole
+  streamed reply arrived before `turn_start`, which reintroduced the reported
+  bug one layer down: output visible while the session still read as finished.
+- A `send()` issued while a turn is settling is no longer classified as
+  `resume`. The trigger reads a counter of host messages still awaiting a
+  turn; the resolver list cannot answer that, because a turn's resolvers are
+  moved off it the moment its `result` is read.
+- `_pendingResumeTaskId` is consumed only by the resume turn it explains. It
+  was cleared on every turn open, so a host send landing between a task's
+  delivery and its resume turn wiped the attribution.
+- Turn state, the task-fact cache, and the unclaimed-send counter are all
+  reset when a session's pending work is rejected (exit, crash, close). A
+  `_turnOpen` left set would also suppress the `idle` fallback in
+  `handleResult` and pin a dead session as working with no path back.
+
 ### Compatibility
 
 - Discovery is curated-list-plus-validation for Claude, not enumeration. A tier
@@ -229,6 +450,20 @@ Follow-ups to the OpenCode empty-turn handling in 0.0.35.
 
 ## 0.0.34 - Codex collaboration task lifecycle
 
+### Changed
+
+- Turn, command, and task state is now reduced from the ordered wire in one
+  place, rather than held in mutable fields updated across `await` boundaries.
+  Each turn's settlement batch is captured synchronously before any suspension
+  point, so a turn that opens while an earlier handler is still draining cannot
+  have its sends resolved by that handler — the failure that made two
+  back-to-back results resolve both callers with the first result.
+
+- A turn owns a *set* of command uuids. The CLI coalesces: a host message
+  dequeued while a turn is running joins that turn instead of starting its own.
+  Modelling one command per turn left every coalesced message permanently
+  unsettled.
+
 ### Fixed
 
 - Codex 0.144 collaboration tool calls now register spawned child threads as
@@ -240,6 +475,26 @@ Follow-ups to the OpenCode empty-turn handling in 0.0.35.
 - Duplicate start and terminal edges are suppressed across collaboration,
   child-thread, and reconciliation signals. Session shutdown also closes any
   still-active child lifecycle instead of leaving a permanent running state.
+
+- `session.state` no longer follows a detached child. The state machine set
+  `thinking` on any assistant line, including a subagent's, so `state` and
+  `turn_start`/`result` contradicted each other for the child's entire run —
+  measured at 7.6s live — with nothing to clear it if the child was stopped or
+  killed.
+- `stream_event` opens a turn. Under `includePartialMessages` the whole
+  streamed reply arrived before `turn_start`, which reintroduced the reported
+  bug one layer down: output visible while the session still read as finished.
+- A `send()` issued while a turn is settling is no longer classified as
+  `resume`. The trigger reads a counter of host messages still awaiting a
+  turn; the resolver list cannot answer that, because a turn's resolvers are
+  moved off it the moment its `result` is read.
+- `_pendingResumeTaskId` is consumed only by the resume turn it explains. It
+  was cleared on every turn open, so a host send landing between a task's
+  delivery and its resume turn wiped the attribution.
+- Turn state, the task-fact cache, and the unclaimed-send counter are all
+  reset when a session's pending work is rejected (exit, crash, close). A
+  `_turnOpen` left set would also suppress the `idle` fallback in
+  `handleResult` and pin a dead session as working with no path back.
 
 ### Compatibility
 
@@ -264,6 +519,20 @@ Follow-ups to the OpenCode empty-turn handling in 0.0.35.
   `getClaudeTaskDetails()` remains available for Claude-native fields and
   accepts legacy `unknown` task events from older agentex versions.
 
+### Changed
+
+- Turn, command, and task state is now reduced from the ordered wire in one
+  place, rather than held in mutable fields updated across `await` boundaries.
+  Each turn's settlement batch is captured synchronously before any suspension
+  point, so a turn that opens while an earlier handler is still draining cannot
+  have its sends resolved by that handler — the failure that made two
+  back-to-back results resolve both callers with the first result.
+
+- A turn owns a *set* of command uuids. The CLI coalesces: a host message
+  dequeued while a turn is running joins that turn instead of starting its own.
+  Modelling one command per turn left every coalesced message permanently
+  unsettled.
+
 ### Fixed
 
 - Codex live sessions now track the active root turn and interrupt it with the
@@ -277,6 +546,26 @@ Follow-ups to the OpenCode empty-turn handling in 0.0.35.
   as `aborted`. Interrupt RPC errors propagate to the caller so hosts can show a
   failed Stop action instead of reporting false success.
 
+- `session.state` no longer follows a detached child. The state machine set
+  `thinking` on any assistant line, including a subagent's, so `state` and
+  `turn_start`/`result` contradicted each other for the child's entire run —
+  measured at 7.6s live — with nothing to clear it if the child was stopped or
+  killed.
+- `stream_event` opens a turn. Under `includePartialMessages` the whole
+  streamed reply arrived before `turn_start`, which reintroduced the reported
+  bug one layer down: output visible while the session still read as finished.
+- A `send()` issued while a turn is settling is no longer classified as
+  `resume`. The trigger reads a counter of host messages still awaiting a
+  turn; the resolver list cannot answer that, because a turn's resolvers are
+  moved off it the moment its `result` is read.
+- `_pendingResumeTaskId` is consumed only by the resume turn it explains. It
+  was cleared on every turn open, so a host send landing between a task's
+  delivery and its resume turn wiped the attribution.
+- Turn state, the task-fact cache, and the unclaimed-send counter are all
+  reset when a session's pending work is rejected (exit, crash, close). A
+  `_turnOpen` left set would also suppress the `idle` fallback in
+  `handleResult` and pin a dead session as working with no path back.
+
 ### Compatibility
 
 - Timeout and AbortSignal cancellation remain best-effort and preserve their
@@ -285,6 +574,20 @@ Follow-ups to the OpenCode empty-turn handling in 0.0.35.
   a root `SendHandle.result`.
 
 ## 0.0.32 — Codex root-thread completion isolation
+
+### Changed
+
+- Turn, command, and task state is now reduced from the ordered wire in one
+  place, rather than held in mutable fields updated across `await` boundaries.
+  Each turn's settlement batch is captured synchronously before any suspension
+  point, so a turn that opens while an earlier handler is still draining cannot
+  have its sends resolved by that handler — the failure that made two
+  back-to-back results resolve both callers with the first result.
+
+- A turn owns a *set* of command uuids. The CLI coalesces: a host message
+  dequeued while a turn is running joins that turn instead of starting its own.
+  Modelling one command per turn left every coalesced message permanently
+  unsettled.
 
 ### Fixed
 
@@ -301,6 +604,26 @@ Follow-ups to the OpenCode empty-turn handling in 0.0.35.
   now normalize to the existing `tool_call` and `tool_result` event shapes.
 - Live Codex event identity prefers the event's own thread scope while retaining
   the pinned root id as a compatibility fallback for older unscoped events.
+
+- `session.state` no longer follows a detached child. The state machine set
+  `thinking` on any assistant line, including a subagent's, so `state` and
+  `turn_start`/`result` contradicted each other for the child's entire run —
+  measured at 7.6s live — with nothing to clear it if the child was stopped or
+  killed.
+- `stream_event` opens a turn. Under `includePartialMessages` the whole
+  streamed reply arrived before `turn_start`, which reintroduced the reported
+  bug one layer down: output visible while the session still read as finished.
+- A `send()` issued while a turn is settling is no longer classified as
+  `resume`. The trigger reads a counter of host messages still awaiting a
+  turn; the resolver list cannot answer that, because a turn's resolvers are
+  moved off it the moment its `result` is read.
+- `_pendingResumeTaskId` is consumed only by the resume turn it explains. It
+  was cleared on every turn open, so a host send landing between a task's
+  delivery and its resume turn wiped the attribution.
+- Turn state, the task-fact cache, and the unclaimed-send counter are all
+  reset when a session's pending work is rejected (exit, crash, close). A
+  `_turnOpen` left set would also suppress the `idle` fallback in
+  `handleResult` and pin a dead session as working with no path back.
 
 ### Compatibility
 
@@ -354,6 +677,20 @@ Follow-ups to the OpenCode empty-turn handling in 0.0.35.
   user prompts owned by the host.
 
 ## 0.0.30 — Complete Claude and Codex host capabilities
+
+### Changed
+
+- Turn, command, and task state is now reduced from the ordered wire in one
+  place, rather than held in mutable fields updated across `await` boundaries.
+  Each turn's settlement batch is captured synchronously before any suspension
+  point, so a turn that opens while an earlier handler is still draining cannot
+  have its sends resolved by that handler — the failure that made two
+  back-to-back results resolve both callers with the first result.
+
+- A turn owns a *set* of command uuids. The CLI coalesces: a host message
+  dequeued while a turn is running joins that turn instead of starting its own.
+  Modelling one command per turn left every coalesced message permanently
+  unsettled.
 
 ### Fixed
 
@@ -489,6 +826,26 @@ remain source-compatible.
 - Codex endpoint header names are emitted as quoted TOML path segments, so
   valid names containing dots cannot become nested configuration keys.
 
+- `session.state` no longer follows a detached child. The state machine set
+  `thinking` on any assistant line, including a subagent's, so `state` and
+  `turn_start`/`result` contradicted each other for the child's entire run —
+  measured at 7.6s live — with nothing to clear it if the child was stopped or
+  killed.
+- `stream_event` opens a turn. Under `includePartialMessages` the whole
+  streamed reply arrived before `turn_start`, which reintroduced the reported
+  bug one layer down: output visible while the session still read as finished.
+- A `send()` issued while a turn is settling is no longer classified as
+  `resume`. The trigger reads a counter of host messages still awaiting a
+  turn; the resolver list cannot answer that, because a turn's resolvers are
+  moved off it the moment its `result` is read.
+- `_pendingResumeTaskId` is consumed only by the resume turn it explains. It
+  was cleared on every turn open, so a host send landing between a task's
+  delivery and its resume turn wiped the attribution.
+- Turn state, the task-fact cache, and the unclaimed-send counter are all
+  reset when a session's pending work is rejected (exit, crash, close). A
+  `_turnOpen` left set would also suppress the `idle` fallback in
+  `handleResult` and pin a dead session as working with no path back.
+
 ### Compatibility and limits
 
 - OpenCode 1.3.2 is the release-tested server schema. Safe disconnect uses
@@ -504,6 +861,20 @@ remain source-compatible.
   mutation. Changing those selections starts a new host session.
 
 ## 0.0.27 — Codex session reasoning effort
+
+### Changed
+
+- Turn, command, and task state is now reduced from the ordered wire in one
+  place, rather than held in mutable fields updated across `await` boundaries.
+  Each turn's settlement batch is captured synchronously before any suspension
+  point, so a turn that opens while an earlier handler is still draining cannot
+  have its sends resolved by that handler — the failure that made two
+  back-to-back results resolve both callers with the first result.
+
+- A turn owns a *set* of command uuids. The CLI coalesces: a host message
+  dequeued while a turn is running joins that turn instead of starting its own.
+  Modelling one command per turn left every coalesced message permanently
+  unsettled.
 
 ### Fixed
 
@@ -630,6 +1001,20 @@ invisible to callers. `getProvider` stays synchronous; only heavy modules
   The loader defaults to the built-in `acpProvider`; `registerAcpFactory` stays
   exported and honored as an override hook.
 
+### Changed
+
+- Turn, command, and task state is now reduced from the ordered wire in one
+  place, rather than held in mutable fields updated across `await` boundaries.
+  Each turn's settlement batch is captured synchronously before any suspension
+  point, so a turn that opens while an earlier handler is still draining cannot
+  have its sends resolved by that handler — the failure that made two
+  back-to-back results resolve both callers with the first result.
+
+- A turn owns a *set* of command uuids. The CLI coalesces: a host message
+  dequeued while a turn is running joins that turn instead of starting its own.
+  Modelling one command per turn left every coalesced message permanently
+  unsettled.
+
 ### Fixed
 
 - **TDZ crash on direct provider import.** `import("@agentex/agent/providers/gemini")`
@@ -693,6 +1078,20 @@ A session-scoped **goal** primitive. Attach a durable objective and the library 
 - **`GoalController` + reconstruction helpers**, exported for hosts: `goalStateFromEvent`, `latestGoalFromEvents`, `normalizeClaudeGoalAttachment`, `normalizeCodexGoalStatus`, `normalizeCodexGoalRecord`, `createDefaultSentinel`, `parseAssessment`, `isTerminalGoalStatus`, `EMULATED_GOAL_CAPABILITY`, `GOAL_OBJECTIVE_MAX`, `CODEX_GOAL_TOOLS`, plus the `GoalState` / `GoalStatus` / `GoalOptions` / `GoalSentinel` / `SetGoalResult` / `ClearGoalResult` types.
 - **Native observability + resume.** Claude writes `goal_status` only to the on-disk transcript (never live stdout), so a native goal session tails its transcript to surface `active`→`met` and restores an unmet goal on `--resume`. Codex rehydrates a durable goal on resume via `thread/goal/get`. Both confirmed live.
 
+### Changed
+
+- Turn, command, and task state is now reduced from the ordered wire in one
+  place, rather than held in mutable fields updated across `await` boundaries.
+  Each turn's settlement batch is captured synchronously before any suspension
+  point, so a turn that opens while an earlier handler is still draining cannot
+  have its sends resolved by that handler — the failure that made two
+  back-to-back results resolve both callers with the first result.
+
+- A turn owns a *set* of command uuids. The CLI coalesces: a host message
+  dequeued while a turn is running joins that turn instead of starting its own.
+  Modelling one command per turn left every coalesced message permanently
+  unsettled.
+
 ### Fixed
 
 - **Codex failed turns are no longer reported as success.** codex 0.130 signals failure via `turn/completed` with `turn.status: "failed"` (carrying `turn.error.message`), not only `turn/failed` — agentex hardcoded `isError:false`, so a failed turn (e.g. a 4xx from the model API) looked `completed`. The parser + session now detect the failed status and the trailing `error` notification, reporting `status:"failed"` with the error text. Verified live.
@@ -723,6 +1122,20 @@ Additive. The instruction-file twin of `installSkills`: install an orientation b
 ## 0.0.20 — MCP attachment fix, session controls, typewriter deltas, Codex event identity
 
 Driven by consumer feedback from an embedding host wiring an orchestrator onto agentex sessions. All additive — except the MCP fix, which replaces behavior that never worked in any published version.
+
+### Changed
+
+- Turn, command, and task state is now reduced from the ordered wire in one
+  place, rather than held in mutable fields updated across `await` boundaries.
+  Each turn's settlement batch is captured synchronously before any suspension
+  point, so a turn that opens while an earlier handler is still draining cannot
+  have its sends resolved by that handler — the failure that made two
+  back-to-back results resolve both callers with the first result.
+
+- A turn owns a *set* of command uuids. The CLI coalesces: a host message
+  dequeued while a turn is running joins that turn instead of starting its own.
+  Modelling one command per turn left every coalesced message permanently
+  unsettled.
 
 ### Fixed
 
@@ -758,6 +1171,20 @@ A three-tier provider architecture (deep-native · ACP · bespoke). The ACP tier
 - **Codex session resume.** `createSession` now honors `ctx.sessionParams` (a prior `sessionId` / `thread_id`) by issuing `thread/resume` to continue the *same* Codex thread with full context — previously every session cold-started a fresh `thread/start` and the saved session id was ignored. On an unknown thread it falls back to a fresh thread with a stderr notice rather than failing the session.
 - **Codex collaboration modes.** `codexProvider.listModes()` discovers Codex's collaboration modes via `collaborationMode/list`; `config.modeId` applies a chosen mode to a fresh `thread/start` (a resumed thread keeps its original mode). `capabilities.modes` is now `true` for Codex.
 - **Codex structured questions.** The app-server `requestUserInput` (and legacy `tool/requestUserInput`) server→client request is now bridged to `onUserInputRequest` as an `AskUserQuestion`, with answers mapped back into Codex's `{ answers: { [id]: { answers: [] } } }` shape — Codex sessions can answer questions headlessly.
+
+### Changed
+
+- Turn, command, and task state is now reduced from the ordered wire in one
+  place, rather than held in mutable fields updated across `await` boundaries.
+  Each turn's settlement batch is captured synchronously before any suspension
+  point, so a turn that opens while an earlier handler is still draining cannot
+  have its sends resolved by that handler — the failure that made two
+  back-to-back results resolve both callers with the first result.
+
+- A turn owns a *set* of command uuids. The CLI coalesces: a host message
+  dequeued while a turn is running joins that turn instead of starting its own.
+  Modelling one command per turn left every coalesced message permanently
+  unsettled.
 
 ### Fixed
 
@@ -795,6 +1222,20 @@ Scheduled / fire-and-forget session runs needed three things the SDK pushed onto
 - **`AgentSession.drain(): Promise<void>`** — graceful stop: refuse new `send()` calls, await the in-flight turn's `result`, then `close()`. The right tool for budget gates, `SIGTERM` handlers, and schedule pauses, where `interrupt()` (loses work) and `close()` (kills mid-tool) are both wrong. Idempotent.
 
 - **`SendHandle`, `SendOptions`, `CancelResult`** are now exported from the package entry point (previously only the `AgentSession` interface was).
+
+### Changed
+
+- Turn, command, and task state is now reduced from the ordered wire in one
+  place, rather than held in mutable fields updated across `await` boundaries.
+  Each turn's settlement batch is captured synchronously before any suspension
+  point, so a turn that opens while an earlier handler is still draining cannot
+  have its sends resolved by that handler — the failure that made two
+  back-to-back results resolve both callers with the first result.
+
+- A turn owns a *set* of command uuids. The CLI coalesces: a host message
+  dequeued while a turn is running joins that turn instead of starting its own.
+  Modelling one command per turn left every coalesced message permanently
+  unsettled.
 
 ### Fixed
 

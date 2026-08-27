@@ -382,8 +382,10 @@ Variants:
 - `tool_result` — Tool returned a result (`toolCallId: string | null`, `toolName: string | null`, `content`, `isError`, `exitCode: number | null`). `toolName` mirrors the matching `tool_call.name` (correlated for you), so you don't need your own `toolCallId → name` cache; null when no preceding `tool_call` was seen on the stream.
 - `rate_limit` — Provider reported rate-limit state (`status`, `limitType`, `resetAt`, `overageStatus`, `isUsingOverage`)
 - `permission_mode` — Permission mode change mid-session (`permissionMode: string`). Claude only, e.g., when the user accepts a plan and the session leaves `plan` mode.
-- `background_task` — Provider-neutral lifecycle for work that can outlive the root turn (`taskId`, `taskType`, `phase`, `status`, `description`, `summary`, `parentTaskId`). A terminal task event never settles the root turn.
-- `result` — Final result (`text`, `costUsd`, `isError`, `stopReason`, `terminalReason`, `numTurns`, `durationMs`)
+- `background_task` — Provider-neutral lifecycle for work that can outlive the root turn (`taskId`, `taskType`, `phase`, `status`, `description`, `summary`, `parentTaskId`, `toolUseId`, `report`). A terminal task event never settles the root turn.
+- `turn_start` — A turn opened (`turnId`, `trigger`). `trigger` is `"send"` when the host dispatched it and `"resume"` when the provider started it on its own — Claude does the latter when a background task's result comes back, opening a turn no `send()` can see. Track "is the agent working" from `turn_start` → `turn_end`, not from your own dispatch. `turnId` is session-local (`turn-1`, `turn-2`, …), not a provider id. `turn_start` deliberately does not name the task behind a `resume`: Claude delivers a task's result and opens the turn as two unlinked records, so with several tasks in flight the pairing is not recoverable from the wire — correlate through `background_task.report` and `toolUseId` instead.
+- `turn_end` — The matching close (`turnId`, `trigger`, `reason`). Exactly one per `turn_start`, carrying the same `turnId`. **Close on this, not on `result`.** `reason: "result"` is a normal completion whose payload arrives as the accompanying `result` event, ordered immediately before this one. `"cancelled" | "discarded" | "refused"` are the CLI's verdicts on a message that opened a turn and produced no result at all, and `"session_closed"` is a turn still open when the session went down. A host pairing `turn_start` with `result` stays busy forever on those four paths.
+- `result` — Final result (`text`, `costUsd`, `isError`, `stopReason`, `terminalReason`, `numTurns`, `durationMs`). The outcome payload, not the close signal — see `turn_end`.
 
 Lifecycle events (via `onLifecycle`) report phases: `preparing`, `spawning`, `running`, `waiting_for_input`, `completed`, `cancelled`, `error`.
 
@@ -396,7 +398,7 @@ Verified live against `claude 2.1.116` and `codex-cli 0.122.0` (2026-04-21). ACP
 | `sessionId`            | `session_id` (UUID, stable across turns + resume)  | `thread_id` (UUIDv7, emitted once on `thread.started`, tracked across lines) |
 | `messageId`            | `message.id` (Anthropic API message, e.g. `msg_*`) | v2 app-server: globally unique (`msg_*`, `rs_*`, `call_*`). NDJSON: `item_N` — **turn-local, not globally unique** |
 | `eventId`              | Top-level per-line `uuid`                          | Synthetic where derivable (see below); else null |
-| `turnId`               | **null** — Claude doesn't model turns              | v2 app-server: native UUIDv7 from `params.turnId`. NDJSON: **null** — no turn id in legacy format |
+| `turnId`               | **null** on every event except `turn_start` / `turn_end`, which carry a session-local `turn-N` — Claude has no native turn id | v2 app-server: native UUIDv7 from `params.turnId`. NDJSON: **null** — no turn id in legacy format |
 | `parentToolCallId`     | `parent_tool_use_id` (set for sub-agent messages)  | **null** — not emitted                           |
 | Tool correlation       | `tool_use.id` (`toolu_*`) ↔ `tool_result.tool_use_id`; the library stamps `tool_result.toolName` from the matching call | `item.id` reappears on the same item's `item.completed`; `toolName` set directly from the item type |
 | `tool_result.exitCode` | **null** (Claude doesn't expose shell exit codes)  | `item.exit_code` for `command_execution`         |
@@ -550,6 +552,15 @@ first-class `background_task` event. Its normalized contract is:
   description: string | null;
   summary: string | null;
   parentTaskId: string | null;
+  // The tool call that launched the task, when the provider reports it.
+  toolUseId: string | null;
+  // The task's delivered output — present only on the event that hands the
+  // result back, null on every state change. See below.
+  report: {
+    summary: string | null;
+    outputFile: string | null;
+    usage: { totalTokens: number | null; toolUses: number | null; durationMs: number | null } | null;
+  } | null;
 }
 ```
 
@@ -557,6 +568,15 @@ Treat these as a task-keyed event log: upsert by `taskId`, and remove the task
 from the active set when `phase === "completed"`. Root turn state is a separate
 axis. A `result` may arrive while background tasks are still active, and a
 background task may complete while the root is still running.
+
+A completion can arrive as more than one event. Claude emits both a state
+patch (`task_updated`) and a result delivery (`task_notification`) for a single
+finished task, and they are different records rather than duplicates: only the
+delivery carries the summary and the output file. Render one row per completion
+by keying on `report !== null` rather than on `phase`. A task that was stopped
+or killed delivered nothing and carries no report, so it produces no row under
+that rule — surface those from the terminal `status` if your UI needs to show
+that a task was cut short.
 
 ```typescript
 createSession({

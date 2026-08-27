@@ -203,3 +203,58 @@ describe("root collab items keep the forward-compat escape hatch", () => {
     expect(events[0]).toMatchObject({ taskId: "child-a", phase: "started", status: "running" });
   });
 });
+
+// ---------------------------------------------------------------------------
+// `report` — the delivered result, as opposed to a bare state change.
+//
+// The rule has to be the same across providers or a host cannot use it: render
+// one row per completion by keying on `report !== null`. Three Codex sites
+// build these events and previously disagreed with each other and with Claude.
+// ---------------------------------------------------------------------------
+
+describe("codex background_task report", () => {
+  const parse = (state: Record<string, unknown>): StreamEvent[] =>
+    parseCodexStreamLines(collabLine({
+      tool: "spawnAgent",
+      prompt: "review the diff",
+      receiverThreadIds: ["child-1"],
+      agentsStates: { "child-1": state },
+    }));
+
+  const task = (events: StreamEvent[]) =>
+    events.find((e): e is Extract<StreamEvent, { type: "background_task" }> =>
+      e.type === "background_task");
+
+  it("reports a completed child", () => {
+    const t = task(parse({ status: "completed", message: "looks good" }));
+    expect(t?.status).toBe("completed");
+    expect(t?.report).toEqual({ summary: "looks good", outputFile: null, usage: null });
+  });
+
+  it("reports a completed child that said nothing", () => {
+    // A delivery still happened; there was just no summary. Gating on a
+    // non-null summary made this completion render no row while the live
+    // session path rendered one.
+    const t = task(parse({ status: "completed" }));
+    expect(t?.report).toEqual({ summary: null, outputFile: null, usage: null });
+  });
+
+  it("reports an errored child, which delivered an outcome", () => {
+    const t = task(parse({ status: "errored", message: "boom" }));
+    expect(t?.status).toBe("failed");
+    expect(t?.report).not.toBeNull();
+  });
+
+  it("does not report an interrupted child", () => {
+    // Cut short — same rule as Claude's `stopped` and the one-shot path.
+    const t = task(parse({ status: "interrupted", message: "cancelled" }));
+    expect(t?.status).toBe("stopped");
+    expect(t?.report).toBeNull();
+  });
+
+  it("does not report a child that is still running", () => {
+    const t = task(parse({ status: "pendingInit" }));
+    expect(t?.status).toBe("running");
+    expect(t?.report).toBeNull();
+  });
+});

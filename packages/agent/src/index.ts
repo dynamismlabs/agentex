@@ -172,6 +172,8 @@ export type {
   BackgroundTaskType,
   BackgroundTaskPhase,
   BackgroundTaskStatus,
+  BackgroundTaskReport,
+  TurnTrigger,
   BinaryStatus,
   ProviderModel,
   ListModelsOptions,
