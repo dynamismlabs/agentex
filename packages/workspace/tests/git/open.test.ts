@@ -107,7 +107,7 @@ describe("workspace.open (git)", () => {
     });
 
     const { git } = await import("../git-helpers.js");
-    const { stdout } = await git(wsPath, "rev-parse", "--git-path", "info/agentex.json");
+    const { stdout } = await git(wsPath, "rev-parse", "--git-path", "agentex.json");
     await fs.unlink(stdout.trim());
 
     await expect(workspace.open(wsPath)).rejects.toThrow(/no base metadata/);
@@ -129,7 +129,7 @@ describe("workspace.open (git)", () => {
     });
 
     const { git } = await import("../git-helpers.js");
-    const { stdout } = await git(wsPath, "rev-parse", "--git-path", "info/agentex.json");
+    const { stdout } = await git(wsPath, "rev-parse", "--git-path", "agentex.json");
     await fs.unlink(stdout.trim());
 
     const reopened = await workspace.open(wsPath, {
@@ -158,7 +158,7 @@ describe("workspace.open (git)", () => {
     });
 
     const { git } = await import("../git-helpers.js");
-    const { stdout } = await git(wsPath, "rev-parse", "--git-path", "info/agentex.json");
+    const { stdout } = await git(wsPath, "rev-parse", "--git-path", "agentex.json");
     await fs.unlink(stdout.trim());
 
     const expectedSha = await headSha(sourcePath, "main");
