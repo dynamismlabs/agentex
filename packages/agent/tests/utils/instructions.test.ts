@@ -78,18 +78,33 @@ describe("resolveInstructions", () => {
 describe("resolveInstructionTargets", () => {
   const cwd = "/projects/my-app";
 
-  it("workspace default → CLAUDE.md + AGENTS.md once each", () => {
+  it("workspace default → AGENTS.md once, serving every runtime", () => {
     const targets = resolveInstructionTargets({ location: "workspace", cwd });
+
+    expect(targets).toHaveLength(1);
+    expect(targets[0]!.filename).toBe("AGENTS.md");
+    expect(targets[0]!.targetPath).toBe(path.join(cwd, "AGENTS.md"));
+    expect(targets[0]!.importsFile).toBeUndefined();
+    // Claude Code reads AGENTS.md too (since 2.1.277, where there is no CLAUDE.md).
+    expect(targets[0]!.runtimes.sort()).toEqual(
+      ["claude", "codex", "cursor", "gemini", "opencode", "pi"].sort(),
+    );
+  });
+
+  it("includeNativeFiles adds CLAUDE.md as a pointer to AGENTS.md", () => {
+    const targets = resolveInstructionTargets({
+      location: "workspace",
+      cwd,
+      runtimes: ["claude"],
+      includeNativeFiles: true,
+    });
     const byFile = Object.fromEntries(targets.map((t) => [t.filename, t]));
 
-    expect(Object.keys(byFile).sort()).toEqual(["AGENTS.md", "CLAUDE.md"]);
+    expect(Object.keys(byFile)).toEqual(["AGENTS.md", "CLAUDE.md"]);
     expect(byFile["CLAUDE.md"]!.targetPath).toBe(path.join(cwd, "CLAUDE.md"));
-    expect(byFile["AGENTS.md"]!.targetPath).toBe(path.join(cwd, "AGENTS.md"));
-    // CLAUDE.md serves claude; AGENTS.md serves everyone else.
+    expect(byFile["CLAUDE.md"]!.importsFile).toBe("AGENTS.md");
     expect(byFile["CLAUDE.md"]!.runtimes).toEqual(["claude"]);
-    expect(byFile["AGENTS.md"]!.runtimes.sort()).toEqual(
-      ["codex", "cursor", "gemini", "opencode", "pi"].sort(),
-    );
+    expect(byFile["AGENTS.md"]!.importsFile).toBeUndefined();
   });
 
   it("workspace dedupes AGENTS.md across multiple runtimes", () => {
@@ -112,6 +127,8 @@ describe("resolveInstructionTargets", () => {
     });
     const files = targets.map((t) => t.filename).sort();
     expect(files).toEqual(["AGENTS.md", "GEMINI.md"]);
+    // Gemini doesn't read AGENTS.md by default, so GEMINI.md is a copy, not a pointer.
+    expect(targets.find((t) => t.filename === "GEMINI.md")!.importsFile).toBeUndefined();
   });
 
   it("includeNativeFiles is a no-op for runtimes whose native file is the standard", () => {
@@ -255,18 +272,26 @@ describe("installInstructions (workspace)", () => {
     return dir;
   }
 
-  it("default writes CLAUDE.md + AGENTS.md, both with the managed block", async () => {
+  async function exists(p: string): Promise<boolean> {
+    try {
+      await fs.access(p);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  it("default writes AGENTS.md only, with the managed block", async () => {
     const cwd = await mkCwd();
     const result = await installInstructions("orientation brief", { location: "workspace", cwd });
 
-    expect(result.installed).toBe(2);
+    expect(result.installed).toBe(1);
     expect(result.errors).toBe(0);
 
-    const claude = await fs.readFile(path.join(cwd, "CLAUDE.md"), "utf-8");
     const agents = await fs.readFile(path.join(cwd, "AGENTS.md"), "utf-8");
-    expect(claude).toContain("orientation brief");
-    expect(claude).toContain("agentex:managed:start");
     expect(agents).toContain("orientation brief");
+    expect(agents).toContain("agentex:managed:start");
+    expect(await exists(path.join(cwd, "CLAUDE.md"))).toBe(false);
   });
 
   it("is idempotent — re-install with same content reports all skipped", async () => {
@@ -274,9 +299,114 @@ describe("installInstructions (workspace)", () => {
     await installInstructions("brief", { location: "workspace", cwd });
     const second = await installInstructions("brief", { location: "workspace", cwd });
 
-    expect(second.skipped).toBe(2);
+    expect(second.skipped).toBe(1);
     expect(second.installed).toBe(0);
     expect(second.updated).toBe(0);
+  });
+
+  it("includeNativeFiles writes CLAUDE.md as a one-line @AGENTS.md pointer", async () => {
+    const cwd = await mkCwd();
+    const result = await installInstructions("brief", {
+      location: "workspace",
+      cwd,
+      runtimes: ["claude"],
+      includeNativeFiles: true,
+    });
+
+    expect(result.installed).toBe(2); // AGENTS.md + CLAUDE.md
+    const claude = await fs.readFile(path.join(cwd, "CLAUDE.md"), "utf-8");
+    expect(claude).toContain("agentex:managed:start");
+    expect(claude).toContain("@AGENTS.md");
+    expect(claude).not.toContain("brief");
+    expect(await fs.readFile(path.join(cwd, "AGENTS.md"), "utf-8")).toContain("brief");
+
+    const again = await installInstructions("brief", {
+      location: "workspace",
+      cwd,
+      runtimes: ["claude"],
+      includeNativeFiles: true,
+    });
+    expect(again.skipped).toBe(2);
+  });
+
+  it("removes a CLAUDE.md holding only the managed region when the opt-in is off", async () => {
+    const cwd = await mkCwd();
+    const claudePath = path.join(cwd, "CLAUDE.md");
+    // What 0.0.37 and earlier wrote: the full brief in CLAUDE.md. Left alone it
+    // would hide AGENTS.md from Claude Code.
+    await fs.writeFile(claudePath, upsertManagedBlock(null, "old brief"));
+
+    const result = await installInstructions("new brief", { location: "workspace", cwd });
+
+    expect(result.removed).toBe(1);
+    expect(result.entries.find((e) => e.filename === "CLAUDE.md")!.status).toBe("removed");
+    expect(await exists(claudePath)).toBe(false);
+    expect(await fs.readFile(path.join(cwd, "AGENTS.md"), "utf-8")).toContain("new brief");
+  });
+
+  it("turning the opt-in off removes the pointer", async () => {
+    const cwd = await mkCwd();
+    await installInstructions("brief", { location: "workspace", cwd, includeNativeFiles: true });
+    expect(await exists(path.join(cwd, "CLAUDE.md"))).toBe(true);
+
+    const result = await installInstructions("brief", { location: "workspace", cwd });
+    expect(result.removed).toBe(1);
+    expect(await exists(path.join(cwd, "CLAUDE.md"))).toBe(false);
+  });
+
+  it("points a user-written CLAUDE.md at AGENTS.md, keeping their content", async () => {
+    const cwd = await mkCwd();
+    const claudePath = path.join(cwd, "CLAUDE.md");
+    await fs.writeFile(claudePath, "# My Claude rules\nbe terse\n");
+
+    const result = await installInstructions("brief", { location: "workspace", cwd });
+    expect(result.entries.find((e) => e.filename === "CLAUDE.md")!.status).toBe("updated");
+
+    const claude = await fs.readFile(claudePath, "utf-8");
+    expect(claude).toContain("@AGENTS.md");
+    expect(claude).toContain("be terse");
+    expect(claude).not.toContain("brief");
+    expect(claude.indexOf("@AGENTS.md")).toBeLessThan(claude.indexOf("# My Claude rules"));
+
+    const again = await installInstructions("brief", { location: "workspace", cwd });
+    expect(again.entries.find((e) => e.filename === "CLAUDE.md")!.status).toBe("skipped");
+  });
+
+  it("swaps an old full brief in a user's CLAUDE.md for the pointer", async () => {
+    const cwd = await mkCwd();
+    const claudePath = path.join(cwd, "CLAUDE.md");
+    await fs.writeFile(claudePath, upsertManagedBlock(null, "old brief") + "\n# mine\nkeep me\n");
+
+    await installInstructions("new brief", { location: "workspace", cwd });
+
+    const claude = await fs.readFile(claudePath, "utf-8");
+    expect(claude.split("agentex:managed:start").length).toBe(2); // exactly one block
+    expect(claude).toContain("@AGENTS.md");
+    expect(claude).not.toContain("old brief");
+    expect(claude).toContain("keep me");
+  });
+
+  it("leaves CLAUDE.md alone when claude isn't among the runtimes", async () => {
+    const cwd = await mkCwd();
+    const claudePath = path.join(cwd, "CLAUDE.md");
+    const managedOnly = upsertManagedBlock(null, "old brief");
+    await fs.writeFile(claudePath, managedOnly);
+
+    const result = await installInstructions("brief", { location: "workspace", cwd, runtimes: ["codex"] });
+
+    expect(result.entries.map((e) => e.filename)).toEqual(["AGENTS.md"]);
+    expect(await fs.readFile(claudePath, "utf-8")).toBe(managedOnly);
+  });
+
+  it("managed:false leaves an existing CLAUDE.md alone", async () => {
+    const cwd = await mkCwd();
+    const claudePath = path.join(cwd, "CLAUDE.md");
+    const managedOnly = upsertManagedBlock(null, "old brief");
+    await fs.writeFile(claudePath, managedOnly);
+
+    await installInstructions("brief", { location: "workspace", cwd, managed: false });
+
+    expect(await fs.readFile(claudePath, "utf-8")).toBe(managedOnly);
   });
 
   it("user content outside the markers survives a changed re-install", async () => {
@@ -514,9 +644,24 @@ describe("removeInstructions", () => {
     const cwd = await mkCwd();
     await installInstructions("brief", { location: "workspace", cwd });
     const removed = await removeInstructions({ location: "workspace", cwd });
-    expect(removed.removed).toBe(2);
+    expect(removed.removed).toBe(1);
 
-    for (const f of ["CLAUDE.md", "AGENTS.md"]) {
+    let exists = true;
+    try {
+      await fs.access(path.join(cwd, "AGENTS.md"));
+    } catch {
+      exists = false;
+    }
+    expect(exists).toBe(false);
+  });
+
+  it("removes native files too, including an opt-in CLAUDE.md pointer", async () => {
+    const cwd = await mkCwd();
+    await installInstructions("brief", { location: "workspace", cwd, includeNativeFiles: true });
+    const removed = await removeInstructions({ location: "workspace", cwd });
+    expect(removed.removed).toBe(3); // AGENTS.md + CLAUDE.md + GEMINI.md
+
+    for (const f of ["CLAUDE.md", "AGENTS.md", "GEMINI.md"]) {
       let exists = true;
       try {
         await fs.access(path.join(cwd, f));

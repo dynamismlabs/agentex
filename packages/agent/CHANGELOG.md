@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.0.38 — AGENTS.md is the workspace instruction file for every runtime
+
+Claude Code reads `AGENTS.md` since 2.1.277, loaded exactly where `CLAUDE.md` would be, but only in a folder with no `CLAUDE.md`. A `CLAUDE.md`, a `CLAUDE.local.md`, or one in a parent folder hides `AGENTS.md` completely (verified against 2.1.281). Not yet on Bedrock, Vertex or Foundry.
+
+### Changed (breaking)
+
+- **`installInstructions` writes `AGENTS.md` only by default.** Claude's workspace file is now `AGENTS.md`, like every other runtime. `CLAUDE.md` is Claude's native file, written only with `includeNativeFiles: true`, and then as a one-line `@AGENTS.md` pointer in the managed region instead of a second copy of the brief. A copy would have made anything the user writes in `AGENTS.md` invisible to Claude. Opt in for Claude Code before 2.1.277 or on a third-party API provider. `includeNativeFiles` still writes Gemini's `GEMINI.md` as a copy.
+- **An existing workspace `CLAUDE.md` is reconciled** whenever `claude` is among the runtimes and the opt-in is off, because it would hide `AGENTS.md`: one holding nothing but this installer's managed region (for example the full brief 0.0.37 and earlier wrote) is deleted, and one the user wrote keeps their content and gains `@AGENTS.md` in the managed region. `managed: false` leaves it alone.
+- **`removeInstructions` always checks native files** (`CLAUDE.md`, `GEMINI.md`), so an opt-in install is fully removable. It still only strips the managed region.
+
+### Added
+
+- `InstructionStatus` gains `"removed"`, and `InstructionInstallResult` a `removed` count.
+- `InstructionTarget.importsFile` marks a pointer file (`"AGENTS.md"` on an opt-in `CLAUDE.md`).
+
+### Migration
+
+A host that relied on the default `CLAUDE.md` gets `AGENTS.md` only. Nothing else is needed on Claude Code 2.1.277+ with first-party auth: the next install deletes the old managed-only `CLAUDE.md`. Elsewhere, pass `includeNativeFiles: true`.
+
 ## 0.0.37 — Turn liveness and background-task identity (Claude)
 
 Claude Code starts turns by itself. When a background task finishes, the CLI

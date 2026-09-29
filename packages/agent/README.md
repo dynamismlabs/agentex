@@ -1041,11 +1041,11 @@ Channels and locations follow the emerging `.agents/skills/` + `.claude/skills/`
 import { installInstructions, removeInstructions } from "@agentex/agent";
 
 // Workspace (repo-root) install — the common case.
-// Writes the brief into {cwd}/CLAUDE.md and {cwd}/AGENTS.md (deduped by filename).
+// Writes the brief into {cwd}/AGENTS.md, which every runtime reads.
 await installInstructions(brief, {
   location: "workspace",      // or "global"
   cwd: process.cwd(),         // required for workspace installs
-  includeNativeFiles: false,  // true also writes Gemini's native GEMINI.md
+  includeNativeFiles: false,  // true also writes CLAUDE.md (an @AGENTS.md pointer) and GEMINI.md
   managed: true,              // wrap in markers + merge (default); false overwrites the file
   managedTag: "agentex",      // marker tag → <!-- agentex:managed:start -->
 });
@@ -1058,7 +1058,12 @@ await installInstructions(brief, { location: "global" });
 await removeInstructions({ location: "workspace", cwd: process.cwd() });
 ```
 
-Every runtime except Claude reads `AGENTS.md`; Claude reads `CLAUDE.md`. Gemini reads `GEMINI.md` by default (only reads `AGENTS.md` when configured), so it gets a native escape hatch via `includeNativeFiles`. Re-installing unchanged content is idempotent (reported as `skipped`). Use `resolveInstructionTargets(opts)` to see which files *would* be written without touching disk, and `upsertManagedBlock` / `stripManagedBlock` for the low-level merge.
+Every runtime reads `AGENTS.md` at a workspace root. Claude Code does since 2.1.277, but only where the folder has no `CLAUDE.md`: a `CLAUDE.md`, a `CLAUDE.local.md`, or one in a parent folder hides `AGENTS.md` completely. So a workspace `CLAUDE.md` is only ever a one-line `@AGENTS.md` pointer, never a second copy of the brief:
+
+- `includeNativeFiles: true` writes the pointer. Use it for Claude Code before 2.1.277, or on Bedrock, Vertex or Foundry, where Claude doesn't read `AGENTS.md` on its own. It also writes Gemini's native `GEMINI.md` (a copy), since Gemini reads `AGENTS.md` only when configured.
+- With the opt-in off, an existing `CLAUDE.md` is reconciled whenever Claude is among the runtimes: one holding nothing but the managed region is removed (reported `removed`), and one the user wrote gets `@AGENTS.md` in its managed region, so the brief still reaches Claude.
+
+Re-installing unchanged content is idempotent (reported as `skipped`). Use `resolveInstructionTargets(opts)` to see which files *would* be written without touching disk, and `upsertManagedBlock` / `stripManagedBlock` for the low-level merge.
 
 ### Discover Slash-Invokable Skills
 
@@ -1268,7 +1273,7 @@ registerProvider(myProvider);
 - `renderTemplate(template, ctx)` — `{{var}}` interpolation.
 - `redactEnvForLogs(env)` — redact sensitive values before logging.
 - `resolveInstructions(path?)` — read an instructions file, or `null` if no path.
-- `installInstructions(content, opts?)` / `removeInstructions(opts?)` — write/remove a managed instruction brief across per-runtime files (`CLAUDE.md` / `AGENTS.md` / native `GEMINI.md`), workspace or global.
+- `installInstructions(content, opts?)` / `removeInstructions(opts?)` — write/remove a managed instruction brief across per-runtime files (`AGENTS.md`, plus opt-in native `CLAUDE.md` pointer / `GEMINI.md`), workspace or global.
 - `resolveInstructionTargets(opts?)` — list which instruction files would be written, without touching disk.
 - `upsertManagedBlock(existing, content, opts?)` / `stripManagedBlock(existing, opts?)` — low-level managed-region merge/strip (preserves content outside the markers).
 - `getDefaultRuntimeHome(runtime, homeDir?)` — pass `homeDir` to resolve against a sandboxed base instead of `os.homedir()`.

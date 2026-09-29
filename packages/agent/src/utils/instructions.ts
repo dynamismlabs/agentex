@@ -29,17 +29,26 @@ export async function resolveInstructions(filePath?: string): Promise<string | n
 // (.agents/skills + .claude/skills) with a per-runtime "native" escape hatch.
 // Instruction files follow the same shape:
 //
-//   - every runtime except Claude reads AGENTS.md; Claude reads CLAUDE.md
-//   - Gemini reads GEMINI.md by default (AGENTS.md only when configured), so it
-//     gets a native escape hatch
+//   - every runtime reads AGENTS.md at a workspace root (Claude Code since
+//     2.1.277, where the folder has no CLAUDE.md)
+//   - Claude's CLAUDE.md and Gemini's GEMINI.md are native files, written only
+//     on opt-in (`includeNativeFiles`)
 //
 // Two locations, mirroring installSkills:
 //
 //   - "workspace": files at {cwd}/ — the repo-root AGENTS.md convention. Files
-//     dedupe by name, so the default writes CLAUDE.md + AGENTS.md once each.
+//     dedupe by name, so the default writes AGENTS.md once.
 //   - "global": each runtime reads its own file in its own home dir
 //     (~/.claude/CLAUDE.md, ~/.codex/AGENTS.md, ~/.gemini/GEMINI.md, ...). There
 //     is no universal ~/AGENTS.md, so global is inherently per-runtime.
+//
+// Claude Code reads AGENTS.md only where no CLAUDE.md exists: a CLAUDE.md (or
+// a CLAUDE.local.md, or one in a parent directory) hides AGENTS.md completely.
+// So a workspace CLAUDE.md is only ever a one-line pointer (`@AGENTS.md`),
+// never a second copy of the brief, and a CLAUDE.md already on disk is
+// reconciled on every install: one holding nothing but our managed region is
+// removed when the opt-in is off, and one the user wrote gets the pointer so
+// the brief still reaches Claude.
 //
 // Unlike skills (which are symlinked dirs), instruction files carry content, so
 // installInstructions does a managed-region merge: it wraps `content` in marker
@@ -48,21 +57,28 @@ export async function resolveInstructions(filePath?: string): Promise<string | n
 // ===========================================================================
 
 interface RuntimeInstructionSpec {
-  /** File this runtime reads at a workspace/repo root. AGENTS.md for all but Claude. */
+  /** File this runtime reads at a workspace/repo root. AGENTS.md for every runtime. */
   projectFile: string;
-  /** The runtime's own preferred filename. Differs from projectFile only for Gemini (GEMINI.md). */
+  /** The runtime's own preferred filename. Written in a workspace only on opt-in (`includeNativeFiles`). */
   nativeFile: string;
+  /**
+   * How an opt-in native file carries the brief. "pointer": only an import of
+   * the project file (`@AGENTS.md`), because the native file's mere presence
+   * hides the project file from the runtime (Claude). "copy": the brief itself
+   * (Gemini, which doesn't read AGENTS.md by default).
+   */
+  nativeFileMode: "pointer" | "copy";
   /** Whether the runtime has a file-based global config. False for Cursor (global = app User Rules). */
   hasGlobalFile: boolean;
 }
 
 const RUNTIME_INSTRUCTIONS: Record<SkillRuntime, RuntimeInstructionSpec> = {
-  claude: { projectFile: "CLAUDE.md", nativeFile: "CLAUDE.md", hasGlobalFile: true },
-  codex: { projectFile: "AGENTS.md", nativeFile: "AGENTS.md", hasGlobalFile: true },
-  opencode: { projectFile: "AGENTS.md", nativeFile: "AGENTS.md", hasGlobalFile: true },
-  gemini: { projectFile: "AGENTS.md", nativeFile: "GEMINI.md", hasGlobalFile: true },
-  cursor: { projectFile: "AGENTS.md", nativeFile: "AGENTS.md", hasGlobalFile: false },
-  pi: { projectFile: "AGENTS.md", nativeFile: "AGENTS.md", hasGlobalFile: true },
+  claude: { projectFile: "AGENTS.md", nativeFile: "CLAUDE.md", nativeFileMode: "pointer", hasGlobalFile: true },
+  codex: { projectFile: "AGENTS.md", nativeFile: "AGENTS.md", nativeFileMode: "copy", hasGlobalFile: true },
+  opencode: { projectFile: "AGENTS.md", nativeFile: "AGENTS.md", nativeFileMode: "copy", hasGlobalFile: true },
+  gemini: { projectFile: "AGENTS.md", nativeFile: "GEMINI.md", nativeFileMode: "copy", hasGlobalFile: true },
+  cursor: { projectFile: "AGENTS.md", nativeFile: "AGENTS.md", nativeFileMode: "copy", hasGlobalFile: false },
+  pi: { projectFile: "AGENTS.md", nativeFile: "AGENTS.md", nativeFileMode: "copy", hasGlobalFile: true },
 };
 
 const ALL_RUNTIMES: SkillRuntime[] = ["claude", "codex", "gemini", "cursor", "opencode", "pi"];
@@ -78,15 +94,20 @@ export interface InstallInstructionsOptions {
   cwd?: string;
   /**
    * Also write each runtime's native file when it differs from the shared
-   * standard (currently only Gemini's GEMINI.md). Only affects "workspace";
-   * "global" always uses native files. Default: false.
+   * AGENTS.md: Claude's CLAUDE.md (as a one-line `@AGENTS.md` pointer) and
+   * Gemini's GEMINI.md (as a copy). Only affects "workspace"; "global" always
+   * uses native files. Default: false.
+   *
+   * Opt in for Claude Code before 2.1.277, or on Bedrock, Vertex or Foundry,
+   * where Claude doesn't read AGENTS.md on its own.
    */
   includeNativeFiles?: boolean;
   /**
    * Wrap `content` in managed markers and merge into any existing file,
    * replacing only the previously-managed region and preserving everything the
    * user wrote outside it. Default: true. When false, the file is overwritten
-   * with raw `content` (escape hatch for fully-owned files).
+   * with raw `content` (escape hatch for fully-owned files), and an existing
+   * CLAUDE.md is left alone even though it hides AGENTS.md from Claude Code.
    */
   managed?: boolean;
   /** Marker tag, so the comment reads `<!-- <tag>:managed:start -->`. Default: "agentex". */
@@ -98,7 +119,11 @@ export interface InstallInstructionsOptions {
   homeDir?: string;
 }
 
-export type InstructionStatus = "created" | "updated" | "skipped" | "error";
+/**
+ * "removed": a workspace CLAUDE.md that held nothing but this installer's
+ * managed region, deleted because the opt-in (`includeNativeFiles`) is off.
+ */
+export type InstructionStatus = "created" | "updated" | "skipped" | "removed" | "error";
 
 export interface InstructionInstallEntry {
   /** The filename written, e.g. "AGENTS.md", "CLAUDE.md", "GEMINI.md". */
@@ -107,6 +132,8 @@ export interface InstructionInstallEntry {
   targetPath: string;
   /** Which requested runtimes this file serves. */
   runtimes: SkillRuntime[];
+  /** Set when the file is a pointer: its managed region is `@<importsFile>`, not the brief. */
+  importsFile?: string;
   status: InstructionStatus;
   error?: string;
 }
@@ -116,6 +143,7 @@ export interface InstructionInstallResult {
   installed: number; // newly created files
   updated: number; // existing files whose content changed
   skipped: number; // content already current → no write
+  removed: number; // managed-only CLAUDE.md deleted because the opt-in is off
   errors: number;
 }
 
@@ -123,6 +151,8 @@ export interface InstructionTarget {
   filename: string;
   targetPath: string;
   runtimes: SkillRuntime[];
+  /** Set when the file is a pointer: its managed region is `@<importsFile>`, not the brief. */
+  importsFile?: string;
 }
 
 export interface RemoveInstructionsOptions {
@@ -163,7 +193,8 @@ export interface ManagedBlockOptions {
  * without touching disk.
  *
  * - "workspace": files dedupe by name under {cwd}/ (the default writes
- *   CLAUDE.md + AGENTS.md once each). `includeNativeFiles` adds GEMINI.md.
+ *   AGENTS.md once). `includeNativeFiles` adds CLAUDE.md (a pointer, marked by
+ *   `importsFile`) and GEMINI.md.
  * - "global": one file per runtime in each runtime's home dir. Runtimes without
  *   a file-based global config (Cursor) are omitted.
  */
@@ -181,26 +212,27 @@ export function resolveInstructionTargets(options?: {
     const cwd = options?.cwd;
     if (!cwd) throw new Error("cwd is required when location is 'workspace'");
 
-    const byFile = new Map<string, SkillRuntime[]>();
-    const add = (filename: string, runtime: SkillRuntime) => {
-      const list = byFile.get(filename) ?? [];
-      list.push(runtime);
-      byFile.set(filename, list);
+    const byFile = new Map<string, InstructionTarget>();
+    const add = (filename: string, runtime: SkillRuntime, importsFile?: string) => {
+      const target: InstructionTarget = byFile.get(filename) ?? {
+        filename,
+        targetPath: path.join(cwd, filename),
+        runtimes: [],
+        ...(importsFile !== undefined && { importsFile }),
+      };
+      target.runtimes.push(runtime);
+      byFile.set(filename, target);
     };
 
     for (const runtime of runtimes) {
       const spec = RUNTIME_INSTRUCTIONS[runtime];
       add(spec.projectFile, runtime);
       if (options?.includeNativeFiles && spec.nativeFile !== spec.projectFile) {
-        add(spec.nativeFile, runtime);
+        add(spec.nativeFile, runtime, spec.nativeFileMode === "pointer" ? spec.projectFile : undefined);
       }
     }
 
-    return [...byFile.entries()].map(([filename, rts]) => ({
-      filename,
-      targetPath: path.join(cwd, filename),
-      runtimes: dedupeRuntimes(rts),
-    }));
+    return [...byFile.values()].map((target) => ({ ...target, runtimes: dedupeRuntimes(target.runtimes) }));
   }
 
   // global: each runtime reads its own native file in its own home dir.
@@ -229,18 +261,25 @@ function dedupeRuntimes(runtimes: SkillRuntime[]): SkillRuntime[] {
 /**
  * Install an instruction brief into the right per-runtime files.
  *
- * By default merges `content` into a managed region of `{cwd}/CLAUDE.md` and
- * `{cwd}/AGENTS.md`, preserving any user-authored content outside the markers.
- * Idempotent: a re-install with unchanged content reports every entry as
- * "skipped".
+ * By default merges `content` into a managed region of `{cwd}/AGENTS.md`,
+ * preserving any user-authored content outside the markers. Idempotent: a
+ * re-install with unchanged content reports every entry as "skipped".
+ *
+ * When Claude is among the runtimes, a `{cwd}/CLAUDE.md` already on disk is
+ * reconciled, because it would hide AGENTS.md from Claude Code: one holding
+ * nothing but this installer's managed region is removed, and one the user
+ * wrote gets `@AGENTS.md` in its managed region. With `includeNativeFiles`,
+ * CLAUDE.md is written as that pointer either way. `managed: false` leaves an
+ * existing CLAUDE.md alone.
  *
  * @example
  * ```ts
  * // Workspace (repo-root) install — the common case.
  * await installInstructions(brief, { location: "workspace", cwd: projectDir });
- * // → {cwd}/CLAUDE.md + {cwd}/AGENTS.md
+ * // → {cwd}/AGENTS.md
  *
- * // Also drop Gemini's native GEMINI.md (it doesn't read AGENTS.md by default).
+ * // Also write the native files: CLAUDE.md as an `@AGENTS.md` pointer (for
+ * // Claude Code before 2.1.277, or on Bedrock/Vertex/Foundry) and GEMINI.md.
  * await installInstructions(brief, { location: "workspace", cwd, includeNativeFiles: true });
  *
  * // Global install — per-runtime home files.
@@ -254,37 +293,16 @@ export async function installInstructions(
 ): Promise<InstructionInstallResult> {
   const managed = options?.managed ?? true;
   const tag = options?.managedTag ?? DEFAULT_MANAGED_TAG;
-  const targets = resolveInstructionTargets(options);
   const entries: InstructionInstallEntry[] = [];
 
-  for (const target of targets) {
-    try {
-      const existing = await readFileOrNull(target.targetPath);
-      const next = managed
-        ? upsertManagedBlock(existing, content, { tag })
-        : ensureTrailingNewline(content);
-
-      let status: InstructionStatus;
-      if (existing === null) {
-        status = "created";
-      } else if (existing === next) {
-        status = "skipped";
-      } else {
-        status = "updated";
-      }
-
-      if (status !== "skipped") {
-        await fs.mkdir(path.dirname(target.targetPath), { recursive: true });
-        await fs.writeFile(target.targetPath, next, { mode: 0o644 });
-      }
-
-      entries.push({ ...target, status });
-    } catch (err) {
-      entries.push({
-        ...target,
-        status: "error",
-        error: err instanceof Error ? err.message : String(err),
-      });
+  for (const target of resolveInstructionTargets(options)) {
+    const body = target.importsFile !== undefined ? `@${target.importsFile}` : content;
+    entries.push(await writeTarget(target, body, managed, tag));
+  }
+  if (managed) {
+    for (const target of unrequestedPointerTargets(options)) {
+      const entry = await reconcilePointer(target, tag);
+      if (entry) entries.push(entry);
     }
   }
 
@@ -293,15 +311,84 @@ export async function installInstructions(
     installed: entries.filter((e) => e.status === "created").length,
     updated: entries.filter((e) => e.status === "updated").length,
     skipped: entries.filter((e) => e.status === "skipped").length,
+    removed: entries.filter((e) => e.status === "removed").length,
     errors: entries.filter((e) => e.status === "error").length,
   };
+}
+
+async function writeTarget(
+  target: InstructionTarget,
+  body: string,
+  managed: boolean,
+  tag: string,
+): Promise<InstructionInstallEntry> {
+  try {
+    const existing = await readFileOrNull(target.targetPath);
+    const next = managed ? upsertManagedBlock(existing, body, { tag }) : ensureTrailingNewline(body);
+
+    let status: InstructionStatus;
+    if (existing === null) {
+      status = "created";
+    } else if (existing === next) {
+      status = "skipped";
+    } else {
+      status = "updated";
+    }
+
+    if (status !== "skipped") {
+      await fs.mkdir(path.dirname(target.targetPath), { recursive: true });
+      await fs.writeFile(target.targetPath, next, { mode: 0o644 });
+    }
+    return { ...target, status };
+  } catch (err) {
+    return { ...target, status: "error", error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * Pointer files (a workspace CLAUDE.md) for the requested runtimes that the
+ * install doesn't write because the opt-in is off, but that still need
+ * reconciling if they exist.
+ */
+function unrequestedPointerTargets(options?: InstallInstructionsOptions): InstructionTarget[] {
+  if ((options?.location ?? "workspace") !== "workspace" || options?.includeNativeFiles) return [];
+  return resolveInstructionTargets({ ...options, includeNativeFiles: true }).filter(
+    (target) => target.importsFile !== undefined,
+  );
+}
+
+/**
+ * An existing pointer file with the opt-in off: delete it when nothing but our
+ * managed region is in it, otherwise keep the user's content and make sure it
+ * imports the project file. Returns null when there is no file.
+ */
+async function reconcilePointer(
+  target: InstructionTarget,
+  tag: string,
+): Promise<InstructionInstallEntry | null> {
+  try {
+    const existing = await readFileOrNull(target.targetPath);
+    if (existing === null) return null;
+    if (stripManagedBlock(existing, { tag }) === null) {
+      await fs.rm(target.targetPath, { force: true });
+      return { ...target, status: "removed" };
+    }
+    const next = upsertManagedBlock(existing, `@${target.importsFile}`, { tag });
+    if (next === existing) return { ...target, status: "skipped" };
+    await fs.writeFile(target.targetPath, next);
+    return { ...target, status: "updated" };
+  } catch (err) {
+    return { ...target, status: "error", error: err instanceof Error ? err.message : String(err) };
+  }
 }
 
 /**
  * Remove the managed region installed by {@link installInstructions}, preserving
  * any user-authored content outside the markers. If the file contains nothing
  * but the managed block, it is deleted. User-owned files (no managed region) are
- * left untouched and reported as "skipped".
+ * left untouched and reported as "skipped". Native files (CLAUDE.md, GEMINI.md)
+ * are always checked, whether or not they were installed with
+ * `includeNativeFiles`.
  */
 export async function removeInstructions(
   options?: RemoveInstructionsOptions,
@@ -311,6 +398,7 @@ export async function removeInstructions(
     runtimes: options?.runtimes,
     location: options?.location,
     cwd: options?.cwd,
+    includeNativeFiles: true,
     homeDir: options?.homeDir,
   });
   const entries: InstructionRemoveEntry[] = [];
