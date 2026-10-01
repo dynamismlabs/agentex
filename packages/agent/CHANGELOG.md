@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.0.39 — Antigravity provider (Google's successor to Gemini CLI)
+
+Gemini CLI stopped serving free, Google AI Pro, and Google AI Ultra sign-ins on 2026-06-18 ("This client is no longer supported for Gemini Code Assist for individuals"). Google moved those accounts to the Antigravity CLI, `agy`. This release adds it as a first-class provider. Wire behavior follows the documented headless protocol and was checked against `agy` 1.2.14.
+
+### Added
+
+- **`antigravity` provider** (`getProvider("antigravity")`). Drives `agy --input-format stream-json --output-format stream-json`.
+  - **Sessions.** One `agy` process per session. Each `send()` writes one NDJSON user message and resolves on that turn's `result`. Sessions resume with `--conversation`. `sessionParams` are `{ sessionId, cwd }`, because Antigravity scopes conversations to a directory. Params saved for another directory start a new conversation instead of resuming the wrong one.
+  - **One-shot `execute()`.** Writes the prompt over stdin and closes it, so prompts are never argv-limited or visible in `ps`. It waits for the process to exit.
+  - **Interrupts.** The CLI has no control protocol, so `interrupt()`, timeouts, and abort signals SIGINT the process group (Ctrl+C). If `agy` exits instead of reporting `INTERRUPTED`, the next `send()` resumes the conversation in a new process. A message sent to a process that exits without acknowledging it is re-run once on a fresh one.
+  - **Events.** `system/init`, `assistant` (with `assistant_delta` under `includePartialMessages`), `thinking`, correlated `tool_call`/`tool_result` (`toolCallId` = `<conversationId>:<stepIndex>`, subagent steps included), `result`, `turn_start`/`turn_end`, `auth_required`, and `unknown` for future step types.
+  - **Usage.** agy reports cumulative usage per process. agentex reports each turn's share, with `cachedInputTokens` from `cache_read_tokens`.
+  - **Config mapping.** `model` → `--model`. `effort` → `--effort` (`low|medium|high|max`). `modeId`/`mode` → `--mode` (`default`, `accept-edits`, `plan`). `planMode` → `--mode plan`, which wins over `skipPermissions` → `--dangerously-skip-permissions`. `sandbox` → `--sandbox`. `instructionsFile` is prepended to a new conversation's first message. `skillDirs` are linked into `~/.gemini/antigravity-cli/skills`.
+  - **Permissions.** Headless agy cannot ask. Tools needing approval are soft-denied by policy and surface on `ExecutionResult.permissionDenials`. `capabilities.permissionRequests` is `false`.
+  - **Errors.** `AGY_ERROR` stderr reports map to `rate_limited`, `invalid_model`, `waiting_for_input` (status `blocked`), or `agent_error`.
+  - **Discovery.** `listModels()` reads `agy models`. `listModes()` is static and spawns nothing. `probeCapabilities()` checks `--help` for the stream-json flags (profile `agy-stream-json-v1`) and reports "not signed in" as `missing` rather than `upgrade_required`.
+- **Fast sign-in failure.** An unsigned headless `agy` prints a login URL and blocks for 60 seconds waiting for a pasted code. agentex stops it as soon as the prompt appears, emits `auth_required` with `loginCommand: "agy"`, and fails with `errorCode: "auth_required"`. Against the real CLI this takes about 0.5s instead of 60.
+- **Auth.** `resolveAuthForProvider("antigravity")` reports the sign-in from `agy models` (there is no status subcommand). `GEMINI_API_KEY` counts only when `~/.gemini/antigravity-cli/settings.json` sets `"modelProvider": "gemini"`, because the CLI ignores the variable otherwise. `detectAuth` and `loginCommandFor` (`"agy"`) follow the same rules.
+- **`SkillRuntime` gains `"antigravity"`.** Workspace skills use the standard `.agents/skills` channel. Global skills go to `~/.gemini/antigravity-cli/skills`. Instructions use `AGENTS.md`, and the global native file is the `~/.gemini/GEMINI.md` it shares with Gemini CLI.
+- `findBinary("agy")` also checks `~/.local/bin/agy`, where the official installer puts it and which GUI apps usually lack on `PATH`. It also checks `/usr/local/bin`, `/opt/homebrew/bin`, and on Windows `%LOCALAPPDATA%\agy\bin`.
+
+### Changed
+
+- `installSkills`/`removeSkills`/`listInstalledSkills` with `includeNativeDirs` skip a runtime folder that is already a standard channel, so nothing is installed or reported twice.
+- Global `resolveInstructionTargets`/`installInstructions` merge runtimes that share a file. Gemini CLI and Antigravity both read `~/.gemini/GEMINI.md`, so it becomes one target serving both.
+- The `gemini` provider documents the personal-account retirement and points to `antigravity`. It still works with paid API keys and Gemini Code Assist Standard/Enterprise.
+- The barrel-import module budget in `tests/packaging/lazy-graph.test.ts` is re-pinned from 51 to 53. The new provider adds the same light `index` + `codec` pair every provider ships, and no heavy modules.
+
 ## 0.0.38 — AGENTS.md is the workspace instruction file for every runtime
 
 Claude Code reads `AGENTS.md` since 2.1.277, loaded exactly where `CLAUDE.md` would be, but only in a folder with no `CLAUDE.md`. A `CLAUDE.md`, a `CLAUDE.local.md`, or one in a parent folder hides `AGENTS.md` completely (verified against 2.1.281). Not yet on Bedrock, Vertex or Foundry.

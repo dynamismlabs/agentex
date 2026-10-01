@@ -2,13 +2,13 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
 
-export type SkillRuntime = "claude" | "codex" | "gemini" | "cursor" | "opencode" | "pi";
+export type SkillRuntime = "claude" | "codex" | "gemini" | "antigravity" | "cursor" | "opencode" | "pi";
 
 export type SkillLocation = "global" | "workspace";
 
 /**
  * The two standard skill discovery channels:
- * - "agents": ~/.agents/skills/ or {cwd}/.agents/skills/ — scanned by Codex, Gemini, Cursor, OpenCode, Pi
+ * - "agents": ~/.agents/skills/ or {cwd}/.agents/skills/ — scanned by Codex, Gemini, Antigravity, Cursor, OpenCode, Pi
  * - "claude": ~/.claude/skills/ or {cwd}/.claude/skills/ — scanned by Claude Code (the only agent that doesn't scan .agents/)
  */
 export type SkillChannel = "agents" | "claude";
@@ -22,6 +22,12 @@ const NATIVE_DIRS: Record<string, { global: string; workspace: (cwd: string) => 
   gemini: {
     global: path.join(os.homedir(), ".gemini", "skills"),
     workspace: (cwd) => path.join(cwd, ".gemini", "skills"),
+  },
+  // Antigravity reads workspace skills from the standard .agents/skills
+  // channel; only its global folder is its own.
+  antigravity: {
+    global: path.join(os.homedir(), ".gemini", "antigravity-cli", "skills"),
+    workspace: (cwd) => path.join(cwd, ".agents", "skills"),
   },
   cursor: {
     global: path.join(os.homedir(), ".cursor", "skills"),
@@ -139,7 +145,14 @@ function resolveTargets(
 ): Array<{ target: string; skillsHome: string }> {
   const targets = resolveStandardPaths(location, cwd);
   if (includeNativeDirs) {
-    targets.push(...resolveNativePaths(location, cwd));
+    // A runtime whose native folder is a standard channel (Antigravity's
+    // workspace .agents/skills) is already covered by that channel.
+    const seen = new Set(targets.map((t) => t.skillsHome));
+    for (const native of resolveNativePaths(location, cwd)) {
+      if (seen.has(native.skillsHome)) continue;
+      seen.add(native.skillsHome);
+      targets.push(native);
+    }
   }
   return targets;
 }
@@ -152,7 +165,7 @@ function resolveTargets(
  * Install skill directories into agent discovery paths via idempotent symlinks.
  *
  * By default, installs into the two standard channels:
- * - `.agents/skills/` — discovered by Codex, Gemini, Cursor, OpenCode, Pi
+ * - `.agents/skills/` — discovered by Codex, Gemini, Antigravity, Cursor, OpenCode, Pi
  * - `.claude/skills/` — discovered by Claude Code
  *
  * Set `includeNativeDirs: true` to also install into each runtime's

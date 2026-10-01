@@ -13,6 +13,10 @@ describe("getRuntimeHomeEnvVar", () => {
     expect(getRuntimeHomeEnvVar("codex")).toBe("CODEX_HOME");
   });
 
+  it("returns null for antigravity (agy has no home override)", () => {
+    expect(getRuntimeHomeEnvVar("antigravity")).toBeNull();
+  });
+
   it("returns GEMINI_CONFIG_DIR for gemini", () => {
     expect(getRuntimeHomeEnvVar("gemini")).toBe("GEMINI_CONFIG_DIR");
   });
@@ -43,6 +47,10 @@ describe("getDefaultRuntimeHome", () => {
 
   it("returns ~/.codex for codex", () => {
     expect(getDefaultRuntimeHome("codex")).toBe(path.join(home, ".codex"));
+  });
+
+  it("returns ~/.gemini for antigravity (shared global GEMINI.md)", () => {
+    expect(getDefaultRuntimeHome("antigravity")).toBe(path.join(home, ".gemini"));
   });
 
   it("returns ~/.gemini for gemini", () => {

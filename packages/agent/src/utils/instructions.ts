@@ -77,11 +77,12 @@ const RUNTIME_INSTRUCTIONS: Record<SkillRuntime, RuntimeInstructionSpec> = {
   codex: { projectFile: "AGENTS.md", nativeFile: "AGENTS.md", nativeFileMode: "copy", hasGlobalFile: true },
   opencode: { projectFile: "AGENTS.md", nativeFile: "AGENTS.md", nativeFileMode: "copy", hasGlobalFile: true },
   gemini: { projectFile: "AGENTS.md", nativeFile: "GEMINI.md", nativeFileMode: "copy", hasGlobalFile: true },
+  antigravity: { projectFile: "AGENTS.md", nativeFile: "GEMINI.md", nativeFileMode: "copy", hasGlobalFile: true },
   cursor: { projectFile: "AGENTS.md", nativeFile: "AGENTS.md", nativeFileMode: "copy", hasGlobalFile: false },
   pi: { projectFile: "AGENTS.md", nativeFile: "AGENTS.md", nativeFileMode: "copy", hasGlobalFile: true },
 };
 
-const ALL_RUNTIMES: SkillRuntime[] = ["claude", "codex", "gemini", "cursor", "opencode", "pi"];
+const ALL_RUNTIMES: SkillRuntime[] = ["claude", "codex", "gemini", "antigravity", "cursor", "opencode", "pi"];
 
 const DEFAULT_MANAGED_TAG = "agentex";
 
@@ -235,19 +236,19 @@ export function resolveInstructionTargets(options?: {
     return [...byFile.values()].map((target) => ({ ...target, runtimes: dedupeRuntimes(target.runtimes) }));
   }
 
-  // global: each runtime reads its own native file in its own home dir.
-  const targets: InstructionTarget[] = [];
+  // global: each runtime reads its own native file in its own home dir. Gemini
+  // CLI and Antigravity share ~/.gemini/GEMINI.md, so targets merge by path.
+  const byPath = new Map<string, InstructionTarget>();
   for (const runtime of runtimes) {
     const spec = RUNTIME_INSTRUCTIONS[runtime];
     if (!spec.hasGlobalFile) continue; // e.g. cursor global = app User Rules, not a file
     const home = getDefaultRuntimeHome(runtime, options?.homeDir);
-    targets.push({
-      filename: spec.nativeFile,
-      targetPath: path.join(home, spec.nativeFile),
-      runtimes: [runtime],
-    });
+    const targetPath = path.join(home, spec.nativeFile);
+    const existing = byPath.get(targetPath);
+    if (existing) existing.runtimes.push(runtime);
+    else byPath.set(targetPath, { filename: spec.nativeFile, targetPath, runtimes: [runtime] });
   }
-  return targets;
+  return [...byPath.values()];
 }
 
 function dedupeRuntimes(runtimes: SkillRuntime[]): SkillRuntime[] {

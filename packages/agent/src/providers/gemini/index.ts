@@ -7,6 +7,12 @@ import { resolveAuthForProvider } from "../../utils/auth.js";
  * `@google/gemini-cli` on PATH; Gemini handles its own Google auth (GEMINI_API_KEY,
  * GOOGLE_API_KEY, or an OAuth login).
  *
+ * Since 2026-06-18 Gemini CLI no longer serves free, Google AI Pro, or Google
+ * AI Ultra sign-ins ("This client is no longer supported for Gemini Code
+ * Assist for individuals"); those accounts moved to the Antigravity CLI — use
+ * the `antigravity` provider. Gemini CLI still works with a paid API key and
+ * Gemini Code Assist Standard/Enterprise.
+ *
  * Replaces the previous one-shot `--output-format stream-json` adapter: the ACP
  * base gives gemini real sessions, streaming, tool-call correlation, permission
  * bridging (via `onUserInputRequest`), and mode discovery — none of which the

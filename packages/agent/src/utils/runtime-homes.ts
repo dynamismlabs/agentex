@@ -10,6 +10,7 @@ const ENV_VAR_MAP: Record<SkillRuntime, string | null> = {
   claude: "CLAUDE_CONFIG_DIR",
   codex: "CODEX_HOME",
   gemini: "GEMINI_CONFIG_DIR",
+  antigravity: null,  // agy has no home override
   cursor: "CURSOR_CONFIG_DIR",
   opencode: "XDG_CONFIG_HOME",  // affects ~/.config/opencode/
   pi: "PI_HOME",
@@ -22,6 +23,9 @@ const HOME_SUBPATH_MAP: Record<SkillRuntime, string[]> = {
   claude: [".claude"],
   codex: [".codex"],
   gemini: [".gemini"],
+  // Shared with Gemini CLI: agy reads its global GEMINI.md from ~/.gemini and
+  // keeps its own settings and skills in ~/.gemini/antigravity-cli.
+  antigravity: [".gemini"],
   cursor: [".cursor"],
   opencode: [".config", "opencode"],
   pi: [".pi"],

@@ -1,6 +1,6 @@
 # @agentex/agent
 
-Programmatic execution of AI coding agents. Spawn and manage Claude Code, Codex, Gemini, Cursor, OpenCode, Pi, OpenClaw, or any CLI-based agent as a child process with streaming output, multi-turn sessions, auth detection, isolated workspaces, skill installation, and a unified interface.
+Programmatic execution of AI coding agents. Spawn and manage Claude Code, Codex, Antigravity, Gemini, Cursor, OpenCode, Pi, OpenClaw, or any CLI-based agent as a child process with streaming output, multi-turn sessions, auth detection, isolated workspaces, skill installation, and a unified interface.
 
 ## Install
 
@@ -48,7 +48,7 @@ Providers fall into three tiers:
 
 - **Tier 1 — deep native:** `claude`, `codex`. Hand-built adapters over each CLI's richest protocol (Claude's stream-json, Codex's `app-server` JSON-RPC). Subscription-native, fullest feature set.
 - **Tier 2 — ACP:** `gemini`, `copilot`, plus any agent registered via [`acpProvider`](#custom--byok-providers) or `extends: "acp"` config. One shared, tested base over the open [Agent Client Protocol](https://agentclientprotocol.com) (JSON-RPC over stdio).
-- **Tier 3 — bespoke escape hatches:** `opencode` (authenticated HTTP/SSE daemon), `pi` (persistent RPC), `cursor` (exec-backed resume), `openclaw` (HTTP gateway), `process` (any executable).
+- **Tier 3 — bespoke escape hatches:** `opencode` (authenticated HTTP/SSE daemon), `pi` (persistent RPC), `antigravity` (persistent stream-json), `cursor` (exec-backed resume), `openclaw` (HTTP gateway), `process` (any executable).
 
 | Provider   | Transport                              | Tier | Sessions  | Modes | Permissions |
 | ---------- | -------------------------------------- | ---- | --------- | ----- | ----------- |
@@ -58,11 +58,40 @@ Providers fall into three tiers:
 | `copilot`  | `copilot --acp` (ACP)                  | 2    | ✅        | ✅    | ✅          |
 | `opencode` | authenticated `opencode serve` HTTP + SSE | 3 | ✅ resume | ✅ | ✅ |
 | `pi`       | persistent `pi --mode rpc`             | 3    | ✅ resume | —     | —           |
+| `antigravity` | persistent `agy` stream-json (stdin + stdout) | 3 | ✅ resume | ✅ | policy |
 | `cursor`   | `cursor-agent` stream-json per turn    | 3    | ✅ resume | probed | —          |
 | `openclaw` | HTTP gateway                           | 3    | —         | —     | —           |
 | `process`  | any executable                         | 3    | —         | —     | —           |
 
 Cursor sessions are exec-backed. Each `send()` starts one CLI process and promotes the returned Cursor session ID into `--resume` for the next turn. `probeCapabilities()` verifies the selected binary's model catalog and advertised modes. Each execution independently validates the supported stream-json acceptance marker before releasing output. Older Cursor CLIs report `upgrade_required` instead of silently advertising discovery features they do not expose.
+
+### Antigravity (Google)
+
+Google moved personal accounts (Free, Google AI Pro, Google AI Ultra) from Gemini CLI to the [Antigravity CLI](https://antigravity.google/docs/cli/overview) on 2026-06-18. Signing in to Gemini CLI with one of those accounts now fails with "This client is no longer supported for Gemini Code Assist for individuals". Use the `antigravity` provider for them. The `gemini` provider still works with a paid API key or Gemini Code Assist Standard/Enterprise.
+
+```bash
+curl -fsSL https://antigravity.google/cli/install.sh | bash   # installs ~/.local/bin/agy
+agy                                                            # once, to sign in through the browser
+```
+
+```typescript
+const agy = getProvider("antigravity");
+const session = await agy.createSession!({
+  cwd,
+  config: { model: "gemini-3.1-pro-high", effort: "high", modeId: "accept-edits" },
+  onEvent: (e) => { if (e.type === "assistant") console.log(e.text); },
+});
+await (await session.send("Summarize this repo")).result;
+await (await session.send("Now list its entry points")).result; // same agy process, same conversation
+```
+
+- **Transport.** A session is one `agy --input-format stream-json --output-format stream-json` process. Each `send()` writes one NDJSON user message and resolves on that turn's `result` event. `execute()` writes one message and closes stdin, so prompts never travel through argv. Saved `sessionParams` are `{ sessionId, cwd }` and resume with `--conversation`. Antigravity scopes conversations to a directory, so params saved for another `cwd` start a new conversation instead of resuming.
+- **Interrupts.** The CLI has no control protocol, so `interrupt()`, timeouts, and abort signals send SIGINT to the process group, like Ctrl+C. If agy exits instead of reporting the turn as `INTERRUPTED`, the next `send()` starts a new process on the same conversation.
+- **Permissions.** Headless agy cannot ask. `skipPermissions` maps to `--dangerously-skip-permissions`. Without it, actions that would need approval (shell commands by default) are soft-denied and listed in `ExecutionResult.permissionDenials`, and the run still succeeds. Grant specific actions with `permissions.allow` rules in `~/.gemini/antigravity-cli/settings.json`. `permissionRequests` is therefore `false`.
+- **Modes, effort, models.** `listModes()` returns `default`, `accept-edits`, and `plan` (`--mode`). `planMode` maps to `--mode plan`. `config.effort` maps to `--effort` (`low`, `medium`, `high`, `max`). `listModels()` reads `agy models`, which needs a signed-in account.
+- **Sign-in.** An unsigned headless agy prints a login URL and waits a minute for a code. agentex stops it as soon as the prompt appears, emits `auth_required` with `loginCommand: "agy"`, and fails the turn with `errorCode: "auth_required"`.
+- **Usage.** agy reports cumulative usage per process. agentex reports each turn's share, keyed by the pinned model (or `"default"`). `cachedInputTokens` comes from `cache_read_tokens`.
+- **Not yet wired.** `config.mcpServers` (agy reads `~/.gemini/config/mcp_config.json` and `.agents/mcp_config.json` itself), and history import.
 
 OpenCode sessions use a password-authenticated loopback server, SSE events, permission and question reconciliation, durable service-backed history, saved-session discovery and import, runtime model and agent discovery, and upstream provider authentication. `config.mcpServers` remains unsupported for OpenCode because strict isolation from ambient OpenCode MCP configuration is not yet proven.
 
@@ -256,7 +285,7 @@ interface ProviderConfig {
   command?: string;                 // Override CLI binary path
   model?: string;
   modelVariant?: string;            // OpenCode provider-native variant, separate from effort
-  effort?: string;
+  effort?: string;                  // claude/antigravity: --effort; codex: turn effort override
   unattendedPermissionPolicy?: "allow" | "deny";
   inputRequestTimeoutSec?: number;  // OpenCode permission/question response deadline, default 300
   maxTurns?: number;
@@ -269,14 +298,14 @@ interface ProviderConfig {
   strictMcpConfig?: boolean;        // claude: --strict-mcp-config — MCP surface is exactly what you attach
   allowedTools?: string[];          // claude: --allowed-tools (patterns verbatim; codex ignores)
   disallowedTools?: string[];       // claude: --disallowed-tools (deny wins; codex ignores)
-  includePartialMessages?: boolean; // claude: emit assistant_delta/thinking_delta typewriter events
+  includePartialMessages?: boolean; // claude, antigravity: emit assistant_delta/thinking_delta typewriter events
   extraArgs?: string[];             // always appended LAST — hosts can override any generated flag
   search?: boolean;
-  sandbox?: boolean;
+  sandbox?: boolean;                // antigravity: --sandbox (terminal sandbox)
   thinking?: string;
-  mode?: string;                    // cursor: --mode <mode>; not for plan mode
-  modeId?: string;                  // select an operating mode from listModes() (codex/ACP)
-  planMode?: boolean;               // read-only "plan" mode (claude/codex)
+  mode?: string;                    // cursor, antigravity: --mode <mode>; not for plan mode
+  modeId?: string;                  // select an operating mode from listModes() (codex/ACP/antigravity)
+  planMode?: boolean;               // read-only "plan" mode (claude/codex/cursor/opencode/antigravity)
   workspace?: { strategy: "worktree"; baseBranch?: string; branchName?: string };
 }
 ```
@@ -434,7 +463,7 @@ When in doubt, `raw` is the verbatim provider event — parse it yourself for an
 
 ### Other providers
 
-`gemini` and `copilot` (ACP) and the session-backed `opencode` and `pi` emit real, correlated `StreamEvent`s — assistant text, thinking, and tool_call/tool_result with proper tool-call ids (ACP and Codex have no per-event/message ids, so those stay `null`). `cursor` and `openclaw` still emit the same `StreamEvent` shape with most ids stubbed to `null`; their `raw` field is populated. `cursor` will gain full fidelity when it moves to the ACP tier.
+`gemini` and `copilot` (ACP), `antigravity`, and the session-backed `opencode` and `pi` emit real, correlated `StreamEvent`s — assistant text, thinking, and tool_call/tool_result with proper tool-call ids (ACP and Codex have no per-event/message ids, so those stay `null`). `cursor` and `openclaw` still emit the same `StreamEvent` shape with most ids stubbed to `null`; their `raw` field is populated. `cursor` will gain full fidelity when it moves to the ACP tier. `antigravity` has no per-call tool ids, so `toolCallId` is `<conversationId>:<stepIndex>`, and `messageId` uses the same key for a response step's `assistant` and `assistant_delta` events.
 
 ## Sessions (multi-turn)
 
@@ -797,6 +826,7 @@ const executeRun = await claude.execute({
 | -------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
 | `claude` | `--permission-mode plan` (CLI-native plan UX)                        | Agent calls the `ExitPlanMode` tool with the plan as a permission request. Host extracts via `parseExitPlanMode(req)` from `onUserInputRequest`. The plan is **not** in the persisted transcript — capture it live. |
 | `codex`  | `--sandbox read-only` **plus** an injected planning system preamble  | Plain text in the agent's final assistant message (i.e. `result.summary`). |
+| `antigravity` | `--mode plan` (CLI-native: read-only tools, then a plan)        | Plain text in the turn's response (`result.summary`). Headless runs proceed through plan review automatically. |
 
 The mechanism difference matters:
 
@@ -905,6 +935,7 @@ await claude.execute({ prompt: "Respond with 'hello'.", config: { timeoutSec: 15
 | `codex`   | `codex login status` · fallback: `$CODEX_HOME/auth.json`        | `OPENAI_API_KEY`                           | —                                                                            |
 | `gemini`  | `$GEMINI_CONFIG_DIR/oauth_creds.json`                           | `GEMINI_API_KEY`, `GOOGLE_API_KEY`         | —                                                                            |
 | `cursor`  | selected CLI's `status` command                                 | `CURSOR_API_KEY`                           | `OPENAI_API_KEY` is intentionally ignored                                   |
+| `antigravity` | `agy models` exit status (keyring sign-in)                  | `GEMINI_API_KEY`, only with `"modelProvider": "gemini"` in `~/.gemini/antigravity-cli/settings.json` | The CLI ignores `GEMINI_API_KEY` otherwise |
 | `opencode`| —                                                               | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`      | —                                                                            |
 | `pi`      | —                                                               | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`      | —                                                                            |
 
@@ -917,6 +948,7 @@ The library reflects real CLI behavior rather than imposing its own:
 | Claude    | API key wins (documented). Set `hasApiKey` + show a billing warning.    |
 | Codex     | Subscription wins (current CLI; see openai/codex#2733, #3286).          |
 | Gemini    | API key wins in non-interactive mode.                                   |
+| Antigravity | `settings.json` decides: `modelProvider: "gemini"` uses the API key, otherwise the signed-in account. |
 
 ### Caching
 
@@ -1024,7 +1056,7 @@ const skillDirs = ["/path/to/code-review", "/path/to/testing"];
 await installSkills(skillDirs, {
   location: "workspace",              // or "global"
   cwd: process.cwd(),                 // required for workspace installs
-  includeNativeDirs: false,           // true also installs into ~/.gemini/skills/, etc.
+  includeNativeDirs: false,           // true also installs into ~/.gemini/skills/, ~/.gemini/antigravity-cli/skills/, etc.
 });
 
 const installed = await listInstalledSkills({ location: "workspace", cwd: process.cwd() });
@@ -1247,7 +1279,7 @@ registerProvider(myProvider);
 - `ensureCommandResolvable(command)` — like `findBinary` but accepts an absolute path too.
 - `clearBinaryCache()` — invalidate the binary-resolution cache.
 - `provider.checkQuota?(ctx)` — rate-limit / quota status (when `capabilities.quotaProbing`).
-- `provider.listModels?(opts?)` — enumerate models the binary can drive. Currently no built-in provider implements this: none of the Claude / Codex / Gemini CLIs expose a non-interactive model-listing subcommand yet (run `pnpm list-models` to re-probe). Pass the model you want directly via `ExecutionContext.model` or `ProviderConfig.model`.
+- `provider.listModels?(opts?)` — enumerate models the binary can drive, where the CLI exposes a catalog (for example `cursor`, `opencode`, and `antigravity` via `agy models`). Otherwise pass the model you want directly via `ExecutionContext.model` or `ProviderConfig.model`.
 
 ### Workspace
 - `prepareWorkspace({ strategy, baseBranch?, branchName?, targetDir? })` → `PreparedWorkspace` with `cwd`, `diff()`, `cleanup()`.
@@ -1283,8 +1315,8 @@ registerProvider(myProvider);
 ## Requirements
 
 - Node.js >= 18
-- Each provider's CLI installed and resolvable on `$PATH` (`claude`, `codex`, `gemini`, `agent` for Cursor, `opencode`, `pi`, or a reachable OpenClaw gateway)
-- For subscription auth, the relevant CLI must already be logged in (`codex login`, `claude login`, `gemini auth login`, etc.)
+- Each provider's CLI installed and resolvable on `$PATH` (`claude`, `codex`, `agy` for Antigravity, `gemini`, `agent` for Cursor, `opencode`, `pi`, or a reachable OpenClaw gateway). `agy` is also found at `~/.local/bin/agy` when that folder is not on `$PATH`.
+- For subscription auth, the relevant CLI must already be logged in (`codex login`, `claude login`, `agy` once for Antigravity, etc.)
 
 ## License
 

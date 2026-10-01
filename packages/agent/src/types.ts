@@ -667,8 +667,8 @@ export interface ProviderConfig {
   model?: string;
   /** Provider-native model variant, independent from reasoning effort. */
   modelVariant?: string;
-  /** Provider reasoning effort. Claude maps this to `--effort`; Codex sends
-   *  it as the app-server `turn/start.effort` override. */
+  /** Provider reasoning effort. Claude and Antigravity map this to `--effort`;
+   *  Codex sends it as the app-server `turn/start.effort` override. */
   effort?: string;
   /** Behavior when a host does not provide or loses its input callback. */
   unattendedPermissionPolicy?: "allow" | "deny";
@@ -729,15 +729,16 @@ export interface ProviderConfig {
   sandbox?: boolean;
   thinking?: string;
   /**
-   * Provider-specific mode pass-through. Currently used by `cursor` for its
-   * `--mode <mode>` flag. Don't use this for plan mode — set `planMode: true`
+   * Provider-specific mode pass-through. Used by `cursor` and `antigravity`
+   * for their `--mode <mode>` flag. Don't use this for plan mode — set `planMode: true`
    * instead, which is the cross-provider abstraction.
    */
   mode?: string;
   /**
    * Select a provider operating mode by id (one of `listModes()`). Honored by
    * providers with `capabilities.modes === true` (codex collaboration modes,
-   * ACP session modes, copilot allow-all/agent/plan). Ignored otherwise.
+   * ACP session modes, copilot allow-all/agent/plan, antigravity
+   * default/accept-edits/plan). Ignored otherwise.
    * Distinct from `mode` (cursor's raw `--mode` passthrough) and `planMode`
    * (the cross-provider read-only abstraction).
    */

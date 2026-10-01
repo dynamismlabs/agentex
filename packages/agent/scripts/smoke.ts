@@ -35,6 +35,7 @@ const MOCK_COMMANDS: Record<string, string> = {
   cursor: path.join(FIXTURES_DIR, "mock-cursor.sh"),
   opencode: path.join(FIXTURES_DIR, "mock-opencode.sh"),
   pi: path.join(FIXTURES_DIR, "mock-pi.sh"),
+  antigravity: path.join(FIXTURES_DIR, "mock-agy.sh"),
 };
 
 const MOCK_SESSION_COMMAND = path.join(FIXTURES_DIR, "mock-claude-session.sh");
@@ -102,6 +103,8 @@ const SMOKE_SPECS: Record<string, SmokeSpec> = {
   cursor: { mock: MOCK_COMMANDS["cursor"] },
   opencode: { mock: MOCK_COMMANDS["opencode"], needsDaemon: true },
   pi: { mock: MOCK_COMMANDS["pi"] },
+  // Real runs need `agy` signed in once (run `agy`); otherwise the auth check skips.
+  antigravity: { mock: MOCK_COMMANDS["antigravity"], mockSession: MOCK_COMMANDS["antigravity"], session: true },
 };
 // gemini is now ACP-backed — smoke it via `pnpm smoke acp --command "gemini --acp"`.
 

@@ -1,4 +1,5 @@
 import * as fs from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import type {
@@ -90,6 +91,12 @@ export function detectAuth(providerType: string, env: Record<string, string>): R
     }
     case "cursor": {
       if (hasEnv(env, "CURSOR_API_KEY")) {
+        return { method: "api_key", billingType: "api" };
+      }
+      return { method: "subscription", billingType: "subscription" };
+    }
+    case "antigravity": {
+      if (hasEnv(env, "GEMINI_API_KEY") && readAgyModelProvider() === "gemini") {
         return { method: "api_key", billingType: "api" };
       }
       return { method: "subscription", billingType: "subscription" };
@@ -435,6 +442,74 @@ async function resolveGeminiAuth(ctx?: AuthResolveContext): Promise<AuthReport> 
 }
 
 // ---------------------------------------------------------------------------
+// Antigravity — no status subcommand, but `agy models` exits 1 with "Please
+// sign in" when no cached sign-in exists, so its exit status is the CLI's own
+// answer. A GEMINI_API_KEY counts only when settings.json selects the Gemini
+// API (`"modelProvider": "gemini"`); the CLI ignores the variable otherwise.
+// ---------------------------------------------------------------------------
+
+/** Home directory as agy (a Go binary) resolves it: os.UserHomeDir semantics. */
+function agyHomeDir(): string {
+  const fromEnv = process.platform === "win32" ? process.env["USERPROFILE"] : process.env["HOME"];
+  return fromEnv && fromEnv.trim() ? fromEnv : os.homedir();
+}
+
+function agySettingsPath(): string {
+  return path.join(agyHomeDir(), ".gemini", "antigravity-cli", "settings.json");
+}
+
+function readAgyModelProvider(): string | null {
+  try {
+    const settings = JSON.parse(readFileSync(agySettingsPath(), "utf-8")) as Record<string, unknown>;
+    return typeof settings["modelProvider"] === "string" ? settings["modelProvider"] : null;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveAntigravityAuth(ctx?: AuthResolveContext): Promise<AuthReport> {
+  const env = buildEnv(ctx?.env);
+  const binary = await checkBinary("agy", ctx?.command, env);
+  const apiKeyProvider = readAgyModelProvider() === "gemini";
+  let signedIn = false;
+  let usedCli = false;
+  if (binary.installed && binary.resolvedPath) {
+    try {
+      const result = await runChildProcess({
+        runId: "antigravity-auth-status",
+        command: binary.resolvedPath,
+        args: [...binary.prefixArgs, "models"],
+        cwd: process.cwd(),
+        env,
+        timeoutSec: 20,
+      });
+      const output = `${result.stdout}\n${result.stderr}`;
+      signedIn = result.exitCode === 0 && !/sign in|authentication required/i.test(output);
+      usedCli = !result.timedOut;
+    } catch {
+      // Presence stays false; the binary could not be run.
+    }
+  }
+  return {
+    providerType: "antigravity",
+    binary: stripPrefixArgs(binary),
+    options: [
+      {
+        method: "subscription",
+        source: { kind: "cli", command: "agy models" },
+        present: signedIn && !apiKeyProvider,
+      },
+      {
+        method: "api_key",
+        source: { kind: "env", var: "GEMINI_API_KEY" },
+        present: apiKeyProvider && hasEnv(env, "GEMINI_API_KEY"),
+      },
+    ],
+    source: usedCli ? "cli" : "filesystem",
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Cursor uses its selected binary's `status` command. Other providers in this
 // section use environment or native-store presence reports.
 // ---------------------------------------------------------------------------
@@ -538,6 +613,8 @@ async function resolveInternal(providerType: string, ctx?: AuthResolveContext): 
       return resolveGeminiAuth(ctx);
     case "cursor":
       return resolveCursorAuth(ctx);
+    case "antigravity":
+      return resolveAntigravityAuth(ctx);
     case "opencode":
       return resolveOpencodeAuth(ctx);
     case "pi":
@@ -626,7 +703,7 @@ export async function hasBedrock(
  * Shell command a host should surface when an `auth_required` event fires
  * for `providerType`, or when `isLoggedIn` returns false. Values are the
  * provider's canonical CLI subcommand for interactive login — they spawn
- * a browser flow (Claude, Codex, Gemini, Cursor) or print API-key setup
+ * a browser flow (Claude, Codex, Gemini, Cursor, Antigravity) or print API-key setup
  * instructions (OpenCode, Pi).
  *
  * Unknown provider types fall back to `${providerType} login`, which is
@@ -647,6 +724,10 @@ export function loginCommandFor(providerType: string): string {
       return "gemini";
     case "cursor":
       return "cursor-agent login";
+    case "antigravity":
+      // No login subcommand: running `agy` signs in through the browser and
+      // caches the session in the OS keyring for headless runs.
+      return "agy";
     case "opencode":
       return "opencode auth login";
     case "pi":

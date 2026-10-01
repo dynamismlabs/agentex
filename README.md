@@ -2,7 +2,7 @@
 
 Open-source infrastructure for running AI coding agents for local execution. Four composable packages:
 
-- **[@agentex/agent](./packages/agent)** — Execute Claude Code, Codex, Cursor, OpenCode, OpenClaw, or any CLI agent programmatically with streaming, sessions, runtime model discovery, skill discovery/invocation, and a unified interface.
+- **[@agentex/agent](./packages/agent)** — Execute Claude Code, Codex, Antigravity, Cursor, OpenCode, OpenClaw, or any CLI agent programmatically with streaming, sessions, runtime model discovery, skill discovery/invocation, and a unified interface.
 - **[@agentex/gateway](./packages/gateway)** — Multi-channel communication gateway that connects agents to Telegram, Discord, Slack, WhatsApp, email, webhooks, and cron with a single YAML config.
 - **[@agentex/workspace](./packages/workspace)** — Isolation and lifecycle primitives: git worktrees, file cloning, port allocation, run-script process-group teardown, structured diff, per-worktree checkpoints, status / commit / push / merge / mergeFrom / pullLatestBase, file tree + watch, plus a `raw` git escape hatch.
 - **[@agentex/github](./packages/github)** — Thin typed wrapper over the `gh` CLI for PRs, issues, and status checks. Pairs with `@agentex/workspace` (workspace owns git plumbing; github owns the host API).
@@ -44,7 +44,9 @@ const result = await claude.execute({
 });
 ```
 
-Built-in providers: `claude`, `codex`, `gemini`, `cursor`, `opencode`, `pi`, `openclaw`, `process`
+Built-in providers: `claude`, `codex`, `antigravity`, `gemini`, `cursor`, `opencode`, `pi`, `copilot`, `openclaw`, `process`
+
+`antigravity` drives Google's Antigravity CLI (`agy`), which replaced Gemini CLI for personal Google accounts in June 2026. See [the agent README](./packages/agent/README.md#antigravity-google).
 
 #### Goals
 
@@ -166,7 +168,7 @@ agentex/
 ├── packages/
 │   ├── agent/             # @agentex/agent
 │   │   ├── src/
-│   │   │   ├── providers/  # claude, codex, cursor, opencode, and others
+│   │   │   ├── providers/  # claude, codex, antigravity, cursor, opencode, and others
 │   │   │   ├── utils/      # template, env, skills
 │   │   │   ├── registry.ts
 │   │   │   └── types.ts

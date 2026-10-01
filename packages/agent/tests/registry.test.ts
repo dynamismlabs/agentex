@@ -45,6 +45,12 @@ describe("registry", () => {
     expect(provider.type).toBe("pi");
   });
 
+  it("getProvider returns antigravity provider", () => {
+    const provider = getProvider("antigravity");
+    expect(provider.type).toBe("antigravity");
+    expect(listProviders()).toContain("antigravity");
+  });
+
   it("listProviders returns all registered types", () => {
     const types = listProviders();
     expect(types).toContain("claude");

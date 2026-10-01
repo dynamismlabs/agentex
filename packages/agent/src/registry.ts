@@ -8,6 +8,7 @@ import { cursorProvider } from "./providers/cursor/index.js";
 import { opencodeProvider } from "./providers/opencode/index.js";
 import { piProvider } from "./providers/pi/index.js";
 import { copilotProvider } from "./providers/copilot/index.js";
+import { antigravityProvider } from "./providers/antigravity/index.js";
 
 const providers = new Map<string, ProviderModule>();
 
@@ -21,6 +22,7 @@ providers.set("cursor", cursorProvider);
 providers.set("opencode", opencodeProvider);
 providers.set("pi", piProvider);
 providers.set("copilot", copilotProvider);
+providers.set("antigravity", antigravityProvider);
 
 export function getProvider(type: string): ProviderModule {
   const provider = providers.get(type);

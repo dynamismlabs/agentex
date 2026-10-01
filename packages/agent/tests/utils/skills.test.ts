@@ -139,6 +139,10 @@ describe("resolveNativeSkillsHome", () => {
     expect(resolveNativeSkillsHome("pi")).toBe(path.join(os.homedir(), ".pi", "agent", "skills"));
   });
 
+  it("returns ~/.gemini/antigravity-cli/skills for antigravity", () => {
+    expect(resolveNativeSkillsHome("antigravity")).toBe(path.join(os.homedir(), ".gemini", "antigravity-cli", "skills"));
+  });
+
   it("returns null for claude (uses standard channel)", () => {
     expect(resolveNativeSkillsHome("claude")).toBeNull();
   });
@@ -161,6 +165,10 @@ describe("resolveNativeSkillsWorkspace", () => {
 
   it("returns {cwd}/.pi/skills for pi", () => {
     expect(resolveNativeSkillsWorkspace("pi", cwd)).toBe(path.join(cwd, ".pi", "skills"));
+  });
+
+  it("returns the standard {cwd}/.agents/skills channel for antigravity", () => {
+    expect(resolveNativeSkillsWorkspace("antigravity", cwd)).toBe(path.join(cwd, ".agents", "skills"));
   });
 
   it("returns null for claude", () => {
@@ -404,8 +412,11 @@ describe("installSkills", () => {
       includeNativeDirs: true,
     });
 
-    // 2 standard + 4 native (gemini, cursor, opencode, pi)
+    // 2 standard + 4 native (gemini, cursor, opencode, pi). Antigravity's
+    // workspace folder is the standard .agents/skills channel, so it is not
+    // installed (or reported) twice.
     expect(result.installed).toBe(6);
+    expect(new Set(result.entries.map((e) => e.targetPath)).size).toBe(result.entries.length);
 
     const targets = result.entries.map((e) => e.target).sort();
     expect(targets).toEqual(["agents", "claude", "cursor", "gemini", "opencode", "pi"]);

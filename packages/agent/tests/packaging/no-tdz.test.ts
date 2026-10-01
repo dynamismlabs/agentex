@@ -26,8 +26,8 @@ function providerEntries(): string[] {
 describe("no TDZ: every provider index imports clean as an entry point", () => {
   const entries = providerEntries();
 
-  it("discovers all 10 built-in provider modules", () => {
-    expect(entries.length).toBe(10);
+  it("discovers all 11 built-in provider modules", () => {
+    expect(entries.length).toBe(11);
   });
 
   it.each(entries)("%s imports without error", (entry) => {

@@ -135,10 +135,10 @@ describe("ProviderCapabilities", () => {
     }
   });
 
-  it("claude, codex, Cursor, and OpenCode advertise plan mode", () => {
+  it("claude, codex, Cursor, OpenCode, and Antigravity advertise plan mode", () => {
     for (const name of listProviders()) {
       const caps = getProvider(name).capabilities;
-      const expected = name === "claude" || name === "codex" || name === "cursor" || name === "opencode";
+      const expected = ["claude", "codex", "cursor", "opencode", "antigravity"].includes(name);
       expect(caps.planMode).toBe(expected);
     }
   });
@@ -169,7 +169,7 @@ describe("ProviderCapabilities", () => {
       expect(p.capabilities.durableSessions).toBe(true);
       expect(typeof p.attachSession).toBe("function");
     }
-    for (const type of ["openclaw", "cursor", "process", "opencode", "pi", "gemini", "copilot"]) {
+    for (const type of ["openclaw", "cursor", "process", "opencode", "pi", "gemini", "copilot", "antigravity"]) {
       const p = getProvider(type);
       expect(p.capabilities.durableSessions).toBeUndefined();
       expect(p.attachSession).toBeUndefined();
@@ -192,6 +192,38 @@ describe("ProviderCapabilities", () => {
       expect(provider.capabilities.savedHistory === true).toBe(expected);
       expect(typeof provider.savedHistory === "object").toBe(expected);
     }
+  });
+
+  it("antigravity declares its capabilities", () => {
+    expect(getProvider("antigravity").capabilities).toEqual({
+      sessions: true,
+      modelDiscovery: true,
+      quotaProbing: false,
+      mcp: false,
+      skills: true,
+      instructions: true,
+      workspace: true,
+      planMode: true,
+      concurrentSend: false,
+      cancelQueuedMessage: false,
+      stopTask: false,
+      modes: true,
+      resume: true,
+      modelVariants: false,
+      permissionRequests: false,
+      questionRequests: false,
+      upstreamProviderDisconnect: false,
+      sessionModelChange: false,
+      sessionVariantChange: false,
+      sessionEffortChange: false,
+      sessionModeChange: false,
+    });
+    const provider = getProvider("antigravity");
+    expect(typeof provider.createSession).toBe("function");
+    expect(typeof provider.listModels).toBe("function");
+    expect(typeof provider.listModes).toBe("function");
+    expect(typeof provider.probeCapabilities).toBe("function");
+    expect(provider.sessionCodec).toBeDefined();
   });
 
   it("openclaw has no capabilities", () => {

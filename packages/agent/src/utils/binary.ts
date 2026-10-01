@@ -44,6 +44,13 @@ const COMMON_PATHS_UNIX: Record<string, string[]> = {
     "/usr/local/bin/pi",
     path.join(os.homedir(), ".npm-global", "bin", "pi"),
   ],
+  // Antigravity CLI. Its installer writes ~/.local/bin/agy, which GUI apps
+  // launched outside a login shell usually don't have on PATH.
+  agy: [
+    path.join(os.homedir(), ".local", "bin", "agy"),
+    "/usr/local/bin/agy",
+    "/opt/homebrew/bin/agy",
+  ],
 };
 
 function getCommonPathsWindows(name: string): string[] {
@@ -54,6 +61,8 @@ function getCommonPathsWindows(name: string): string[] {
     path.join(appData, "npm", `${name}.cmd`),
     path.join(localAppData, "pnpm", `${name}.cmd`),
     path.join(userProfile, ".local", "bin", `${name}.exe`),
+    // Native installers that keep a per-tool folder (Antigravity: %LOCALAPPDATA%\agy\bin).
+    path.join(localAppData, name, "bin", `${name}.exe`),
   ];
 }
 
@@ -158,6 +167,7 @@ export async function findBinary(name: string, configOverride?: string): Promise
     agent: "Install the Cursor CLI agent",
     opencode: "Install: npm install -g opencode-ai",
     pi: "Install: npm install -g @mariozechner/pi-coding-agent",
+    agy: "Install the Antigravity CLI: curl -fsSL https://antigravity.google/cli/install.sh | bash",
   };
   throw new Error(
     `Could not find "${name}" binary. Searched common install paths and PATH. ` +

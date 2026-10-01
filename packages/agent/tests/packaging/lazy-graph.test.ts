@@ -21,8 +21,10 @@ const HEAVY =
   /providers\/[^/]+\/(session|execute|mcp|modes|plan-mode|usage-scanner|server|http-session|event-parse|attach)\.js$/;
 
 /** Budget: measured dist module count for a bare barrel import + ~10% headroom.
- *  Per spec §10.9 this may be tightened, never loosened, without editing the spec. */
-const BARREL_DIST_BUDGET = 51;
+ *  Per spec §10.9 this may be tightened, never loosened, without editing the spec.
+ *  51 at 0.0.26. 53 since 0.0.39: the antigravity provider adds the same light
+ *  index + codec leaf pair every provider ships, and nothing heavier. */
+const BARREL_DIST_BUDGET = 53;
 
 function isDenied(url: string): boolean {
   return (

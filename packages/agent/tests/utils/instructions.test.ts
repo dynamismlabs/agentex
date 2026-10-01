@@ -87,7 +87,7 @@ describe("resolveInstructionTargets", () => {
     expect(targets[0]!.importsFile).toBeUndefined();
     // Claude Code reads AGENTS.md too (since 2.1.277, where there is no CLAUDE.md).
     expect(targets[0]!.runtimes.sort()).toEqual(
-      ["claude", "codex", "cursor", "gemini", "opencode", "pi"].sort(),
+      ["antigravity", "claude", "codex", "cursor", "gemini", "opencode", "pi"].sort(),
     );
   });
 
@@ -155,6 +155,14 @@ describe("resolveInstructionTargets", () => {
     expect(byPath[path.join(home, ".gemini", "GEMINI.md")]).toBeDefined();
     expect(byPath[path.join(home, ".config", "opencode", "AGENTS.md")]).toBeDefined();
     expect(byPath[path.join(home, ".pi", "AGENTS.md")]).toBeDefined();
+  });
+
+  it("global merges Gemini CLI and Antigravity into their shared ~/.gemini/GEMINI.md", () => {
+    const home = "/home/test";
+    const targets = resolveInstructionTargets({ location: "global", homeDir: home, runtimes: ["gemini", "antigravity"] });
+    expect(targets).toEqual([
+      { filename: "GEMINI.md", targetPath: path.join(home, ".gemini", "GEMINI.md"), runtimes: ["gemini", "antigravity"] },
+    ]);
   });
 
   it("global omits cursor (no file-based global config)", () => {
@@ -552,6 +560,13 @@ describe("installInstructions (global)", () => {
       cursorExists = false;
     }
     expect(cursorExists).toBe(false);
+  });
+
+  it("writes Antigravity's global brief to ~/.gemini/GEMINI.md", async () => {
+    const home = await mkHome();
+    const result = await installInstructions("agy brief", { location: "global", homeDir: home, runtimes: ["antigravity"] });
+    expect(result.installed).toBe(1);
+    expect(await fs.readFile(path.join(home, ".gemini", "GEMINI.md"), "utf-8")).toContain("agy brief");
   });
 
   it("respects a runtimes subset", async () => {

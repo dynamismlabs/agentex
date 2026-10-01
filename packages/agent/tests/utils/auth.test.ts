@@ -99,6 +99,28 @@ describe("detectAuth", () => {
     });
   });
 
+  describe("antigravity provider", () => {
+    const originalHome = process.env.HOME;
+    afterEach(() => {
+      process.env.HOME = originalHome;
+    });
+
+    it("bills a signed-in Google account as a subscription, even with GEMINI_API_KEY set", async () => {
+      process.env.HOME = await fs.mkdtemp(path.join(os.tmpdir(), "agentex-agy-home-"));
+      expect(detectAuth("antigravity", {}).method).toBe("subscription");
+      expect(detectAuth("antigravity", { GEMINI_API_KEY: "gem-123" }).method).toBe("subscription");
+    });
+
+    it("bills the Gemini API when settings.json selects it and the key is set", async () => {
+      const home = await fs.mkdtemp(path.join(os.tmpdir(), "agentex-agy-home-"));
+      await fs.mkdir(path.join(home, ".gemini", "antigravity-cli"), { recursive: true });
+      await fs.writeFile(path.join(home, ".gemini", "antigravity-cli", "settings.json"), JSON.stringify({ modelProvider: "gemini" }));
+      process.env.HOME = home;
+      expect(detectAuth("antigravity", { GEMINI_API_KEY: "gem-123" })).toMatchObject({ method: "api_key", billingType: "api" });
+      expect(detectAuth("antigravity", {}).method).toBe("subscription");
+    });
+  });
+
   describe("unknown provider", () => {
     it("returns subscription fallback for unrecognized provider", () => {
       const result = detectAuth("unknown-provider", {});
@@ -288,6 +310,50 @@ describe("resolveAuthForProvider", () => {
     });
   });
 
+  describe("antigravity", () => {
+    const mockAgy = path.resolve(import.meta.dirname, "../fixtures/mock-agy.sh");
+
+    it("reports a signed-in account from `agy models`", async () => {
+      process.env.HOME = tmpHome;
+      const report = await resolveAuthForProvider("antigravity", { command: mockAgy, fresh: true });
+      expect(report.providerType).toBe("antigravity");
+      expect(report.source).toBe("cli");
+      expect(report.binary).toMatchObject({ installed: true, version: "1.2.14" });
+      const subscription = report.options.find((option) => option.method === "subscription");
+      expect(subscription).toMatchObject({ present: true, source: { kind: "cli", command: "agy models" } });
+      expect(report.options.find((option) => option.method === "api_key")?.present).toBe(false);
+    });
+
+    it("reports no sign-in when `agy models` asks for one", async () => {
+      process.env.HOME = tmpHome;
+      const report = await resolveAuthForProvider("antigravity", {
+        command: mockAgy,
+        env: { MOCK_AGY_AUTH: "missing" },
+        fresh: true,
+      });
+      expect(report.options.every((option) => !option.present)).toBe(true);
+    });
+
+    it("counts GEMINI_API_KEY only when settings.json selects the Gemini API", async () => {
+      process.env.HOME = tmpHome;
+      const env = { GEMINI_API_KEY: "gem-123" };
+      const before = await resolveAuthForProvider("antigravity", { command: mockAgy, env, fresh: true });
+      expect(before.options.find((option) => option.method === "api_key")?.present).toBe(false);
+
+      await fs.mkdir(path.join(tmpHome, ".gemini", "antigravity-cli"), { recursive: true });
+      await fs.writeFile(path.join(tmpHome, ".gemini", "antigravity-cli", "settings.json"), JSON.stringify({ modelProvider: "gemini" }));
+      const after = await resolveAuthForProvider("antigravity", { command: mockAgy, env, fresh: true });
+      expect(after.options.find((option) => option.method === "api_key")?.present).toBe(true);
+      expect(after.options.find((option) => option.method === "subscription")?.present).toBe(false);
+    });
+
+    it("reports a missing binary without auth options present", async () => {
+      const report = await resolveAuthForProvider("antigravity", { command: "/nonexistent/agy", fresh: true });
+      expect(report.binary.installed).toBe(false);
+      expect(report.options.every((option) => !option.present)).toBe(true);
+    });
+  });
+
   describe("caching", () => {
     it("caches results by default", async () => {
       const report1 = await resolveAuthForProvider("cursor");
@@ -368,6 +434,7 @@ describe("loginCommandFor", () => {
     ["codex", "codex login"],
     ["gemini", "gemini"],
     ["cursor", "cursor-agent login"],
+    ["antigravity", "agy"],
     ["opencode", "opencode auth login"],
   ])("returns %s → %s", (providerType, expected) => {
     expect(loginCommandFor(providerType)).toBe(expected);
