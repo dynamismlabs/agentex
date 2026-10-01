@@ -57,6 +57,16 @@ function codexUserText(line: CodexTranscriptLine): string | null {
   if (line.type === "event_msg" && line.payload?.["type"] === "user_message") {
     return meaningfulHumanText(asString(line.payload["message"]));
   }
+  // Codex 0.142 and later no longer write `user_message`. Its mirror of what
+  // the person typed is a completed `UserMessage` item. The `response_item`
+  // user message beside it also carries injected context, so the item is the
+  // one read, which keeps each message to one event.
+  if (line.type === "event_msg" && line.payload?.["type"] === "item_completed") {
+    const item = asRecord(line.payload["item"]);
+    if (item?.["type"] === "UserMessage") {
+      return meaningfulHumanText(textFromContent(item["content"], new Set(["text", "input_text"])));
+    }
+  }
   // Older unwrapped rollouts have no event_msg mirror.
   if (line.type === "message" && line.raw["role"] === "user") {
     return meaningfulHumanText(textFromContent(

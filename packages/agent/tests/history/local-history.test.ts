@@ -12,6 +12,7 @@ const CLAUDE_EMPTY_ID = "11111111-1111-4111-8111-333333333333";
 const CODEX_ID = "22222222-2222-4222-8222-222222222222";
 const CODEX_SUBAGENT_ID = "22222222-2222-4222-8222-333333333333";
 const LEGACY_CODEX_ID = "22222222-2222-4222-8222-444444444444";
+const CURRENT_CODEX_ID = "22222222-2222-4222-8222-555555555555";
 
 async function writeJsonl(filePath: string, records: Record<string, unknown>[]): Promise<void> {
   await mkdir(path.dirname(filePath), { recursive: true });
@@ -284,6 +285,72 @@ describe("provider local history", () => {
       payload: { type: "task_complete", last_agent_message: "changed" },
     })}\n`);
     await expect(drain(iterator)).rejects.toMatchObject({ code: "source_changed_during_read" });
+  });
+
+  it("finds and reads current Codex rollouts, which record user messages as completed items", async () => {
+    // Codex 0.142+: no event_msg user_message. The person's words arrive as an
+    // item_completed UserMessage, mirrored by a response_item that can also
+    // carry injected context.
+    await writeJsonl(path.join(
+      codexHome,
+      "sessions",
+      "2026",
+      "07",
+      "07",
+      `rollout-2026-07-07T08-44-33-${CURRENT_CODEX_ID}.jsonl`,
+    ), [
+      {
+        timestamp: "2026-07-07T08:44:33.000Z",
+        ordinal: 0,
+        type: "session_meta",
+        payload: { id: CURRENT_CODEX_ID, cwd: project, originator: "Codex Desktop", source: "vscode", cli_version: "0.142.0" },
+      },
+      {
+        timestamp: "2026-07-07T08:44:34.000Z",
+        ordinal: 1,
+        type: "response_item",
+        payload: {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: `<environment_context><cwd>${project}</cwd></environment_context>` }],
+        },
+      },
+      {
+        timestamp: "2026-07-07T08:44:35.000Z",
+        ordinal: 2,
+        type: "response_item",
+        payload: { type: "message", role: "user", content: [{ type: "input_text", text: "Fix the login redirect" }] },
+      },
+      {
+        timestamp: "2026-07-07T08:44:35.000Z",
+        ordinal: 3,
+        type: "event_msg",
+        payload: {
+          type: "item_completed",
+          item: { type: "UserMessage", id: "item-1", content: [{ type: "text", text: "Fix the login redirect", text_elements: [] }] },
+        },
+      },
+      {
+        timestamp: "2026-07-07T08:44:40.000Z",
+        ordinal: 4,
+        type: "response_item",
+        payload: {
+          type: "message",
+          role: "assistant",
+          phase: "final_answer",
+          content: [{ type: "output_text", text: "The redirect is fixed." }],
+        },
+      },
+    ]);
+
+    const history = getProvider("codex").localHistory!;
+    const sessions = await collect(history.discover({ env: { CODEX_HOME: codexHome } }));
+    const current = sessions.find((session) => session.externalSessionId === CURRENT_CODEX_ID)!;
+    expect(current).toBeDefined();
+    expect(current.cwd).toBe(project);
+    const events = await collect(history.read(current));
+    expect(events.map((value) => value.event.type)).toEqual(["user", "assistant"]);
+    expect(events[0]!.event).toMatchObject({ type: "user", text: "Fix the login redirect" });
   });
 
   it("preserves assistant and tool activity from legacy Codex rollouts", async () => {
