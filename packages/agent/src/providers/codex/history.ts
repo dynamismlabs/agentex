@@ -57,10 +57,11 @@ function codexUserText(line: CodexTranscriptLine): string | null {
   if (line.type === "event_msg" && line.payload?.["type"] === "user_message") {
     return meaningfulHumanText(asString(line.payload["message"]));
   }
-  // Codex 0.142 and later no longer write `user_message`. Its mirror of what
-  // the person typed is a completed `UserMessage` item. The `response_item`
-  // user message beside it also carries injected context, so the item is the
-  // one read, which keeps each message to one event.
+  // Paginated rollouts (`session_meta.history_mode: "paginated"`, written by
+  // Codex 0.142 and later) never write `user_message`. What the person typed
+  // is a completed `UserMessage` item instead, and legacy rollouts never
+  // persist that item, so each message is read once. The `response_item` user
+  // message beside it also carries injected context, so it is not the one read.
   if (line.type === "event_msg" && line.payload?.["type"] === "item_completed") {
     const item = asRecord(line.payload["item"]);
     if (item?.["type"] === "UserMessage") {

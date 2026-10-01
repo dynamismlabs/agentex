@@ -1,9 +1,9 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
-import * as readline from "node:readline";
 import { createReadStream } from "node:fs";
 import type { TokenUsage } from "../../types.js";
+import { readJsonlLines } from "../../utils/jsonl-lines.js";
 
 // ---------------------------------------------------------------------------
 // Log path resolution
@@ -104,16 +104,14 @@ async function scanFile(
 ): Promise<void> {
   let stream: ReturnType<typeof createReadStream>;
   try {
-    stream = createReadStream(filePath, { encoding: "utf-8" });
+    stream = createReadStream(filePath);
   } catch {
     return;
   }
 
-  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-
   try {
-    for await (const line of rl) {
-      const trimmed = line.trim();
+    for await (const line of readJsonlLines(stream)) {
+      const trimmed = line.text.trim();
       if (!trimmed) continue;
 
       let parsed: Record<string, unknown>;
@@ -172,7 +170,6 @@ async function scanFile(
       usageByModel.set(model, existing);
     }
   } finally {
-    rl.close();
     stream.destroy();
   }
 }

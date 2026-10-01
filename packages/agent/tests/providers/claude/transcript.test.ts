@@ -455,6 +455,33 @@ describe("readClaudeTranscript", () => {
     expect(yielded[3].offset).toBe(content.length);
   });
 
+  it("reads records containing U+2028/U+2029 with exact byte offsets", async () => {
+    const file = path.join(dir, "separators.jsonl");
+    const assistant = line({
+      type: "assistant",
+      session_id: "sess-1",
+      uuid: "u-assistant-ls",
+      message: { id: "msg-ls", content: [{ type: "text", text: "caf\u00e9\u2028line\u2029para" }] },
+    });
+    const content = jsonlOf(assistant, SAMPLE_RESULT);
+    await writeFile(file, content);
+
+    const yielded: { type: string; offset: number; text?: string }[] = [];
+    for await (const { event, offset } of readClaudeTranscript({ filePath: file })) {
+      yielded.push({ type: event.type, offset, ...(event.type === "assistant" ? { text: event.text } : {}) });
+    }
+    expect(yielded.map((y) => y.type)).toEqual(["assistant", "result"]);
+    expect(yielded[0]!.text).toBe("caf\u00e9\u2028line\u2029para");
+    expect(yielded[0]!.offset).toBe(Buffer.byteLength(assistant) + 1);
+    expect(yielded[1]!.offset).toBe(Buffer.byteLength(content));
+
+    const resumed: string[] = [];
+    for await (const { event } of readClaudeTranscript({ filePath: file, fromOffset: yielded[0]!.offset })) {
+      resumed.push(event.type);
+    }
+    expect(resumed).toEqual(["result"]);
+  });
+
   it("skips malformed JSON lines", async () => {
     const file = path.join(dir, "malformed.jsonl");
     await writeFile(file, jsonlOf(SAMPLE_ASSISTANT_TEXT_AND_TOOL, "not-json{", SAMPLE_RESULT));

@@ -37,6 +37,11 @@ function taskStartedLine(): string {
     type: "event_msg", timestamp: TS, payload: { type: "task_started" },
   });
 }
+function turnAbortedLine(): string {
+  return JSON.stringify({
+    type: "event_msg", timestamp: TS, payload: { type: "turn_aborted", reason: "interrupted" },
+  });
+}
 function userMessageLine(): string {
   return JSON.stringify({
     type: "event_msg", timestamp: TS, payload: { type: "user_message", message: "next task" },
@@ -112,6 +117,15 @@ describe("attachCodexSession — lastTurn classification", () => {
     await writeRollout([metaLine(), taskCompleteLine(), line()]);
     const att = await attach(record());
     expect(att.lastTurn).toBe("interrupted");
+  });
+
+  it("stays interrupted when the last turn was aborted, though replay reports it", async () => {
+    await writeRollout([metaLine(), taskCompleteLine(), taskStartedLine(), assistantLine(), turnAbortedLine()]);
+    const att = await attach(record());
+    expect(att.lastTurn).toBe("interrupted");
+    const events = await collect(att.catchUp());
+    expect(events.map((e) => e.event.type)).toEqual(["result", "assistant", "result"]);
+    expect(events[2]!.event).toMatchObject({ type: "result", terminalReason: "interrupted", isError: false });
   });
 
   it("interrupted when the rollout ends without task_complete", async () => {

@@ -176,6 +176,104 @@ describe("codexLineToStreamEvents — §5.4 mapping table", () => {
     if (ev.type === "tool_result") expect(ev.content).toBe("inner");
   });
 
+  it("function_call_output with a list of content parts joins the text parts", () => {
+    const ev = only(
+      codexLineToStreamEvents(
+        mk({
+          type: "response_item",
+          payload: {
+            type: "function_call_output",
+            call_id: "c",
+            output: [{ type: "input_text", text: "line one" }, { type: "input_text", text: "line two" }],
+          },
+        }),
+        CTX,
+      ),
+    );
+    if (ev.type === "tool_result") expect(ev.content).toBe("line one\nline two");
+  });
+
+  it("response_item/custom_tool_call → tool_call with the freeform input string", () => {
+    const script = "const r = await tools.exec_command({ cmd: \"ls\" });\ntext(r.output);";
+    const ev = only(
+      codexLineToStreamEvents(
+        mk({
+          type: "response_item",
+          payload: { type: "custom_tool_call", id: "ctc_1", status: "completed", call_id: "call_7", name: "exec", input: script },
+        }),
+        CTX,
+      ),
+    );
+    expect(ev.type).toBe("tool_call");
+    if (ev.type === "tool_call") {
+      expect(ev.toolCallId).toBe("call_7");
+      expect(ev.name).toBe("exec");
+      expect(ev.input).toBe(script);
+    }
+  });
+
+  it("custom_tool_call keeps a JSON-looking input as the string the model wrote", () => {
+    const ev = only(
+      codexLineToStreamEvents(
+        mk({ type: "response_item", payload: { type: "custom_tool_call", call_id: "c", name: "apply_patch", input: "{}" } }),
+        CTX,
+      ),
+    );
+    if (ev.type === "tool_call") expect(ev.input).toBe("{}");
+  });
+
+  it("custom_tool_call falls back to id and a default name, and a non-string input to null", () => {
+    const ev = only(
+      codexLineToStreamEvents(
+        mk({ type: "response_item", payload: { type: "custom_tool_call", id: "ctc_9", input: 42 } }),
+        CTX,
+      ),
+    );
+    if (ev.type === "tool_call") {
+      expect(ev.toolCallId).toBe("ctc_9");
+      expect(ev.name).toBe("custom_tool_call");
+      expect(ev.input).toBeNull();
+    }
+  });
+
+  it("response_item/custom_tool_call_output → tool_result (text parts, images left in raw)", () => {
+    const ev = only(
+      codexLineToStreamEvents(
+        mk({
+          type: "response_item",
+          payload: {
+            type: "custom_tool_call_output",
+            id: "ctco_1",
+            call_id: "call_7",
+            output: [
+              { type: "input_text", text: "Script completed\nOutput:\n" },
+              { type: "input_image", image_url: "data:image/png;base64,AAAA", detail: "high" },
+              { type: "input_text", text: "a.txt" },
+            ],
+          },
+        }),
+        CTX,
+      ),
+    );
+    expect(ev.type).toBe("tool_result");
+    if (ev.type === "tool_result") {
+      expect(ev.toolCallId).toBe("call_7");
+      expect(ev.toolName).toBeNull();
+      expect(ev.content).toBe("Script completed\nOutput:\na.txt");
+      expect(ev.isError).toBe(false);
+    }
+  });
+
+  it("custom_tool_call_output with a string output passes it through", () => {
+    const ev = only(
+      codexLineToStreamEvents(
+        mk({ type: "response_item", payload: { type: "custom_tool_call_output", call_id: "c", output: "Exit code: 0\n" } }),
+        CTX,
+      ),
+    );
+    if (ev.type === "tool_result") expect(ev.content).toBe("Exit code: 0\n");
+  });
+
   it("event_msg/task_complete → result (completed)", () => {
     const ev = only(
       codexLineToStreamEvents(
@@ -191,6 +289,94 @@ describe("codexLineToStreamEvents — §5.4 mapping table", () => {
     }
   });
 
+  it("event_msg/task_complete carries duration_ms through", () => {
+    const ev = only(
+      codexLineToStreamEvents(
+        mk({ type: "event_msg", payload: { type: "task_complete", last_agent_message: "ok", duration_ms: 2135 } }),
+        CTX,
+      ),
+    );
+    if (ev.type === "result") expect(ev.durationMs).toBe(2135);
+  });
+
+  it("event_msg/task_complete with error → failed result with the API's message", () => {
+    const ev = only(
+      codexLineToStreamEvents(
+        mk({
+          type: "event_msg",
+          payload: {
+            type: "task_complete",
+            turn_id: "t1",
+            last_agent_message: null,
+            error: {
+              message: JSON.stringify({
+                type: "error",
+                status: 400,
+                error: { type: "invalid_request_error", message: "The 'gpt-mini' model is not supported." },
+              }),
+              codex_error_info: "other",
+            },
+            duration_ms: 2041,
+          },
+        }),
+        CTX,
+      ),
+    );
+    expect(ev.type).toBe("result");
+    if (ev.type === "result") {
+      expect(ev.isError).toBe(true);
+      expect(ev.terminalReason).toBe("failed");
+      expect(ev.text).toBe("The 'gpt-mini' model is not supported.");
+      expect(ev.durationMs).toBe(2041);
+    }
+  });
+
+  it("task_complete error with a plain message, or none, still fails the result", () => {
+    const plain = only(codexLineToStreamEvents(
+      mk({ type: "event_msg", payload: { type: "task_complete", error: { message: "stream disconnected" } } }),
+      CTX,
+    ));
+    if (plain.type === "result") {
+      expect(plain.isError).toBe(true);
+      expect(plain.text).toBe("stream disconnected");
+    }
+    const bare = only(codexLineToStreamEvents(
+      mk({ type: "event_msg", payload: { type: "task_complete", error: { codex_error_info: "other" } } }),
+      CTX,
+    ));
+    if (bare.type === "result") {
+      expect(bare.isError).toBe(true);
+      expect(bare.text).toBe("Turn failed");
+    }
+    const none = only(codexLineToStreamEvents(
+      mk({ type: "event_msg", payload: { type: "task_complete", last_agent_message: "fine", error: null } }),
+      CTX,
+    ));
+    if (none.type === "result") {
+      expect(none.isError).toBe(false);
+      expect(none.terminalReason).toBe("completed");
+    }
+  });
+
+  it("event_msg/turn_aborted → result (interrupted, not an error)", () => {
+    const ev = only(
+      codexLineToStreamEvents(
+        mk({
+          type: "event_msg",
+          payload: { type: "turn_aborted", turn_id: "t2", reason: "interrupted", duration_ms: 4310 },
+        }),
+        CTX,
+      ),
+    );
+    expect(ev.type).toBe("result");
+    if (ev.type === "result") {
+      expect(ev.isError).toBe(false);
+      expect(ev.terminalReason).toBe("interrupted");
+      expect(ev.text).toBe("");
+      expect(ev.durationMs).toBe(4310);
+    }
+  });
+
   it.each([
     ["session_meta", { type: "session_meta", payload: { id: "x", cwd: "/w" } }],
     ["turn_context", { type: "turn_context", payload: { type: "turn_context" } }],
@@ -199,6 +385,18 @@ describe("codexLineToStreamEvents — §5.4 mapping table", () => {
     ["event_msg/agent_message (dup)", { type: "event_msg", payload: { type: "agent_message", message: "dup" } }],
     ["event_msg/user_message", { type: "event_msg", payload: { type: "user_message", message: "hi" } }],
     ["response_item/unknown", { type: "response_item", payload: { type: "web_search_call" } }],
+    ["response_item/agent_message (inter-agent)", {
+      type: "response_item",
+      payload: { type: "agent_message", author: "/root", recipient: "/root/worker", content: [{ type: "input_text", text: "Message Type: NEW_TASK" }] },
+    }],
+    ["event_msg/item_completed (mirror)", {
+      type: "event_msg",
+      payload: { type: "item_completed", item: { type: "AgentMessage", content: [{ type: "Text", text: "dup" }] } },
+    }],
+    ["event_msg/item_completed UserMessage", {
+      type: "event_msg",
+      payload: { type: "item_completed", item: { type: "UserMessage", content: [{ type: "text", text: "hi" }] } },
+    }],
   ])("drops %s → []", (_label, obj) => {
     expect(codexLineToStreamEvents(mk(obj as Record<string, unknown>), CTX)).toEqual([]);
   });
@@ -250,6 +448,9 @@ describe("codexLineToStreamEvents — BaseStreamEventFields + robustness", () =>
       { type: "response_item", payload: { type: "reasoning", summary: 42 } },
       { type: "response_item", payload: { type: "function_call", arguments: 999 } },
       { type: "response_item", payload: { type: "function_call_output", output: [1, 2, 3] } },
+      { type: "response_item", payload: { type: "custom_tool_call_output", output: [null, { text: 5 }] } },
+      { type: "event_msg", payload: { type: "task_complete", error: { message: 42 } } },
+      { type: "event_msg", payload: { type: "turn_aborted", reason: 7, duration_ms: "slow" } },
       { type: "response_item", payload: {} },
     ];
     for (const w of weird) {

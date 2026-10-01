@@ -132,6 +132,10 @@ export async function attachCodexSession(
   if (transcript) {
     const lastEvent = await latestTurnBoundary(transcript.filePath, sessionId);
     if (lastEvent === null) lastTurn = "unknown";
+    // turn_aborted replays as an interrupted result, but the turn never
+    // finished, so it stays "interrupted" for hosts deciding whether to re-send.
+    else if (lastEvent.type === "event_msg" && lastEvent.payload?.["type"] === "turn_aborted")
+      lastTurn = "interrupted";
     else if (codexLineToStreamEvents(lastEvent, { sessionId }).some((event) => event.type === "result"))
       lastTurn = "completed";
     else lastTurn = "interrupted";

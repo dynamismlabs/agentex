@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.0.40 — Codex local history reads current rollouts
+
+Codex 0.142 and later write paginated rollouts (`session_meta.history_mode: "paginated"`), which never contain the `event_msg` `user_message` that discovery used to find the person's messages. Every current rollout looked like it had no user message, so `localHistory.discover()` returned nothing: 0 sessions on a machine with 154 real ones. Checked against 561 real rollouts from Codex 0.142 to 0.159 and against the upstream persistence policy.
+
+### Fixed
+
+- **Codex discovery and read find user messages in paginated rollouts.** The person's words are read from the completed `UserMessage` item. Legacy rollouts never persist that item and paginated rollouts never persist `user_message`, so each message is read exactly once. The `response_item` user message beside it, which also carries injected context, is still not read as a human message.
+- **Codex `exec` and `apply_patch` tool calls replay.** Current Codex runs shell work through freeform tools, written as `custom_tool_call` / `custom_tool_call_output`, which were dropped entirely (most tool activity in a current rollout). They now map to `tool_call` (`input` is the script or patch string the model wrote) and `tool_result`. This applies to `localHistory.read()` and `attachSession().catchUp()`.
+- **Tool output written as content parts keeps its text.** Codex now also writes `function_call_output` / `custom_tool_call_output` output as a list of `input_text` / `input_image` parts. Text parts are joined one per line, and images stay in `raw`. Before, such a `tool_result` had empty `content`.
+- **Failed and interrupted Codex turns replay as such.** A `task_complete` with `error` becomes a `result` with `isError: true`, `terminalReason: "failed"`, and the API's message as `text`. A `turn_aborted` becomes a `result` with `terminalReason: "interrupted"`, matching a live `turn/completed` with that status. Results carry `durationMs` from `duration_ms`. `attachSession().lastTurn` still reports an aborted last turn as `"interrupted"`.
+- **JSONL records containing U+2028 or U+2029 are no longer dropped.** `node:readline` also splits lines at these separators, which JSON (and so both Claude Code and Codex) writes raw inside strings, usually in text copied from web pages. The record was cut in two, both halves failed to parse, and every later byte offset was 2 bytes short per separator, so a resume offset could land mid-record. Claude and Codex transcript reads, local history, attach classification, and the Codex usage scanner now share `utils/jsonl-lines`, which splits on `\n` only and reports exact byte offsets. CRLF offsets are now exact too. Codex event ids are offset-based, so in a rollout that has such a record, ids after it move to their correct offsets, and a host that already replayed that file may see those later records once more. Claude ids come from record `uuid`s and do not change.
+
+### Changed
+
+- The barrel-import module budget in `tests/packaging/lazy-graph.test.ts` is re-pinned from 53 to 54 for `utils/jsonl-lines`, a dependency-free leaf that replaces the builtin `node:readline`.
+
 ## 0.0.39 — Antigravity provider (Google's successor to Gemini CLI)
 
 Gemini CLI stopped serving free, Google AI Pro, and Google AI Ultra sign-ins on 2026-06-18 ("This client is no longer supported for Gemini Code Assist for individuals"). Google moved those accounts to the Antigravity CLI, `agy`. This release adds it as a first-class provider. Wire behavior follows the documented headless protocol and was checked against `agy` 1.2.14.

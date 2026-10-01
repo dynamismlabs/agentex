@@ -797,6 +797,8 @@ Strong fingerprints verify the opened file before and after hashing. A strong fi
 
 Codex rollout JSONL is the canonical history and checkpoint source. `session_index.jsonl` and compatible SQLite state databases are optional title sources opened read-only. Local history never starts Codex App Server.
 
+Both Codex rollout formats are read. Legacy rollouts record the person's message as an `event_msg` `user_message`. Paginated rollouts (`history_mode: "paginated"`, written by Codex 0.142 and later) record it as a completed `UserMessage` item, and run shell work through the freeform `exec` and `apply_patch` tools, which replay as `tool_call`/`tool_result` like function calls.
+
 ## Plan Mode
 
 Run an agent in read-only "plan" mode — it investigates and proposes a plan but cannot edit files or run mutating commands. Same goal in both providers, **different mechanism** in each. Check `provider.capabilities.planMode` before relying on it.

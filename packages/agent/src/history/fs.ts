@@ -1,12 +1,12 @@
 import { createHash } from "node:crypto";
 import { readdir, stat, open as openFile, type FileHandle } from "node:fs/promises";
 import * as path from "node:path";
-import * as readline from "node:readline";
 
 import {
   LocalHistoryError,
   type LocalHistorySourceFingerprint,
 } from "./types.js";
+import { readJsonlLines } from "../utils/jsonl-lines.js";
 
 export const UUID_JSONL_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$/i;
 export const ROLLOUT_UUID_RE = /-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
@@ -238,22 +238,17 @@ export async function* readJsonlRecords(
 ): AsyncIterable<JsonlRecord> {
   let handle: FileHandle | null = null;
   let stream: ReturnType<FileHandle["createReadStream"]> | null = null;
-  let rl: readline.Interface | null = null;
-  let offset = fromOffset;
   try {
     handle = await openFile(filePath, "r");
     const before = await fileIdentity(handle);
     await options.afterInitialStat?.();
-    stream = handle.createReadStream({ start: fromOffset, encoding: "utf8", autoClose: false });
+    stream = handle.createReadStream({ start: fromOffset, autoClose: false });
     stream.on("error", () => {});
-    rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-    for await (const line of rl) {
-      const lineStartOffset = offset;
-      offset += Buffer.byteLength(line, "utf8") + 1;
-      if (!line.trim()) continue;
+    for await (const line of readJsonlLines(stream, fromOffset)) {
+      if (!line.text.trim()) continue;
       try {
-        const raw = asRecord(JSON.parse(line));
-        if (raw) yield { raw, text: line, lineStartOffset, nextOffset: offset };
+        const raw = asRecord(JSON.parse(line.text));
+        if (raw) yield { raw, text: line.text, lineStartOffset: line.start, nextOffset: line.end };
       } catch {
         // A damaged historical record must not hide later valid records.
       }
@@ -272,7 +267,6 @@ export async function* readJsonlRecords(
   } catch (error) {
     throw wrapFileError(error, "read");
   } finally {
-    rl?.close();
     stream?.destroy();
     await handle?.close();
   }

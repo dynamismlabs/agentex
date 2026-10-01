@@ -23,8 +23,10 @@ const HEAVY =
 /** Budget: measured dist module count for a bare barrel import + ~10% headroom.
  *  Per spec §10.9 this may be tightened, never loosened, without editing the spec.
  *  51 at 0.0.26. 53 since 0.0.39: the antigravity provider adds the same light
- *  index + codec leaf pair every provider ships, and nothing heavier. */
-const BARREL_DIST_BUDGET = 53;
+ *  index + codec leaf pair every provider ships, and nothing heavier. 54 since
+ *  0.0.40: the Claude and Codex transcript readers share `utils/jsonl-lines`,
+ *  a dependency-free leaf that replaces `node:readline` (a builtin, uncounted). */
+const BARREL_DIST_BUDGET = 54;
 
 function isDenied(url: string): boolean {
   return (

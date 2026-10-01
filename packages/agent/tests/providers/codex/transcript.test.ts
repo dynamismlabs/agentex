@@ -331,6 +331,33 @@ describe("readCodexTranscript", () => {
     expect(tail).toEqual(["response_item"]);
   });
 
+  it("reads records containing U+2028 with exact byte offsets and event ids", async () => {
+    const file = path.join(dir, "separators.jsonl");
+    const output = JSON.stringify({
+      type: "response_item",
+      timestamp: "2026-05-08T22:01:59.250Z",
+      payload: { type: "custom_tool_call_output", call_id: "c1", output: "caf\u00e9 \u2028 web text" },
+    });
+    const content = [SESSION_META_LINE, output, RESPONSE_ITEM_LINE].join("\n") + "\n";
+    await writeFile(file, content);
+
+    const seen: { type: string | null; offset: number; eventId: string | null }[] = [];
+    for await (const { event, offset } of readCodexTranscript({ filePath: file })) {
+      seen.push({ type: event.payload?.["type"] as string ?? event.type, offset, eventId: event.eventId });
+    }
+    expect(seen.map((s) => s.type)).toEqual(["session_meta", "custom_tool_call_output", "message"]);
+    const outputStart = Buffer.byteLength(SESSION_META_LINE) + 1;
+    expect(seen[1]!.eventId?.endsWith(`:${outputStart}`)).toBe(true);
+    expect(seen[1]!.offset).toBe(outputStart + Buffer.byteLength(output) + 1);
+    expect(seen[2]!.offset).toBe(Buffer.byteLength(content));
+
+    const resumed: (string | null)[] = [];
+    for await (const { event } of readCodexTranscript({ filePath: file, fromOffset: seen[1]!.offset })) {
+      resumed.push(event.type);
+    }
+    expect(resumed).toEqual(["response_item"]);
+  });
+
   it("skips malformed lines", async () => {
     const file = path.join(dir, "bad.jsonl");
     await writeFile(file, [SESSION_META_LINE, "{bad", RESPONSE_ITEM_LINE].join("\n") + "\n");

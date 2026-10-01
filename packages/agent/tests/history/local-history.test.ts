@@ -288,9 +288,10 @@ describe("provider local history", () => {
   });
 
   it("finds and reads current Codex rollouts, which record user messages as completed items", async () => {
-    // Codex 0.142+: no event_msg user_message. The person's words arrive as an
-    // item_completed UserMessage, mirrored by a response_item that can also
-    // carry injected context.
+    // Paginated rollouts (Codex 0.142+): no event_msg user_message. The
+    // person's words arrive as an item_completed UserMessage, mirrored by a
+    // response_item that can also carry injected context. Shell work is an
+    // `exec` custom tool call whose output is a list of content parts.
     await writeJsonl(path.join(
       codexHome,
       "sessions",
@@ -303,7 +304,14 @@ describe("provider local history", () => {
         timestamp: "2026-07-07T08:44:33.000Z",
         ordinal: 0,
         type: "session_meta",
-        payload: { id: CURRENT_CODEX_ID, cwd: project, originator: "Codex Desktop", source: "vscode", cli_version: "0.142.0" },
+        payload: {
+          id: CURRENT_CODEX_ID,
+          cwd: project,
+          originator: "Codex Desktop",
+          source: "vscode",
+          cli_version: "0.153.4",
+          history_mode: "paginated",
+        },
       },
       {
         timestamp: "2026-07-07T08:44:34.000Z",
@@ -331,8 +339,44 @@ describe("provider local history", () => {
         },
       },
       {
-        timestamp: "2026-07-07T08:44:40.000Z",
+        timestamp: "2026-07-07T08:44:36.000Z",
         ordinal: 4,
+        type: "response_item",
+        payload: {
+          type: "custom_tool_call",
+          id: "ctc_1",
+          status: "completed",
+          call_id: "call_exec",
+          name: "exec",
+          input: "const r = await tools.exec_command({ cmd: \"rg redirect\" });\ntext(r.output);",
+        },
+      },
+      {
+        timestamp: "2026-07-07T08:44:37.000Z",
+        ordinal: 5,
+        type: "event_msg",
+        payload: {
+          type: "item_completed",
+          item: { type: "CommandExecution", id: "cmd-1", command: "rg redirect", aggregated_output: "src/login.ts:4" },
+        },
+      },
+      {
+        timestamp: "2026-07-07T08:44:37.000Z",
+        ordinal: 6,
+        type: "response_item",
+        payload: {
+          type: "custom_tool_call_output",
+          id: "ctco_1",
+          call_id: "call_exec",
+          output: [
+            { type: "input_text", text: "Script completed\nOutput:\n" },
+            { type: "input_text", text: "src/login.ts:4" },
+          ],
+        },
+      },
+      {
+        timestamp: "2026-07-07T08:44:40.000Z",
+        ordinal: 7,
         type: "response_item",
         payload: {
           type: "message",
@@ -341,6 +385,21 @@ describe("provider local history", () => {
           content: [{ type: "output_text", text: "The redirect is fixed." }],
         },
       },
+      {
+        timestamp: "2026-07-07T08:44:40.000Z",
+        ordinal: 8,
+        type: "event_msg",
+        payload: {
+          type: "item_completed",
+          item: { type: "AgentMessage", id: "msg-1", content: [{ type: "Text", text: "The redirect is fixed." }], phase: "final_answer" },
+        },
+      },
+      {
+        timestamp: "2026-07-07T08:44:41.000Z",
+        ordinal: 9,
+        type: "event_msg",
+        payload: { type: "task_complete", turn_id: "turn-1", last_agent_message: "The redirect is fixed.", duration_ms: 8000 },
+      },
     ]);
 
     const history = getProvider("codex").localHistory!;
@@ -348,9 +407,60 @@ describe("provider local history", () => {
     const current = sessions.find((session) => session.externalSessionId === CURRENT_CODEX_ID)!;
     expect(current).toBeDefined();
     expect(current.cwd).toBe(project);
+    expect(current.hasUserMessage).toBe(true);
+    expect(current.title).toBe("Fix the login redirect");
     const events = await collect(history.read(current));
-    expect(events.map((value) => value.event.type)).toEqual(["user", "assistant"]);
+    expect(events.map((value) => value.event.type)).toEqual(["user", "tool_call", "tool_result", "assistant", "result"]);
     expect(events[0]!.event).toMatchObject({ type: "user", text: "Fix the login redirect" });
+    expect(events[1]!.event).toMatchObject({ type: "tool_call", toolCallId: "call_exec", name: "exec" });
+    expect(events[2]!.event).toMatchObject({
+      type: "tool_result",
+      toolCallId: "call_exec",
+      content: "Script completed\nOutput:\nsrc/login.ts:4",
+    });
+    expect(events[4]!.event).toMatchObject({ type: "result", isError: false, terminalReason: "completed", durationMs: 8000 });
+  });
+
+  it("reads Codex records containing U+2028 and resumes from their offsets", async () => {
+    // serde_json writes U+2028 raw. node:readline used to split the record in
+    // two, dropping the message and shifting every later offset.
+    const pasted = "Ship this\u2028copied from a web page";
+    const rolloutPath = path.join(
+      codexHome,
+      "sessions",
+      "2026",
+      "07",
+      "08",
+      `rollout-2026-07-08T08-00-00-${CURRENT_CODEX_ID}.jsonl`,
+    );
+    await writeJsonl(rolloutPath, [
+      { timestamp: "2026-07-08T08:00:00.000Z", type: "session_meta", payload: { id: CURRENT_CODEX_ID, cwd: project, history_mode: "paginated" } },
+      {
+        timestamp: "2026-07-08T08:00:01.000Z",
+        type: "event_msg",
+        payload: { type: "item_completed", item: { type: "UserMessage", content: [{ type: "text", text: pasted }] } },
+      },
+      {
+        timestamp: "2026-07-08T08:00:02.000Z",
+        type: "response_item",
+        payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "Shipped." }] },
+      },
+    ]);
+    const bytes = await readFile(rolloutPath);
+    expect(bytes.toString("utf8")).toContain("\u2028");
+
+    const history = getProvider("codex").localHistory!;
+    const sessions = await collect(history.discover({ env: { CODEX_HOME: codexHome } }));
+    const session = sessions.find((value) => value.externalSessionId === CURRENT_CODEX_ID);
+    expect(session).toBeDefined();
+    const events = await collect(history.read(session!));
+    expect(events.map((value) => value.event.type)).toEqual(["user", "assistant"]);
+    expect(events[0]!.event).toMatchObject({ type: "user", text: pasted });
+    expect(events[1]!.nextOffset).toBe(bytes.length);
+
+    const resumed = await collect(history.read(session!, { fromOffset: events[0]!.nextOffset }));
+    expect(resumed.map((value) => value.event.type)).toEqual(["assistant"]);
+    expect(resumed[0]!.lineStartOffset).toBe(events[1]!.lineStartOffset);
   });
 
   it("preserves assistant and tool activity from legacy Codex rollouts", async () => {

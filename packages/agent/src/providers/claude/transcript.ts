@@ -23,8 +23,8 @@ import { createReadStream } from "node:fs";
 import { readdir, realpath, stat, open as fsOpen } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import * as readline from "node:readline";
 
+import { readJsonlLines } from "../../utils/jsonl-lines.js";
 import { getDefaultRuntimeHome, getRuntimeHomeEnvVar } from "../../utils/runtime-homes.js";
 import type { FoundTranscript, StreamEvent, TranscriptOps } from "../../types.js";
 import { parseStreamLine } from "./parse.js";
@@ -273,13 +273,12 @@ async function readCwdFromTranscript(filePath: string): Promise<string | null> {
   if (!fh) return null;
 
   try {
-    const stream = fh.createReadStream({ encoding: "utf8", autoClose: false });
-    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+    const stream = fh.createReadStream({ autoClose: false });
     let count = 0;
     try {
-      for await (const raw of rl) {
+      for await (const line of readJsonlLines(stream)) {
         if (++count > 50) break;
-        const trimmed = raw.trim();
+        const trimmed = line.text.trim();
         if (!trimmed) continue;
         try {
           const obj = JSON.parse(trimmed) as Record<string, unknown>;
@@ -300,7 +299,6 @@ async function readCwdFromTranscript(filePath: string): Promise<string | null> {
         }
       }
     } finally {
-      rl.close();
       stream.destroy();
     }
   } finally {
@@ -377,26 +375,16 @@ export async function* readClaudeTranscript(
 
   const stream = createReadStream(filePath, { start: fromOffset, encoding: undefined });
 
-  // Suppress stray ENOENT (file deleted between stat and open) — readline
+  // Suppress stray ENOENT (file deleted between stat and open) — the stream
   // raises the same condition through its own iterator, which we catch below.
   stream.on("error", () => {});
 
-  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-
-  let pos = fromOffset;
   let stillSkippingPastSince = !!sinceEventId;
 
   try {
-    for await (const line of rl) {
-      // readline strips the trailing `\n` (and the `\r` from `\r\n`). Claude
-      // writes Unix line endings, so we account for `\n` only. A `\r\n` file
-      // would yield offsets 1 byte short per line — accepted as a corner
-      // case; resume from such an offset would skip one stray `\r`.
-      const lineByteLen = Buffer.byteLength(line, "utf8");
-      pos += lineByteLen + 1;
-
-      if (!line) continue;
-      const trimmed = line.trim();
+    for await (const line of readJsonlLines(stream, fromOffset)) {
+      if (!line.text) continue;
+      const trimmed = line.text.trim();
       if (!trimmed) continue;
 
       if (looksLikeSkippedType(trimmed)) continue;
@@ -413,7 +401,7 @@ export async function* readClaudeTranscript(
       }
 
       for (const event of events) {
-        yield { event, offset: pos };
+        yield { event, offset: line.end };
       }
     }
   } catch (err) {
@@ -421,7 +409,6 @@ export async function* readClaudeTranscript(
     const e = err as NodeJS.ErrnoException;
     if (e?.code !== "ENOENT") throw err;
   } finally {
-    rl.close();
     stream.destroy();
   }
 }

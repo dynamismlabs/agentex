@@ -28,10 +28,10 @@ import { createReadStream } from "node:fs";
 import { readdir, stat, open as fsOpen } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import * as readline from "node:readline";
 
 import { getDefaultRuntimeHome, getRuntimeHomeEnvVar } from "../../utils/runtime-homes.js";
 import type { FoundTranscript, TranscriptOps } from "../../types.js";
+import { readJsonlLines } from "../../utils/jsonl-lines.js";
 
 /** Bytes scanned from the tail of the file in {@link peekCodexTranscript}. */
 const PEEK_TAIL_BYTES = 16 * 1024;
@@ -316,16 +316,11 @@ export async function* readCodexTranscript(
 
   const stream = createReadStream(filePath, { start: fromOffset, encoding: undefined });
   stream.on("error", () => {});
-  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
 
   const fileIdentity = rolloutIdentityFromPath(filePath);
-  let pos = fromOffset;
   try {
-    for await (const line of rl) {
-      const lineStart = pos;
-      pos += Buffer.byteLength(line, "utf8") + 1;
-
-      const trimmed = line.trim();
+    for await (const line of readJsonlLines(stream, fromOffset)) {
+      const trimmed = line.text.trim();
       if (!trimmed) continue;
 
       const parsed = parseCodexLine(trimmed);
@@ -334,15 +329,14 @@ export async function* readCodexTranscript(
       // Replay-stable synthetic identity: (rollout identity, line start offset).
       // Codex emits no native per-event uuid, so this is the idempotency key
       // hosts use to dedup transcript replays. Deterministic across reads.
-      parsed.eventId = `codex:${fileIdentity}:${lineStart}`;
+      parsed.eventId = `codex:${fileIdentity}:${line.start}`;
 
-      yield { event: parsed, offset: pos };
+      yield { event: parsed, offset: line.end };
     }
   } catch (err) {
     const e = err as NodeJS.ErrnoException;
     if (e?.code !== "ENOENT") throw err;
   } finally {
-    rl.close();
     stream.destroy();
   }
 }

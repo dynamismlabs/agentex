@@ -112,6 +112,18 @@ describe("attachClaudeSession — lastTurn classification", () => {
     expect(att.lastTurn).toBe("interrupted");
   });
 
+  it("reads a result whose text contains U+2028, which JSON.stringify writes raw", async () => {
+    const result = JSON.stringify({
+      type: "result", subtype: "success", session_id: SID, result: "copied\u2028text", is_error: false, uuid: "u-result",
+    });
+    expect(result).toContain("\u2028");
+    await writeTranscript([initLine(), assistantLine(), result]);
+    const att = await attach(record());
+    expect(att.lastTurn).toBe("completed");
+    const events = await collect(att.catchUp());
+    expect(events.map((e) => e.event.type)).toEqual(["system", "assistant", "result"]);
+  });
+
   it("interrupted when the transcript ends without a result", async () => {
     await writeTranscript([initLine(), assistantLine()]);
     const att = await attach(record());

@@ -1,6 +1,5 @@
 import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
-import * as readline from "node:readline";
 import type {
   AttachOptions,
   CatchUpOptions,
@@ -16,6 +15,7 @@ import {
   createSessionRecord,
   MalformedSessionRecordError,
 } from "../../sessions/record.js";
+import { readJsonlLines } from "../../utils/jsonl-lines.js";
 import { getRuntimeHomeEnvVar } from "../../utils/runtime-homes.js";
 import { claudeSessionCodec } from "./codec.js";
 import {
@@ -86,16 +86,15 @@ const EMPTY: AsyncIterable<CatchUpYield> = {
  * preceding completed one.
  */
 async function classifyLastTurn(filePath: string): Promise<LastTurnStatus> {
-  const stream = createReadStream(filePath, { encoding: "utf8" });
+  const stream = createReadStream(filePath);
   stream.on("error", () => {});
-  const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
   let lastTurn: LastTurnStatus = "unknown";
 
   try {
-    for await (const line of lines) {
+    for await (const line of readJsonlLines(stream)) {
       let raw: unknown;
       try {
-        raw = JSON.parse(line);
+        raw = JSON.parse(line.text);
       } catch {
         continue;
       }
@@ -109,7 +108,6 @@ async function classifyLastTurn(filePath: string): Promise<LastTurnStatus> {
     if (fsError?.code !== "ENOENT") throw error;
     return "unknown";
   } finally {
-    lines.close();
     stream.destroy();
   }
 
