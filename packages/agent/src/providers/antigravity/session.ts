@@ -38,7 +38,8 @@ import { AGY_SIGN_IN_MESSAGE, buildAgyArgs, findAgyBinary, readAgyResumeId } fro
 interface ActiveTurn {
   turnId: string;
   abort: AbortController;
-  done: Promise<TurnResult>;
+  /** Set once the turn starts; a turn_start handler can interrupt before that. */
+  done: Promise<TurnResult> | null;
 }
 
 /**
@@ -74,8 +75,20 @@ class AntigravitySession implements AgentSession {
   /** Events received from agy processes, to tell whether one saw a message. */
   private connectionEvents = 0;
   private draining = false;
-  /** Instructions go into the first message of a conversation this session starts. */
-  private pendingInstructions: string | null;
+  /**
+   * agy has no system-prompt flag, so instructions ride on the first message
+   * each process accepts, like a per-process system prompt. They stay pending
+   * until agy acknowledges a message that carried them, so a failed start or
+   * sign-in never drops them, and a resume agy could not honor (a new
+   * conversation) still gets them.
+   */
+  private readonly instructions: string | null;
+  /** Conversations this session saw agy accept the instructions into. */
+  private readonly instructedConversations = new Set<string>();
+  /** The current process accepted a message that carried the instructions. */
+  private connectionInstructed = false;
+  /** The conversation the current process was started to resume, if any. */
+  private connectionResumeId: string | null = null;
   private readonly cwd: string;
   private readonly goals: GoalController;
 
@@ -86,7 +99,7 @@ class AntigravitySession implements AgentSession {
   ) {
     this.cwd = ctx.cwd ?? process.cwd();
     this.conversationId = readAgyResumeId(ctx.sessionParams, this.cwd);
-    this.pendingInstructions = this.conversationId ? null : instructions;
+    this.instructions = instructions;
     this.goals = new GoalController({
       providerType: ANTIGRAVITY_PROVIDER_TYPE,
       capability: EMULATED_GOAL_CAPABILITY,
@@ -118,12 +131,14 @@ class AntigravitySession implements AgentSession {
     const uuid = uuidv7();
     const turnId = uuidv7();
     const abort = new AbortController();
-    const text = this.pendingInstructions ? `${this.pendingInstructions}\n\n${message}` : message;
-    this.pendingInstructions = null;
 
     this._state = "thinking";
-    const done = this.runTurn(text, turnId, abort, options);
-    this.active = { turnId, abort, done };
+    // Registered before the turn runs, so interrupt() can reach it from inside
+    // a turn_start handler.
+    const active: ActiveTurn = { turnId, abort, done: null };
+    this.active = active;
+    const done = this.runTurn(message, turnId, abort, options);
+    active.done = done;
     void done.then((result) => this.goals.onTurnSettled(result)).catch(() => undefined);
     return { uuid, result: done };
   }
@@ -133,6 +148,8 @@ class AntigravitySession implements AgentSession {
     const config = this.ctx.config ?? {};
     // A replacement process picks the conversation back up where it stopped.
     this.conversationId = this.sessionId;
+    this.connectionResumeId = this.conversationId;
+    this.connectionInstructed = false;
     const parser = new AgyStreamParser({
       includePartialMessages: config.includePartialMessages,
       conversationId: this.conversationId,
@@ -162,18 +179,21 @@ class AntigravitySession implements AgentSession {
   }
 
   private async runTurn(
-    text: string,
+    message: string,
     turnId: string,
     abort: AbortController,
     options?: SendOptions,
   ): Promise<TurnResult> {
-    await this.emitTurnEdge({ type: "turn_start", turnId, trigger: "send" });
-
+    // Arm every stop before the first await: an interrupt that lands while
+    // turn_start handlers run must still stop the turn.
     const timeoutSec = options?.timeoutSec ?? this.ctx.config?.timeoutSec;
     const graceSec = this.ctx.config?.graceSec;
     let timer: ReturnType<typeof setTimeout> | null = null;
     const guards: Promise<"timeout" | "aborted">[] = [
-      new Promise((resolve) => abort.signal.addEventListener("abort", () => resolve("aborted"), { once: true })),
+      new Promise((resolve) => {
+        if (abort.signal.aborted) resolve("aborted");
+        else abort.signal.addEventListener("abort", () => resolve("aborted"), { once: true });
+      }),
     ];
     if (timeoutSec && timeoutSec > 0) {
       guards.push(new Promise((resolve) => { timer = setTimeout(() => resolve("timeout"), timeoutSec * 1000); }));
@@ -184,15 +204,30 @@ class AntigravitySession implements AgentSession {
       else options.signal.addEventListener("abort", onSendAbort, { once: true });
     }
 
-    let connection = this.ensureConnection();
+    let connection: AgyConnection | null = null;
     try {
+      await this.emitTurnEdge({ type: "turn_start", turnId, trigger: "send" });
+      if (abort.signal.aborted) {
+        // Stopped before agy saw anything: nothing to interrupt, nothing spawned.
+        await this.emitTurnEdge({ type: "turn_end", turnId, trigger: "send", reason: "cancelled" });
+        return { summary: null, costUsd: null, status: "aborted", errorCode: "aborted", errorMessage: "Turn aborted" };
+      }
+
+      connection = this.ensureConnection();
       let result: TurnResult | null = null;
       let reason: "result" | "cancelled" | "session_closed" = "result";
       for (let attempt = 0; result === null; attempt++) {
         const eventsBefore = this.connectionEvents;
+        const carriesInstructions = this.needsInstructions();
         const pending = connection.nextTurn();
-        connection.write(text);
+        connection.write(carriesInstructions ? `${this.instructions}\n\n${message}` : message);
         const first = await Promise.race([pending, ...guards]);
+        // Any event from agy means it accepted the message, instructions included.
+        if (carriesInstructions && this.connectionEvents > eventsBefore) {
+          this.connectionInstructed = true;
+          const conversation = this.parser?.conversationId;
+          if (conversation) this.instructedConversations.add(conversation);
+        }
         if (first === "timeout" || first === "aborted") {
           const outcome = await interruptAgyTurn(connection, pending, graceSec);
           // agy may report INTERRUPTED and then exit. Learn which before the
@@ -230,9 +265,15 @@ class AntigravitySession implements AgentSession {
       if (timer) clearTimeout(timer);
       options?.signal?.removeEventListener("abort", onSendAbort);
       this.active = null;
-      if (!connection.alive && this.connection === connection) this.connection = null;
+      if (connection && !connection.alive && this.connection === connection) this.connection = null;
       if (this._state !== "closed") this._state = "idle";
     }
+  }
+
+  /** The next message must carry the instructions (see `instructions`). */
+  private needsInstructions(): boolean {
+    if (!this.instructions || this.connectionInstructed) return false;
+    return !(this.connectionResumeId && this.instructedConversations.has(this.connectionResumeId));
   }
 
   private usageOf(outcome: AgyTurnOutcome | null): { usage?: TurnResult["usage"] } {
@@ -335,12 +376,12 @@ class AntigravitySession implements AgentSession {
     const active = this.active;
     if (!active) return;
     active.abort.abort();
-    await active.done.catch(() => undefined);
+    await active.done?.catch(() => undefined);
   }
 
   async drain(): Promise<void> {
     this.draining = true;
-    if (this.active) await this.active.done.catch(() => undefined);
+    await this.active?.done?.catch(() => undefined);
     await this.close();
   }
 
@@ -350,7 +391,7 @@ class AntigravitySession implements AgentSession {
     const active = this.active;
     if (active) {
       active.abort.abort();
-      await active.done.catch(() => undefined);
+      await active.done?.catch(() => undefined);
     }
     const connection = this.connection;
     this.connection = null;

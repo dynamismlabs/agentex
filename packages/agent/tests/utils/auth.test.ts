@@ -105,19 +105,30 @@ describe("detectAuth", () => {
       process.env.HOME = originalHome;
     });
 
-    it("bills a signed-in Google account as a subscription, even with GEMINI_API_KEY set", async () => {
-      process.env.HOME = await fs.mkdtemp(path.join(os.tmpdir(), "agentex-agy-home-"));
-      expect(detectAuth("antigravity", {}).method).toBe("subscription");
-      expect(detectAuth("antigravity", { GEMINI_API_KEY: "gem-123" }).method).toBe("subscription");
-    });
-
-    it("bills the Gemini API when settings.json selects it and the key is set", async () => {
+    async function homeWithGeminiProvider(): Promise<string> {
       const home = await fs.mkdtemp(path.join(os.tmpdir(), "agentex-agy-home-"));
       await fs.mkdir(path.join(home, ".gemini", "antigravity-cli"), { recursive: true });
       await fs.writeFile(path.join(home, ".gemini", "antigravity-cli", "settings.json"), JSON.stringify({ modelProvider: "gemini" }));
-      process.env.HOME = home;
-      expect(detectAuth("antigravity", { GEMINI_API_KEY: "gem-123" })).toMatchObject({ method: "api_key", billingType: "api" });
-      expect(detectAuth("antigravity", {}).method).toBe("subscription");
+      return home;
+    }
+
+    it("bills a signed-in Google account as a subscription, even with GEMINI_API_KEY set", async () => {
+      const HOME = await fs.mkdtemp(path.join(os.tmpdir(), "agentex-agy-home-"));
+      expect(detectAuth("antigravity", { HOME }).method).toBe("subscription");
+      expect(detectAuth("antigravity", { HOME, GEMINI_API_KEY: "gem-123" }).method).toBe("subscription");
+    });
+
+    it("bills the Gemini API when settings.json selects it and the key is set", async () => {
+      const HOME = await homeWithGeminiProvider();
+      expect(detectAuth("antigravity", { HOME, GEMINI_API_KEY: "gem-123" })).toMatchObject({ method: "api_key", billingType: "api" });
+      expect(detectAuth("antigravity", { HOME }).method).toBe("subscription");
+    });
+
+    it("reads settings from the child's HOME, not the host process's", async () => {
+      process.env.HOME = await fs.mkdtemp(path.join(os.tmpdir(), "agentex-agy-host-"));
+      const HOME = await homeWithGeminiProvider();
+      expect(detectAuth("antigravity", { HOME, GEMINI_API_KEY: "gem-123" }).method).toBe("api_key");
+      expect(detectAuth("antigravity", { GEMINI_API_KEY: "gem-123", HOME: process.env.HOME }).method).toBe("subscription");
     });
   });
 
@@ -345,6 +356,19 @@ describe("resolveAuthForProvider", () => {
       const after = await resolveAuthForProvider("antigravity", { command: mockAgy, env, fresh: true });
       expect(after.options.find((option) => option.method === "api_key")?.present).toBe(true);
       expect(after.options.find((option) => option.method === "subscription")?.present).toBe(false);
+    });
+
+    it("reads settings from the HOME the caller gives agy", async () => {
+      process.env.HOME = tmpHome;
+      const childHome = path.join(tmpHome, "child-home");
+      await fs.mkdir(path.join(childHome, ".gemini", "antigravity-cli"), { recursive: true });
+      await fs.writeFile(path.join(childHome, ".gemini", "antigravity-cli", "settings.json"), JSON.stringify({ modelProvider: "gemini" }));
+      const report = await resolveAuthForProvider("antigravity", {
+        command: mockAgy,
+        env: { HOME: childHome, GEMINI_API_KEY: "gem-123" },
+        fresh: true,
+      });
+      expect(report.options.find((option) => option.method === "api_key")?.present).toBe(true);
     });
 
     it("reports a missing binary without auth options present", async () => {

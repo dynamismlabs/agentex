@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.0.41 — Antigravity review fixes
+
+Five fixes from a review of the 0.0.39 Antigravity provider.
+
+### Fixed
+
+- **An interrupt during `turn_start` was lost.** The stop listener was attached only after `turn_start` handlers finished, so `interrupt()`, a send signal, or a timeout that fired while an async handler ran let the turn run to completion. The turn was also registered too late for a handler's own `interrupt()` to find it. Every stop is now armed before the first await. A turn stopped that early returns `aborted` without spawning `agy`.
+- **Instructions could be lost.**
+  - A session or run resuming a conversation `agy` could no longer find started a new conversation without them.
+  - A session consumed them before its first turn succeeded, so a failed sign-in or start dropped them.
+  - `instructionsFile` now rides on the first message each `agy` process accepts, like a per-process system prompt (agy has no system-prompt flag). That includes resumes and every `execute()`. It stays pending until `agy` acknowledges a message that carried it. A session that respawns `agy` on a conversation it already briefed does not repeat it.
+- **Auth checked the wrong home.** `resolveAuthForProvider("antigravity")` and `detectAuth("antigravity", env)` read `settings.json` from the host process's home. They now read it from the `HOME` (`USERPROFILE` on Windows) in the environment agy runs with, so a host that gives agy its own home no longer reports API-key billing as a subscription.
+- **A stop after the answer reported success.** If `execute()`'s timeout or abort fired after agy answered but while it was still finishing background work, the process was stopped but the run reported `completed`. It now reports `timeout` or `aborted` and keeps the answer, usage, and session.
+- **Plan mode and permissions disagreed.** `modeId: "plan"` or `mode: "plan"` together with `skipPermissions` passed `--dangerously-skip-permissions`, while `planMode: true` did not. Plan mode now suppresses it however it is requested.
+
+### Changed
+
+- The `default` mode's description now says what it does. agy's `--mode` accepts only `accept-edits` and `plan` (1.2.15 warns `unrecognized --mode value "default"`), so `default` passes no flag and uses the `agentMode` saved in agy's settings.json.
+
 ## 0.0.40 — Codex local history reads current rollouts
 
 Codex 0.142 and later write paginated rollouts (`session_meta.history_mode: "paginated"`), which never contain the `event_msg` `user_message` that discovery used to find the person's messages. Every current rollout looked like it had no user message, so `localHistory.discover()` returned nothing: 0 sessions on a machine with 154 real ones. Checked against 561 real rollouts from Codex 0.142 to 0.159 and against the upstream persistence policy.

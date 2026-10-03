@@ -72,8 +72,10 @@ export async function executeAntigravityProvider(ctx: ExecutionContext): Promise
   const resumeId = readAgyResumeId(ctx.sessionParams, cwd);
 
   ctx.onLifecycle?.({ phase: "preparing", step: "instructions" });
-  // A resumed conversation already carries its instructions.
-  const instructions = resumeId ? null : await resolveInstructions(config.instructionsFile);
+  // agy has no system-prompt flag, so instructions ride on the message, once
+  // per process like a system prompt. Sending them on resumes too means a
+  // conversation agy could not find (it starts a new one) never loses them.
+  const instructions = await resolveInstructions(config.instructionsFile);
   const prompt = instructions ? `${instructions}\n\n${ctx.prompt}` : ctx.prompt;
 
   if (config.skillDirs && config.skillDirs.length > 0) {
@@ -143,7 +145,12 @@ export async function executeAntigravityProvider(ctx: ExecutionContext): Promise
     outcome = first;
     if (!outcome.exited) {
       const ended = await Promise.race([connection.exited().then(() => "exited" as const), ...guards]);
-      if (ended !== "exited") await connection.terminate(config.graceSec, 0);
+      if (ended !== "exited") {
+        // The answer arrived, but agy was still finishing background work when
+        // the run was stopped. Report the stop; keep the answer.
+        stopped = ended;
+        await connection.terminate(config.graceSec, 0);
+      }
     }
   }
   if (timer) clearTimeout(timer);

@@ -121,6 +121,20 @@ describe("agy argument helpers", () => {
     expect(resolveAgyMode({ planMode: true, modeId: "accept-edits" })).toBe("plan");
   });
 
+  it("never pairs plan mode with skipped permissions, however plan was requested", () => {
+    for (const config of [{ planMode: true }, { modeId: "plan" }, { mode: "plan" }]) {
+      const args = buildAgyArgs({ ...config, skipPermissions: true }, { resumeId: null, model: null });
+      expect(args).toEqual(expect.arrayContaining(["--mode", "plan"]));
+      expect(args).not.toContain("--dangerously-skip-permissions");
+    }
+    expect(buildAgyArgs({ modeId: "accept-edits", skipPermissions: true }, { resumeId: null, model: null }))
+      .toContain("--dangerously-skip-permissions");
+  });
+
+  it("passes no --mode for default, which agy rejects as a flag value", () => {
+    expect(buildAgyArgs({ modeId: "default" }, { resumeId: null, model: null })).not.toContain("--mode");
+  });
+
   it("builds stream-json args with resume", () => {
     expect(buildAgyArgs({}, { resumeId: "c1", model: null })).toEqual([
       "--input-format", "stream-json", "--output-format", "stream-json", "--conversation", "c1",

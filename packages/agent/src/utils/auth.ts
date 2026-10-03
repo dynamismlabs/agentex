@@ -96,7 +96,7 @@ export function detectAuth(providerType: string, env: Record<string, string>): R
       return { method: "subscription", billingType: "subscription" };
     }
     case "antigravity": {
-      if (hasEnv(env, "GEMINI_API_KEY") && readAgyModelProvider() === "gemini") {
+      if (hasEnv(env, "GEMINI_API_KEY") && readAgyModelProvider(env) === "gemini") {
         return { method: "api_key", billingType: "api" };
       }
       return { method: "subscription", billingType: "subscription" };
@@ -448,19 +448,20 @@ async function resolveGeminiAuth(ctx?: AuthResolveContext): Promise<AuthReport> 
 // API (`"modelProvider": "gemini"`); the CLI ignores the variable otherwise.
 // ---------------------------------------------------------------------------
 
-/** Home directory as agy (a Go binary) resolves it: os.UserHomeDir semantics. */
-function agyHomeDir(): string {
-  const fromEnv = process.platform === "win32" ? process.env["USERPROFILE"] : process.env["HOME"];
+/**
+ * Home directory as the spawned agy (a Go binary) resolves it: os.UserHomeDir
+ * semantics against the child's environment, so a host that gives agy its own
+ * HOME reads that home's settings.
+ */
+function agyHomeDir(env: Record<string, string | undefined>): string {
+  const fromEnv = process.platform === "win32" ? env["USERPROFILE"] : env["HOME"];
   return fromEnv && fromEnv.trim() ? fromEnv : os.homedir();
 }
 
-function agySettingsPath(): string {
-  return path.join(agyHomeDir(), ".gemini", "antigravity-cli", "settings.json");
-}
-
-function readAgyModelProvider(): string | null {
+function readAgyModelProvider(env: Record<string, string | undefined>): string | null {
   try {
-    const settings = JSON.parse(readFileSync(agySettingsPath(), "utf-8")) as Record<string, unknown>;
+    const settingsPath = path.join(agyHomeDir(env), ".gemini", "antigravity-cli", "settings.json");
+    const settings = JSON.parse(readFileSync(settingsPath, "utf-8")) as Record<string, unknown>;
     return typeof settings["modelProvider"] === "string" ? settings["modelProvider"] : null;
   } catch {
     return null;
@@ -470,7 +471,7 @@ function readAgyModelProvider(): string | null {
 async function resolveAntigravityAuth(ctx?: AuthResolveContext): Promise<AuthReport> {
   const env = buildEnv(ctx?.env);
   const binary = await checkBinary("agy", ctx?.command, env);
-  const apiKeyProvider = readAgyModelProvider() === "gemini";
+  const apiKeyProvider = readAgyModelProvider(env) === "gemini";
   let signedIn = false;
   let usedCli = false;
   if (binary.installed && binary.resolvedPath) {

@@ -12,12 +12,14 @@ export function findAgyBinary(ctx: ProviderRuntimeContext = {}): Promise<Resolve
 }
 
 /**
- * The CLI's execution modes (`--mode`). `default` is request-review: file
- * edits wait for approval, which headless runs settle by policy. Shell
+ * The CLI's execution modes. `--mode` accepts only `accept-edits` and `plan`
+ * (agy 1.2.15 warns "unrecognized --mode value" for anything else), so
+ * `default` passes no flag and agy uses the `agentMode` saved in its
+ * settings.json, which is request-review unless the user changed it. Shell
  * commands follow the permission rules in every mode.
  */
 export const ANTIGRAVITY_MODES: AgentMode[] = [
-  { id: "default", name: "Default", description: "Review file edits before they are applied" },
+  { id: "default", name: "Default", description: "agy's saved default mode (reviews file edits unless changed in its settings)" },
   { id: "accept-edits", name: "Accept edits", description: "Apply file edits without asking" },
   { id: "plan", name: "Plan", description: "Investigate read-only and propose a plan before editing" },
 ];
@@ -43,7 +45,8 @@ export function buildAgyArgs(config: ProviderConfig, options: { resumeId: string
   const mode = resolveAgyMode(config);
   if (mode) args.push("--mode", mode);
   // Plan mode is the more conservative intent and wins over skipPermissions.
-  if (config.skipPermissions && !config.planMode) args.push("--dangerously-skip-permissions");
+  // However it was requested (planMode, modeId, or mode).
+  if (config.skipPermissions && mode !== "plan") args.push("--dangerously-skip-permissions");
   if (config.sandbox) args.push("--sandbox");
   if (config.extraArgs) args.push(...config.extraArgs);
   return args;

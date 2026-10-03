@@ -189,18 +189,102 @@ describe("Antigravity session", () => {
     await session.close();
   });
 
-  it("sends the instructions file with the first message of a new conversation only", async () => {
-    const dir = await tempDir();
+  async function brief(dir: string): Promise<string> {
     const instructionsFile = path.join(dir, "brief.md");
     await writeFile(instructionsFile, "Be terse.");
+    return instructionsFile;
+  }
+
+  it("sends the instructions with the first message each process accepts, once", async () => {
+    const dir = await tempDir();
+    const instructionsFile = await brief(dir);
     const { session } = await open({}, { cwd: dir, config: { instructionsFile } });
     expect((await sendAndWait(session, "one")).summary).toBe("echo: Be terse.\n\none");
     expect((await sendAndWait(session, "two")).summary).toBe("echo: two");
     await session.close();
 
+    // A new session on a saved conversation is a new process, like a system
+    // prompt re-applied on resume.
     const resumed = await open({}, { cwd: dir, config: { instructionsFile }, sessionParams: { sessionId: "conv-1", cwd: dir } });
-    expect((await sendAndWait(resumed.session, "three")).summary).toBe("echo: three");
+    expect((await sendAndWait(resumed.session, "three")).summary).toBe("echo: Be terse.\n\nthree");
+    expect((await sendAndWait(resumed.session, "four")).summary).toBe("echo: four");
     await resumed.session.close();
+  });
+
+  it("delivers the instructions when the saved conversation no longer exists", async () => {
+    const dir = await tempDir();
+    const instructionsFile = await brief(dir);
+    const { session } = await open({}, { cwd: dir, config: { instructionsFile }, sessionParams: { sessionId: "missing", cwd: dir } });
+    expect((await sendAndWait(session, "one")).summary).toBe("echo: Be terse.\n\none");
+    expect(session.sessionId).not.toBe("missing");
+    await session.close();
+  });
+
+  it("keeps the instructions for the next send when sign-in fails", async () => {
+    const dir = await tempDir();
+    const instructionsFile = await brief(dir);
+    const { session } = await open(
+      { MOCK_AGY_BEHAVIOR: "auth-once", MOCK_AGY_STATE: path.join(dir, "state") },
+      { cwd: dir, config: { instructionsFile } },
+    );
+    expect(await sendAndWait(session, "one")).toMatchObject({ status: "failed", errorCode: "auth_required" });
+    expect((await sendAndWait(session, "two")).summary).toBe("echo: Be terse.\n\ntwo");
+    await session.close();
+  });
+
+  it("does not resend the instructions to a conversation it already delivered them to", async () => {
+    const dir = await tempDir();
+    const instructionsFile = await brief(dir);
+    const argsFile = path.join(dir, "args.jsonl");
+    const { session } = await open(
+      { MOCK_AGY_BEHAVIOR: "interrupt-exit-once", MOCK_AGY_DELAY_MS: "30000", MOCK_AGY_STATE: path.join(dir, "state"), MOCK_DUMP_ARGS_TO: argsFile },
+      { cwd: dir, config: { instructionsFile } },
+    );
+    const handle = await session.send("one");
+    setTimeout(() => void session.interrupt(), 200);
+    expect((await handle.result).status).toBe("aborted");
+    // The interrupt ended the process; the next send resumes the conversation.
+    expect((await sendAndWait(session, "two")).summary).toBe("echo: two");
+    const spawns = await readJsonLines<string[]>(argsFile);
+    expect(spawns).toHaveLength(2);
+    expect(spawns[1]).toEqual(expect.arrayContaining(["--conversation", session.sessionId!]));
+    await session.close();
+  });
+
+  it("stops a turn interrupted while turn_start handlers run, before agy starts", async () => {
+    const dir = await tempDir();
+    const argsFile = path.join(dir, "args.jsonl");
+    const session = await createAntigravitySession({
+      cwd: dir,
+      env: { MOCK_DUMP_ARGS_TO: argsFile },
+      config: { command: MOCK_AGY },
+      onEvent: async (event) => {
+        if (event.type === "turn_start") await new Promise((resolve) => setTimeout(resolve, 100));
+      },
+    });
+    const handle = await session.send("one");
+    await session.interrupt();
+    expect(await handle.result).toMatchObject({ status: "aborted", errorCode: "aborted" });
+    await expect(readFile(argsFile, "utf8")).rejects.toThrow(/ENOENT/);
+    expect((await sendAndWait(session, "two")).summary).toBe("echo: two");
+    await session.close();
+  });
+
+  it("stops a turn interrupted from inside its own turn_start handler", async () => {
+    const dir = await tempDir();
+    const argsFile = path.join(dir, "args.jsonl");
+    let session: AgentSession | null = null;
+    session = await createAntigravitySession({
+      cwd: dir,
+      env: { MOCK_DUMP_ARGS_TO: argsFile },
+      config: { command: MOCK_AGY },
+      onEvent: (event) => {
+        if (event.type === "turn_start") void session!.interrupt();
+      },
+    });
+    expect(await sendAndWait(session, "one")).toMatchObject({ status: "aborted" });
+    await expect(readFile(argsFile, "utf8")).rejects.toThrow(/ENOENT/);
+    await session.close();
   });
 
   it("tracks tool execution state from stream events", async () => {

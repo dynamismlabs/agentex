@@ -6,7 +6,11 @@
 //
 // MOCK_AGY_BEHAVIOR: success (default) | tool | thinking | error | denied |
 //   auth | slow | crash | interrupt-exit | waiting | silent-exit |
-//   silent-exit-once (with MOCK_AGY_STATE: a file counting spawns)
+//   silent-exit-once | auth-once | interrupt-exit-once
+//   (the *-once behaviors need MOCK_AGY_STATE: a file counting spawns, and
+//   behave normally from the second spawn on)
+// MOCK_AGY_LINGER_MS: after stdin closes and the last turn ends, keep running
+//   this long, like agy finishing background tasks
 // MOCK_AGY_DELAY_MS: per-turn delay for `slow` (default 10000)
 // MOCK_AGY_AUTH=missing: `models` reports no sign-in
 // MOCK_AGY_HELP=old: `--help` without stream-json input support
@@ -73,9 +77,15 @@ if (flag("--input-format") !== "stream-json" || flag("--output-format") !== "str
 }
 
 const write = (event) => process.stdout.write(`${JSON.stringify(event)}\n`);
+
+// Spawn number (0-based) for the *-once behaviors.
+const stateFile = process.env.MOCK_AGY_STATE;
+const spawnIndex = stateFile && fs.existsSync(stateFile) ? Number(fs.readFileSync(stateFile, "utf8")) : 0;
+if (stateFile && behavior !== "silent-exit-once") fs.writeFileSync(stateFile, String(spawnIndex + 1));
+const once = (name) => behavior === name && spawnIndex === 0;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-if (behavior === "auth") {
+if (behavior === "auth" || once("auth-once")) {
   process.stderr.write("Authentication required. Please visit the URL to log in:\n");
   process.stderr.write("  https://accounts.google.com/o/oauth2/auth?client_id=mock\n\n");
   process.stderr.write("Waiting for authentication (timeout 60s)...\nOr, paste the authorization code here and press Enter:\n");
@@ -106,7 +116,7 @@ function run() {
   process.on("SIGINT", () => {
     if (!inTurn) process.exit(130);
     write({ event: "result", result: { conversation_id: conversationId, status: "INTERRUPTED", response: "", duration_seconds: duration, num_turns: turns, usage } });
-    if (behavior === "interrupt-exit") process.exit(130);
+    if (behavior === "interrupt-exit" || once("interrupt-exit-once")) process.exit(130);
     inTurn = false;
   });
 
@@ -143,7 +153,7 @@ function run() {
       process.stderr.write("panic: mock crash\n");
       process.exit(2);
     }
-    if (behavior === "slow" || behavior === "interrupt-exit") {
+    if (behavior === "slow" || behavior === "interrupt-exit" || once("interrupt-exit-once")) {
       await sleep(Number(process.env.MOCK_AGY_DELAY_MS ?? 10_000));
       if (!inTurn) return;
     }
@@ -215,6 +225,7 @@ function run() {
     }
   });
   process.stdin.on("end", () => {
-    queue.then(() => process.exit(0));
+    const linger = Number(process.env.MOCK_AGY_LINGER_MS ?? 0);
+    queue.then(() => setTimeout(() => process.exit(0), linger));
   });
 }

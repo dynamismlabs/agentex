@@ -133,14 +133,23 @@ describe("executeAntigravityProvider", () => {
     expect(result.clearSession).toBe(true);
   });
 
-  it("prepends the instructions file to a fresh conversation only", async () => {
+  it("sends the instructions file with every run, like a per-process system prompt", async () => {
     const dir = await tempDir();
     const instructionsFile = path.join(dir, "brief.md");
     await writeFile(instructionsFile, "Always answer in haiku.");
     const fresh = await run({ cwd: dir, config: { instructionsFile } });
     expect(fresh.result.summary).toBe("echo: Always answer in haiku.\n\nhello");
     const resumed = await run({ cwd: dir, config: { instructionsFile }, sessionParams: { sessionId: "conv-9", cwd: dir } });
-    expect(resumed.result.summary).toBe("echo: hello");
+    expect(resumed.result.summary).toBe("echo: Always answer in haiku.\n\nhello");
+  });
+
+  it("keeps the instructions when the saved conversation no longer exists", async () => {
+    const dir = await tempDir();
+    const instructionsFile = path.join(dir, "brief.md");
+    await writeFile(instructionsFile, "Always answer in haiku.");
+    const { result } = await run({ cwd: dir, config: { instructionsFile }, sessionParams: { sessionId: "missing", cwd: dir } });
+    expect(result.clearSession).toBe(true);
+    expect(result.summary).toBe("echo: Always answer in haiku.\n\nhello");
   });
 
   it("maps tool steps to correlated tool_call / tool_result events", async () => {
@@ -202,6 +211,22 @@ describe("executeAntigravityProvider", () => {
     expect(Date.now() - started).toBeLessThan(10_000);
     expect(result.status).toBe("timeout");
     expect(result.errorCode).toBe("timeout");
+    const pid = Number(await readFile(pidFile, "utf8"));
+    expect(() => process.kill(pid, 0)).toThrow();
+  });
+
+  it("reports a timeout that fires after the answer while agy finishes background work", async () => {
+    const dir = await tempDir();
+    const pidFile = path.join(dir, "pid");
+    const started = Date.now();
+    const { result } = await run({
+      cwd: dir,
+      env: { MOCK_AGY_LINGER_MS: "30000", MOCK_PID_FILE: pidFile },
+      config: { timeoutSec: 1 },
+    });
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(result).toMatchObject({ status: "timeout", errorCode: "timeout", summary: "echo: hello" });
+    expect(result.usage).toBeDefined();
     const pid = Number(await readFile(pidFile, "utf8"));
     expect(() => process.kill(pid, 0)).toThrow();
   });
