@@ -1,15 +1,23 @@
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import { executeAntigravityProvider } from "../../../src/providers/antigravity/execute.js";
 import type { ExecutionContext, StreamEvent } from "../../../src/types.js";
 
 const MOCK_AGY = path.resolve(import.meta.dirname, "../../fixtures/mock-agy.sh");
 
+const tempDirs: string[] = [];
+
 async function tempDir(): Promise<string> {
-  return mkdtemp(path.join(tmpdir(), "agentex-agy-exec-"));
+  const dir = await mkdtemp(path.join(tmpdir(), "agentex-agy-exec-"));
+  tempDirs.push(dir);
+  return dir;
 }
+
+afterAll(async () => {
+  await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+});
 
 async function readJsonLines<T>(file: string): Promise<T[]> {
   return (await readFile(file, "utf8")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as T);
