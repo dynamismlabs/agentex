@@ -65,6 +65,25 @@ Providers fall into three tiers:
 
 Cursor sessions are exec-backed. Each `send()` starts one CLI process and promotes the returned Cursor session ID into `--resume` for the next turn. `probeCapabilities()` verifies the selected binary's model catalog and advertised modes. Each execution independently validates the supported stream-json acceptance marker before releasing output. Older Cursor CLIs report `upgrade_required` instead of silently advertising discovery features they do not expose.
 
+### Codex sessions: approvals and the sandbox
+
+A Codex session is one `codex app-server` process. That subcommand drops the interactive `--sandbox` and `--dangerously-bypass-approvals-and-sandbox` flags, so agentex sets the approval policy and sandbox through root `-c` overrides and again on `thread/start` / `thread/resume`:
+
+| Config | Approval policy | Sandbox |
+| ------ | --------------- | ------- |
+| `skipPermissions` | `never` | `danger-full-access` |
+| `planMode` (wins over `skipPermissions`) | Codex's default | `read-only` |
+| neither | Codex's default (`on-request`) | Codex's default (depends on the folder's trust) |
+
+Under `never` with full access, Codex approves MCP and ChatGPT app tool calls itself. With approvals on, it asks first, and agentex passes the question to `onUserInputRequest` as a tool permission:
+
+- `toolName` is `mcp__<server>__<tool>`, the name the model calls (`mcp__codex_apps__github_create_branch` for the GitHub app).
+- `toolUseId` is the call's item id, the same `toolCallId` its `tool_call` event carries. When the call can't be matched, it is a fresh `codex-mcp-approval-<uuid>`.
+- `title` is Codex's question (`Allow GitHub to run tool "create_branch"?`), `description` the parameters it shows (`Repository: acme/web · Branch name: fix/login`), and `input` the call's arguments.
+- `{ allow: true }` runs that one call. `{ allow: false }` declines it, and the call fails with "user rejected MCP tool call".
+
+An MCP server's own form or URL request goes to `onElicitation`, and is declined without one. MCP and app calls surface as `tool_call` / `tool_result` events under the same `mcp__<server>__<tool>` name.
+
 ### Antigravity (Google)
 
 Google moved personal accounts (Free, Google AI Pro, Google AI Ultra) from Gemini CLI to the [Antigravity CLI](https://antigravity.google/docs/cli/overview) on 2026-06-18. Signing in to Gemini CLI with one of those accounts now fails with "This client is no longer supported for Gemini Code Assist for individuals". Use the `antigravity` provider for them. The `gemini` provider still works with a paid API key or Gemini Code Assist Standard/Enterprise.
@@ -828,7 +847,7 @@ const executeRun = await claude.execute({
 | Provider | What we wire                                                         | Where the plan shows up                                                                                       |
 | -------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
 | `claude` | `--permission-mode plan` (CLI-native plan UX)                        | Agent calls the `ExitPlanMode` tool with the plan as a permission request. Host extracts via `parseExitPlanMode(req)` from `onUserInputRequest`. The plan is **not** in the persisted transcript — capture it live. |
-| `codex`  | `--sandbox read-only` **plus** an injected planning system preamble  | Plain text in the agent's final assistant message (i.e. `result.summary`). |
+| `codex`  | A `read-only` sandbox (`--sandbox read-only` for `execute()`, `sandbox_mode` and the thread's `sandbox` for sessions) **plus** an injected planning system preamble  | Plain text in the agent's final assistant message (i.e. `result.summary`). |
 | `antigravity` | `--mode plan` (CLI-native: read-only tools, then a plan)        | Plain text in the turn's response (`result.summary`). Headless runs proceed through plan review automatically. |
 
 The mechanism difference matters:
@@ -1203,8 +1222,8 @@ await cfg.cleanup();
 
 Sessions can surface three distinct user-input requests. Handle each via a `SessionContext` callback:
 
-- `onUserInputRequest` — tool permission requests (and interactive tools like Claude's `AskUserQuestion`). Use `parseAskUserQuestion(req)` to detect structured question payloads and return answers via `updatedInput`.
-- `onElicitation` — MCP servers asking the host to render a form or open a URL (`form` / `url` modes, with a JSON-Schema `requestedSchema`).
+- `onUserInputRequest` — tool permission requests (and interactive tools like Claude's `AskUserQuestion`). Use `parseAskUserQuestion(req)` to detect structured question payloads and return answers via `updatedInput`. Codex's MCP and app tool approvals arrive here too (see [Codex sessions](#codex-sessions-approvals-and-the-sandbox)).
+- `onElicitation` — MCP servers asking the host to render a form or open a URL (`form` / `url` modes, with a JSON-Schema `requestedSchema`). Claude and Codex sessions decline these when the host registers no handler.
 - `onHookCallback` — CLI requesting the host to run a registered hook.
 
 ## Custom Providers

@@ -81,6 +81,61 @@ function parseStringArray(value: unknown): string[] {
  * tells it to do — rendered no row for completions that reached it by the
  * reconcile path. Mirrors the Claude gate in `claude/parse.ts`.
  */
+/**
+ * The name an MCP tool call goes by: `mcp__<server>__<tool>`, the name the
+ * model calls it by and the shape Claude reports, so hosts render both alike.
+ * Codex's `tool` can be dotted (`github.create_branch` on the `codex_apps`
+ * server); the model sees `mcp__codex_apps__github_create_branch`.
+ */
+export function codexMcpToolName(server: string, tool: string | null): string {
+  const clean = (part: string) => part.replace(/[^A-Za-z0-9_-]/g, "_");
+  return tool ? `mcp__${clean(server)}__${clean(tool)}` : `mcp__${clean(server)}`;
+}
+
+function isMcpToolCallItem(itemType: string): boolean {
+  return itemType === "mcpToolCall" || itemType === "mcp_tool_call";
+}
+
+/** What an MCP tool call returned: its error, else its text content, else its structured content. */
+function mcpToolCallOutput(item: Record<string, unknown>): string {
+  const error = parseObject(item["error"]);
+  const message = asString(error["message"], "");
+  if (message) return message;
+  const result = parseObject(item["result"]);
+  const content = Array.isArray(result["content"]) ? result["content"] : [];
+  const text = content
+    .map((part) => {
+      const block = parseObject(part);
+      return block["type"] === "text" ? asString(block["text"], "") : JSON.stringify(part);
+    })
+    .filter(Boolean)
+    .join("\n");
+  if (text) return text;
+  const structured = result["structuredContent"] ?? result["structured_content"];
+  return structured === undefined || structured === null ? "" : JSON.stringify(structured);
+}
+
+function mcpToolCallEvent(
+  phase: "started" | "completed",
+  item: Record<string, unknown>,
+  itemId: string | null,
+  base: BaseStreamEventFields,
+): StreamEvent {
+  const name = codexMcpToolName(asString(item["server"], ""), asNullableString(item["tool"]));
+  if (phase === "started") {
+    return { type: "tool_call", toolCallId: itemId, name, input: item["arguments"] ?? {}, ...base };
+  }
+  return {
+    type: "tool_result",
+    toolCallId: itemId,
+    toolName: name,
+    content: mcpToolCallOutput(item),
+    isError: item["status"] === "failed" || Object.keys(parseObject(item["error"])).length > 0,
+    exitCode: null,
+    ...base,
+  };
+}
+
 export function codexBackgroundTaskReport(
   phase: "started" | "progress" | "completed",
   status: "pending" | "running" | "paused" | "completed" | "failed" | "stopped" | null,
@@ -402,6 +457,7 @@ function parseV2Notification(event: Record<string, unknown>): StreamEvent | Stre
           ...base,
         };
       }
+      if (isMcpToolCallItem(itemType)) return mcpToolCallEvent("started", item, itemId, base);
       // reasoning, agentMessage, userMessage — wait for item/completed.
       return null;
     }
@@ -432,6 +488,7 @@ function parseV2Notification(event: Record<string, unknown>): StreamEvent | Stre
         ...base,
       };
     }
+    if (isMcpToolCallItem(itemType)) return mcpToolCallEvent("completed", item, itemId, base);
     if (itemType === "agentMessage") {
       const directText = asString(item["text"], "");
       if (directText || directText === "") {
@@ -690,6 +747,7 @@ function parseNdjsonEvent(
         ...base,
       };
     }
+    if (isMcpToolCallItem(itemType)) return mcpToolCallEvent("started", item, itemId, base);
   }
 
   if (type === "item.completed") {
@@ -721,6 +779,7 @@ function parseNdjsonEvent(
         ...base,
       };
     }
+    if (isMcpToolCallItem(itemType)) return mcpToolCallEvent("completed", item, itemId, base);
     if (itemType === "agent_message") {
       const phase = asMessagePhase(item["phase"]);
       const directText = asString(item["text"], "");

@@ -4,6 +4,7 @@ import {
   parseCodexStreamLine,
   stripCodexRolloutNoise,
   isCodexAuthRequired,
+  codexMcpToolName,
 } from "../../../src/providers/codex/parse.js";
 import {
   CODEX_SUCCESS_OUTPUT,
@@ -733,5 +734,97 @@ describe("isCodexAuthRequired", () => {
 
   it("returns false for normal output", () => {
     expect(isCodexAuthRequired(CODEX_SUCCESS_OUTPUT, "")).toBe(false);
+  });
+});
+
+describe("MCP tool calls", () => {
+  // The app-server shape (codex 0.160 `McpToolCallThreadItem`), here a ChatGPT
+  // app call. These used to fall through as `unknown`, so hosts showed no tool
+  // row for any MCP or app call a Codex chat made.
+  const v2 = (method: "item/started" | "item/completed", item: Record<string, unknown>) =>
+    JSON.stringify({ method, params: { threadId: "thr-1", turnId: "turn-1", item } });
+  const call = {
+    type: "mcpToolCall",
+    id: "exec-1",
+    server: "codex_apps",
+    tool: "github.create_branch",
+    arguments: { repository_full_name: "acme/web", branch_name: "fix/login" },
+    readOnlyHint: false,
+  };
+
+  it("names the call the way the model sees it", () => {
+    expect(codexMcpToolName("codex_apps", "github.create_branch")).toBe("mcp__codex_apps__github_create_branch");
+    expect(codexMcpToolName("my-server", "lookup")).toBe("mcp__my-server__lookup");
+    expect(codexMcpToolName("codex_apps", null)).toBe("mcp__codex_apps");
+  });
+
+  it("emits a tool_call when the call starts", () => {
+    expect(parseCodexStreamLine(v2("item/started", { ...call, status: "inProgress" }))).toMatchObject({
+      type: "tool_call",
+      toolCallId: "exec-1",
+      name: "mcp__codex_apps__github_create_branch",
+      input: { repository_full_name: "acme/web", branch_name: "fix/login" },
+      sessionId: "thr-1",
+      turnId: "turn-1",
+    });
+  });
+
+  it("emits the text result when it completes", () => {
+    const event = parseCodexStreamLine(v2("item/completed", {
+      ...call,
+      status: "completed",
+      result: { content: [{ type: "text", text: "Created fix/login." }], structuredContent: { ref: "refs/heads/fix/login" } },
+    }));
+    expect(event).toMatchObject({
+      type: "tool_result",
+      toolCallId: "exec-1",
+      toolName: "mcp__codex_apps__github_create_branch",
+      content: "Created fix/login.",
+      isError: false,
+      exitCode: null,
+    });
+  });
+
+  it("falls back to structured content when there is no text", () => {
+    const event = parseCodexStreamLine(v2("item/completed", {
+      ...call,
+      status: "completed",
+      result: { content: [], structuredContent: { ref: "refs/heads/fix/login" } },
+    }));
+    expect(event).toMatchObject({ type: "tool_result", content: '{"ref":"refs/heads/fix/login"}', isError: false });
+  });
+
+  it("reports a declined call as an error with Codex's message", () => {
+    const event = parseCodexStreamLine(v2("item/completed", {
+      ...call,
+      status: "failed",
+      result: null,
+      error: { message: "user rejected MCP tool call" },
+    }));
+    expect(event).toMatchObject({ type: "tool_result", content: "user rejected MCP tool call", isError: true });
+  });
+
+  it("reports a failed call whose error is in the result content", () => {
+    const event = parseCodexStreamLine(v2("item/completed", {
+      ...call,
+      tool: "github.fetch_file",
+      status: "failed",
+      result: { content: [{ type: "text", text: "GitHub API error 404" }] },
+    }));
+    expect(event).toMatchObject({
+      toolName: "mcp__codex_apps__github_fetch_file",
+      content: "GitHub API error 404",
+      isError: true,
+    });
+  });
+
+  it("maps the exec format's snake_case items the same way", () => {
+    const item = { id: "item_3", type: "mcp_tool_call", server: "docs", tool: "search", arguments: { q: "x" } };
+    expect(parseCodexStreamLine(JSON.stringify({ type: "item.started", item: { ...item, status: "in_progress" } }), "thr-2"))
+      .toMatchObject({ type: "tool_call", toolCallId: "item_3", name: "mcp__docs__search", input: { q: "x" } });
+    expect(parseCodexStreamLine(JSON.stringify({
+      type: "item.completed",
+      item: { ...item, status: "completed", result: { content: [{ type: "text", text: "3 hits" }], structured_content: null } },
+    }), "thr-2")).toMatchObject({ type: "tool_result", toolCallId: "item_3", toolName: "mcp__docs__search", content: "3 hits", isError: false });
   });
 });

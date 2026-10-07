@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.0.42 — Codex approvals reach the host
+
+Codex sessions never ran with the permissions the host asked for, and MCP tool approvals never reached the host. Together they made every ChatGPT app write in a Codex session (a GitHub branch, a pull request update) fail as "user rejected MCP tool call" in under 10 ms, with nobody asked. Checked live against `codex` 0.160.0 with a probe MCP server: allowed, denied, and `skipPermissions`, plus the same script on 0.0.40 reproducing the failure.
+
+### Fixed
+
+- **`skipPermissions` and `planMode` now apply to Codex sessions.** `codex app-server` drops the interactive `--dangerously-bypass-approvals-and-sandbox` and `--sandbox` flags (they belong to the TUI, and the subcommand never receives them). Every session ran on Codex's defaults instead: approvals `on-request` and a `workspace-write` or `read-only` sandbox. The settings now go in as root `-c` overrides (`approval_policy`, `sandbox_mode`) and again as `approvalPolicy` / `sandbox` on `thread/start` and `thread/resume`, so a resumed thread takes the session's current settings. `skipPermissions` is `never` with `danger-full-access`. `planMode` is a `read-only` sandbox with approvals left on, and still wins over `skipPermissions`. `execute()` (`codex exec`) was not affected and is unchanged.
+- **MCP tool approvals reach `onUserInputRequest`.** Codex asks before an MCP or app tool call that needs a yes with `mcpServer/elicitation/request` (`_meta.codex_approval_kind: "mcp_tool_call"`). agentex answered it with `{}`, which Codex reads as a decline. It is now a tool permission: `toolName` is `mcp__<server>__<tool>`, `toolUseId` the call's item id (paired through the in-flight `item/started`), `title` Codex's question, `description` the parameters Codex displays, and `input` the call's arguments. Allow accepts that one call, deny declines it. Child-thread approvals carry `agentId` and leave root state alone, like the other approvals.
+- **Other MCP elicitations reach `onElicitation`.** An MCP server's form or URL request is passed through in the shape the Claude provider already uses, and declined without a handler. A handler that throws cancels.
+- **Unhandled server requests get a JSON-RPC error.** The generic `{}` reply was schema-invalid for every request type, and Codex read it as a refusal. Requests agentex does not handle now get `-32601` ("method not found") and fail visibly. None are expected: the remaining types are opt-in or never sent to a client without dynamic tools or external auth.
+
+### Added
+
+- **MCP tool calls are `tool_call` / `tool_result` events.** Codex `mcpToolCall` items (and `mcp_tool_call` in `codex exec --json`) were emitted as `unknown`, so hosts showed no row for any MCP or app call. The name is `mcp__<server>__<tool>` (`codexMcpToolName`), `input` the arguments, and the result is the error message, else the text content, else the structured content. A failed or declined call is `isError: true`.
+
 ## 0.0.41 — Antigravity review fixes
 
 Five fixes from a review of the 0.0.39 Antigravity provider.

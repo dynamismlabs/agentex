@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import type {
   BackgroundTaskReport,
   AgentSession,
+  ElicitationResponse,
   CancelResult,
   ClearGoalResult,
   GoalOptions,
@@ -28,11 +29,16 @@ import { translateEndpoint } from "../../utils/endpoint.js";
 import { injectWorkspaceSkills } from "../../utils/skills.js";
 import { resolveInstructions } from "../../utils/instructions.js";
 import { createToolNameTracker } from "../../utils/tool-names.js";
-import { parseCodexStreamLines, codexBackgroundTaskReport } from "./parse.js";
+import { parseCodexStreamLines, codexBackgroundTaskReport, codexMcpToolName } from "./parse.js";
 import { withPlanModePreamble } from "./plan-mode.js";
 import { scanCodexSessionUsage } from "./usage-scanner.js";
 import { codexSessionCodec } from "./codec.js";
 import { parseCollaborationModes, resolveCollaborationModeParam } from "./modes.js";
+import {
+  codexPermissionConfigArgs,
+  codexPermissionThreadParams,
+  codexThreadPermissions,
+} from "./permissions.js";
 
 /**
  * Extract a resume thread id from session params (reusing the codec's
@@ -120,6 +126,52 @@ function buildCodexUserInputAnswers(
     if (values.length > 0) out[q.id] = { answers: values };
   }
   return out;
+}
+
+/** An MCP tool call Codex has started and not finished (`item/started`, `mcpToolCall`). */
+interface InFlightMcpCall {
+  itemId: string;
+  threadId: string | null;
+  server: string;
+  tool: string;
+  arguments: unknown;
+}
+
+/**
+ * One line for an MCP tool approval from Codex's `tool_params_display`
+ * (`[{ name, display_name, value }]`), e.g.
+ * `Repository: acme/web · Branch name: fix/login · Base ref: main`.
+ */
+function describeMcpToolParams(display: unknown): string | undefined {
+  if (!Array.isArray(display)) return undefined;
+  const parts: string[] = [];
+  for (const entry of display) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const param = entry as Record<string, unknown>;
+    const label = str(param, "display_name") || str(param, "name");
+    if (!label) continue;
+    const raw = param["value"];
+    const value = typeof raw === "string" ? raw : JSON.stringify(raw);
+    if (value === undefined) continue;
+    parts.push(`${label}: ${value.length > 120 ? `${value.slice(0, 117)}...` : value}`);
+  }
+  return parts.length > 0 ? parts.join(" · ") : undefined;
+}
+
+/** The elicitation reply Codex expects: `action`, plus `content` only on an accept. */
+function elicitationReply(resp: ElicitationResponse): Record<string, unknown> {
+  return {
+    action: resp.action,
+    ...(resp.action === "accept" && resp.content ? { content: resp.content } : {}),
+  };
+}
+
+/** JSON with object keys sorted, so two argument objects compare by value. */
+function stableJson(value: unknown): string {
+  return JSON.stringify(value, (_key, v: unknown) =>
+    v && typeof v === "object" && !Array.isArray(v)
+      ? Object.fromEntries(Object.entries(v as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)))
+      : v) ?? "";
 }
 
 /** A pending `send()` whose `result` Promise hasn't settled yet. */
@@ -328,15 +380,13 @@ export async function createCodexSession(ctx: SessionContext): Promise<AgentSess
   // Spawn Codex in interactive JSON-RPC mode via the `app-server` subcommand
   // (codex-cli 0.130.0+; the old top-level `--json` flag was removed).
   //
-  // Args order matters: `--sandbox` and `--dangerously-bypass-approvals-and-sandbox`
-  // are TOP-LEVEL options and must come BEFORE the `app-server` subcommand.
+  // Approval policy and sandbox go in as root `-c` overrides, BEFORE the
+  // subcommand: app-server ignores `--sandbox` and
+  // `--dangerously-bypass-approvals-and-sandbox` (see ./permissions.ts). The
+  // handshake repeats them on the thread itself.
   // extraArgs land after the subcommand — semantics depend on the user's intent.
   const args = [...resolved.prefixArgs];
-  if (config.planMode) {
-    args.push("--sandbox", "read-only");
-  } else if (config.skipPermissions) {
-    args.push("--dangerously-bypass-approvals-and-sandbox");
-  }
+  args.push(...codexPermissionConfigArgs(codexThreadPermissions(config)));
   // Custom endpoint model_providers overrides are top-level `-c` options, placed
   // with the other top-level flags before the `app-server` subcommand (the
   // position that is always valid for global options).
@@ -436,6 +486,9 @@ export class CodexSessionImpl implements AgentSession {
 
   /** Stamps `tool_result.toolName` by correlating with prior `tool_call`s. */
   private readonly _trackToolName = createToolNameTracker();
+
+  /** MCP tool calls started and not yet completed, by item id, for pairing approvals. */
+  private readonly _mcpCallsInFlight = new Map<string, InFlightMcpCall>();
 
   // Per-turn accumulators. Cleared after each result delivery so a subsequent
   // turn's events don't inherit stale values.
@@ -771,6 +824,10 @@ export class CodexSessionImpl implements AgentSession {
     this.proc.stdin!.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\n");
   }
 
+  private rpcError(id: number, code: number, message: string): void {
+    this.proc.stdin!.write(JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } }) + "\n");
+  }
+
   // -------------------------------------------------------------------------
   // Handshake
   // -------------------------------------------------------------------------
@@ -791,9 +848,12 @@ export class CodexSessionImpl implements AgentSession {
     //    otherwise start a fresh one. `thread/resume` continues the SAME thread
     //    with its full context retained — distinct from `thread/fork`, which is
     //    a divergent rewind copy. The thread keeps its original cwd/model, so we
-    //    pass only the thread id (+ refreshed developer instructions).
+    //    pass only the thread id (+ refreshed developer instructions, and the
+    //    approval policy and sandbox this session runs with, which may differ
+    //    from the ones the thread was created under).
+    const permissionParams = codexPermissionThreadParams(codexThreadPermissions(this.ctx.config));
     if (this._resumeThreadId) {
-      const resumeParams: Record<string, unknown> = { threadId: this._resumeThreadId };
+      const resumeParams: Record<string, unknown> = { threadId: this._resumeThreadId, ...permissionParams };
       if (this.instructions) resumeParams["developerInstructions"] = this.instructions;
       try {
         const res = await this.rpcRequest("thread/resume", resumeParams);
@@ -830,7 +890,7 @@ export class CodexSessionImpl implements AgentSession {
     }
 
     // thread/start (fresh)
-    const threadParams: Record<string, unknown> = { cwd: this.cwd };
+    const threadParams: Record<string, unknown> = { cwd: this.cwd, ...permissionParams };
     if (this.model) threadParams["model"] = this.model;
     if (this.instructions) threadParams["developerInstructions"] = this.instructions;
 
@@ -1236,16 +1296,174 @@ export class CodexSessionImpl implements AgentSession {
     ) {
       // `tool/requestUserInput` is the legacy method name on older codex builds.
       void this.handleUserInputRequest(id, params);
+    } else if (method === "mcpServer/elicitation/request") {
+      void this.handleMcpElicitation(id, params);
     } else {
-      // Unknown server request. `{}` is a best-effort reply, NOT a guarantee
-      // that the turn proceeds: every server request the protocol defines but
-      // this file does not handle declares required response fields, so an
-      // empty result is schema-invalid for all of them. A JSON-RPC error reply
-      // would be the honest answer, but `rpcResponse` has no error path and
-      // introducing one changes behavior (an error can abort a turn where this
-      // limps along), so that is a deliberate follow-up rather than a fix here.
-      this.rpcResponse(id, {});
+      // A request this file does not handle. Every server request the protocol
+      // defines declares required response fields, so the `{}` this used to
+      // send was schema-invalid, and Codex read it as a refusal: that is how
+      // MCP tool approvals were silently declined before they were handled
+      // here. "Method not found" is the honest answer and fails visibly.
+      // What's left is opt-in (`attestation/generate`), never sent to a client
+      // that registers no dynamic tools and no external auth (`item/tool/call`,
+      // `account/chatgptAuthTokens/refresh`), or v1-only (`applyPatchApproval`,
+      // `execCommandApproval`).
+      this.rpcError(id, -32601, `agentex does not handle the ${method} request`);
     }
+  }
+
+  /**
+   * Handle `mcpServer/elicitation/request`. Codex sends two kinds.
+   *
+   * With `_meta.codex_approval_kind: "mcp_tool_call"` it is a tool permission:
+   * an MCP tool (a ChatGPT app such as GitHub, or a server in the user's
+   * config.toml) that needs a yes before it runs. Codex asks only while the
+   * thread's approval policy is on; under `never` with full access it approves
+   * these itself. It goes to `onUserInputRequest` like every other approval.
+   *
+   * Anything else is an MCP elicitation proper, a form or a URL an MCP server
+   * asks the user to fill in or open, and goes to `onElicitation`.
+   *
+   * The reply must carry `action`. Before this was handled, the generic `{}`
+   * reply was read as a decline, so every app write failed as "user rejected
+   * MCP tool call" with nobody asked.
+   */
+  private async handleMcpElicitation(id: number, params: Record<string, unknown>): Promise<void> {
+    const meta = asObj(params, "_meta");
+    if (str(meta, "codex_approval_kind") === "mcp_tool_call") {
+      await this.handleMcpToolApproval(id, params, meta);
+    } else {
+      await this.handleElicitation(id, params);
+    }
+  }
+
+  private async handleMcpToolApproval(
+    id: number,
+    params: Record<string, unknown>,
+    meta: Record<string, unknown>,
+  ): Promise<void> {
+    const requestThreadId = str(params, "threadId") || null;
+    const foreign = this.isForeignThread(requestThreadId);
+    if (!foreign) this._state = "waiting_for_approval";
+    const restore = () => { if (!foreign) this.restoreStateAfter("waiting_for_approval"); };
+
+    // No host handler: allowed, like the command and file-change approvals.
+    if (!this.ctx.onUserInputRequest) {
+      this.rpcResponse(id, { action: "accept" });
+      restore();
+      return;
+    }
+
+    // The request names neither the tool nor the call it gates. The call has
+    // already started (Codex reports `item/started` before it asks), so pair
+    // the two through the in-flight MCP calls.
+    const server = str(params, "serverName");
+    const toolParams = meta["tool_params"];
+    const call = this.findMcpCallForApproval(requestThreadId, server, toolParams);
+    const input = call?.arguments ?? toolParams;
+
+    try {
+      const resp = await this.ctx.onUserInputRequest({
+        toolName: codexMcpToolName(call?.server ?? server, call?.tool ?? null),
+        input: input && typeof input === "object" && !Array.isArray(input)
+          ? input as Record<string, unknown>
+          : {},
+        // The call's item id lines the approval up with its tool_call event,
+        // as `itemId` does for command approvals. Without a match, a fresh id:
+        // hosts key pending approvals on this, so it must never repeat.
+        toolUseId: call?.itemId ?? `codex-mcp-approval-${randomUUID()}`,
+        // Codex's own question, e.g. `Allow GitHub to run tool "create_branch"?`.
+        title: str(params, "message") || undefined,
+        displayName: str(meta, "tool_title") || str(meta, "connector_name") || undefined,
+        description: describeMcpToolParams(meta["tool_params_display"]),
+        ...(foreign && requestThreadId ? { agentId: requestThreadId } : {}),
+      });
+      // A plain accept runs this one call. Codex also offers "for this
+      // session" and "always" (`_meta.persist`), which agentex's yes/no
+      // permission has no way to express, so the host is asked each time.
+      this.rpcResponse(id, { action: resp.allow ? "accept" : "decline" });
+    } catch {
+      this.rpcResponse(id, { action: "decline" });
+    }
+
+    restore();
+  }
+
+  /** An MCP server's form or URL request, for the host's `onElicitation`. Declined without one. */
+  private async handleElicitation(id: number, params: Record<string, unknown>): Promise<void> {
+    if (!this.ctx.onElicitation) {
+      this.rpcResponse(id, { action: "decline" });
+      return;
+    }
+
+    const requestThreadId = str(params, "threadId") || null;
+    const foreign = this.isForeignThread(requestThreadId);
+    if (!foreign) this._state = "waiting_for_input";
+    const restore = () => { if (!foreign) this.restoreStateAfter("waiting_for_input"); };
+
+    const url = str(params, "url");
+    const elicitationId = str(params, "elicitationId");
+    const schema = params["requestedSchema"];
+    try {
+      const resp = await this.ctx.onElicitation({
+        mcpServerName: str(params, "serverName"),
+        message: str(params, "message"),
+        mode: str(params, "mode") === "url" ? "url" : "form",
+        ...(url ? { url } : {}),
+        ...(elicitationId ? { elicitationId } : {}),
+        ...(schema && typeof schema === "object" && !Array.isArray(schema)
+          ? { requestedSchema: schema as Record<string, unknown> }
+          : {}),
+      });
+      this.rpcResponse(id, elicitationReply(resp));
+    } catch {
+      this.rpcResponse(id, { action: "cancel" });
+    }
+
+    restore();
+  }
+
+  /**
+   * Remember the MCP tool calls Codex has started and not finished, on every
+   * thread, so an approval request can be paired with the call it gates.
+   */
+  private trackMcpToolCall(method: string, params: Record<string, unknown>): void {
+    if (method !== "item/started" && method !== "item/completed") return;
+    const item = asObj(params, "item");
+    if (str(item, "type") !== "mcpToolCall") return;
+    const itemId = str(item, "id");
+    if (!itemId) return;
+    if (method === "item/completed") {
+      this._mcpCallsInFlight.delete(itemId);
+      return;
+    }
+    this._mcpCallsInFlight.set(itemId, {
+      itemId,
+      threadId: str(params, "threadId") || null,
+      server: str(item, "server"),
+      tool: str(item, "tool"),
+      arguments: item["arguments"],
+    });
+  }
+
+  /**
+   * The in-flight call an approval is about: on the asking thread and server,
+   * the one whose arguments match the approval's `tool_params`, else the most
+   * recently started (Codex asks right after it starts a call).
+   */
+  private findMcpCallForApproval(
+    threadId: string | null,
+    server: string,
+    toolParams: unknown,
+  ): InFlightMcpCall | null {
+    const candidates = [...this._mcpCallsInFlight.values()].filter((call) =>
+      call.server === server && (!threadId || !call.threadId || call.threadId === threadId));
+    if (toolParams !== undefined) {
+      const wanted = stableJson(toolParams);
+      const exact = candidates.find((call) => stableJson(call.arguments) === wanted);
+      if (exact) return exact;
+    }
+    return candidates.at(-1) ?? null;
   }
 
   /**
@@ -1965,6 +2183,7 @@ export class CodexSessionImpl implements AgentSession {
 
   private handleNotification(method: string, params: Record<string, unknown>, rawLine: string): void {
     if (this._state === "closed") return;
+    this.trackMcpToolCall(method, params);
     // codex/event — legacy wrapper
     if (method === "codex/event") {
       const innerMsg = str(params, "msg");
