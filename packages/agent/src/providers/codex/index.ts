@@ -49,6 +49,7 @@ export const codexProvider: ProviderModule = {
   resolveAuth: (ctx) => resolveAuthForProvider("codex", ctx),
   sessionCodec: codexSessionCodec,
   probeCapabilities: (ctx) => import("../../telemetry/probe.js").then((m) => m.probeNativeTelemetry("codex", ctx)),
+  readRateLimits: (ctx) => import("../../telemetry/rate-limit-read.js").then((m) => m.readNativeRateLimits("codex", ctx)),
   transcript: codexTranscriptOps,
   listModels: (options) => import("./discovery.js").then((m) => m.listCodexModels(options)),
   listModes: async (opts) => (await import("./modes.js")).listCodexModes(opts),

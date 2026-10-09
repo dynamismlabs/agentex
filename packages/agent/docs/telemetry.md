@@ -50,11 +50,46 @@ try {
 }
 ```
 
-Static capabilities (`contextUsage`, `rateLimits`, `contextUsageRefresh`, `rateLimitsRefresh`) describe adapter paths. `provider.probeCapabilities?.({ cwd, env, config })` explicitly verifies the selected native runtime/auth context where a probe exists. Probes can perform native control/account reads and spawn short-lived harnesses; they never send an inference prompt. Session observations are authoritative for what actually arrived. ACP context support starts `unknown` until the agent emits the optional standard.
+Static capabilities (`contextUsage`, `rateLimits`, `contextUsageRefresh`, `rateLimitsRefresh`) describe adapter paths. `provider.probeCapabilities?.({ cwd, env, config })` explicitly verifies the selected native runtime/auth context where a probe exists. Probes can perform native control/account reads and spawn short-lived harnesses; they never send an inference prompt. Claude/Codex handshake or telemetry read failures degrade only the affected telemetry capabilities, never `binary.status` or session availability. Binary resolution and Codex's independent MCP version check retain their own semantics. Matching concurrent probes share in-flight work; completed reports are not cached. Session observations are authoritative for what actually arrived. ACP context support starts `unknown` until the agent emits the optional standard.
 
 A native session's refresh method can initially exist while support is `unknown`, allowing a bounded discovery read. `refreshSupported` becomes true only after actual source support is established. An unsupported response disables further reads (`refreshSupported: false`); calling that existing method again returns the unsupported snapshot. Concurrent refreshes of the same surface on a session share one promise/request. The context and capacity transports are independent; a combined native event is parsed once into independent stores. Closing the session settles pending controls, stops automatic reads, and marks retained data unavailable/stale.
 
 After a successful explicit Claude context refresh, the session also reads the native summary at subsequent result, compaction/reset, and model-init boundaries. This keeps the opted-in context snapshot current without an inference or token-count API call. Codex and ACP consume their native context notifications directly. Snapshot reads themselves never enable or trigger refresh.
+
+## Read account capacity without a session
+
+Since 0.0.44, Claude and Codex implement `provider.readRateLimits?(ctx)` separately from `probeCapabilities`. `RateLimitReadContext` extends `ProviderRuntimeContext` (`cwd`, `env`, `config`) with optional `signal: AbortSignal` and `timeoutMs`. No session is created and no probe is required:
+
+```ts
+import { getProvider, type RateLimitReadContext } from "@agentex/agent";
+
+const controller = new AbortController();
+const ctx: RateLimitReadContext = {
+  cwd: process.cwd(),
+  // env/config select the same runtime and auth context as the app's session.
+  timeoutMs: 10_000,
+  signal: controller.signal,
+};
+const result = await getProvider("claude").readRateLimits?.(ctx);
+if (result?.value) {
+  // TelemetryObservation<RateLimitUpdate>, not a session snapshot surface.
+  console.log(result.value.mode); // "replace"
+  console.log(result.value.snapshot.observedAt);
+  for (const bucket of result.value.snapshot.buckets) {
+    console.log(bucket.id, bucket.applicability, bucket.usedPercent, bucket.resetAt);
+  }
+}
+```
+
+The value is the same authoritative normalized `replace` update an explicit session capacity read emits. It describes the collection returned by the native source, including independent account, model-family/pool and credit/enforcement buckets where supplied; it does not promise native fields the provider omits. Each bucket retains its own timestamp and reset. An already expired reset produces `status: "stale"` and `bucket.stale: true` without changing the measured usage. An explicitly empty collection is a successful observation. Unsupported auth/methods return `unsupported`; timeout, cancellation, transport failure or missing/malformed data return `unavailable` with a safe reason and no value. Other built-in providers omit `readRateLimits`.
+
+The deadline defaults to 10,000 milliseconds and is capped at 60,000. Nonpositive/nonfinite `timeoutMs` rejects with `RangeError` before spawning. Matching concurrent reads share one native process; a caller's abort or deadline affects only that caller while others remain. When the last caller leaves, it waits for bounded process cleanup (SIGTERM, then SIGKILL after one second). Every completed/failed read closes its process, and the in-flight operation has a 60-second ceiling. Agent Ex keeps no completed-result cache and does not mutate an existing session's telemetry store.
+
+Deduplication is per operation (read or probe), selected provider/command, cwd, canonical config, effective environment/home/endpoint, and native auth-file revision. Values are compared through a process-private keyed digest, not logged or exposed as keys. Credential files are fingerprinted by filesystem metadata without reading tokens. Native credentials held only in external keychains cannot be independently fingerprinted; there is no durable auth/result cache. Returned `authContextId` is opaque and read-local, not a credential or reusable account id. Scope an app's cache by its own selected provider/auth context; preserve native `accountId` where reported. Runtime config's `command` and environment select the harness; turn instructions, extra argv, MCP servers, skills and hooks are not installed for an account read. Custom endpoints are unsupported for native plan allowance.
+
+Codex performs app-server **initialize → account/read (`refreshToken: false`) → account/rateLimits/read**, only for service-backed `account.type: "chatgpt"`. It sends no thread/start/resume or turn request, so no conversation is written to Codex history. API-key, Bedrock and other auth types are unsupported. Claude performs headless control **initialize → get_usage (`skip_behaviors: true`)** with `--no-session-persistence`, `--setting-sources ""`, strict empty MCP configuration and no prompt. The skip flag avoids the unrelated transcript/behavior scan. Both use the session telemetry normalizers/redaction; native error text, environment and credentials are never returned as diagnostic metadata.
+
+For an app's hover-to-refresh UI, read only when its cached capacity is stale, retain old numbers with an updating indicator, and replace the cache only when a value arrives. Failed/unsupported reads do not prove zero usage or available capacity. Probe scheduling, cache lifetime and display policy belong to the consuming app.
 
 ## Unknown, unavailable, and stale data
 
@@ -89,7 +124,7 @@ For example, Claude's `five_hour`, `seven_day`, and `seven_day_opus` can apply s
 
 `enforcement`, `overage`, `credits`, and snapshot-level `ordinaryUsageAllowed` preserve reported native state. A warning/rejection is not derived from missing metrics. Native future fields survive in sanitized additive `metadata`. Credential-like fields and bearer/basic credential strings are removed from telemetry metadata. Existing `StreamEvent.raw` remains the provider-native escape hatch with its existing trust/redaction contract; consumers should not log it indiscriminately.
 
-`rate_limits` carries `RateLimitUpdate`: `merge` updates only supplied buckets; `replace` denotes an authoritative collection; `removedBucketIds` removes only explicit native removals. `replacedCollectionIds` can replace an authoritative subset identified by each bucket's opaque `collectionId`, while leaving unrelated buckets alone. Claude's explicitly empty `model_scoped` list clears only that collection; an omitted, null, or filtered list does not. Older partial updates cannot overwrite newer observations, remove newer buckets, or revive an explicitly removed collection/bucket. Account changes clear unrelated buckets. Every session/auth transport has its own opaque `authContextId`; there is no process-global quota cache. Native auth-change notifications invalidate account observations and fence in-flight reads from the previous auth context. External credential/endpoint changes should use a new session unless the harness reports an auth change; no undocumented credential polling is performed.
+`rate_limits` carries `RateLimitUpdate`: `merge` updates only supplied buckets; `replace` denotes an authoritative collection; `removedBucketIds` removes only explicit native removals. `replacedCollectionIds` can replace an authoritative subset identified by each bucket's opaque `collectionId`, while leaving unrelated buckets alone. In partial Claude reports, an explicitly empty `model_scoped` list clears only that collection; an omitted, null, or filtered list does not. Explicit control reads use `replace` for the collection the native source returns. Older partial updates cannot overwrite newer observations, remove newer buckets, or revive an explicitly removed collection/bucket. Account changes clear unrelated buckets. Every session/auth transport has its own opaque `authContextId`; there is no process-global quota cache. Native auth-change notifications invalidate account observations and fence in-flight reads from the previous auth context. External credential/endpoint changes should use a new session unless the harness reports an auth change; no undocumented credential polling is performed.
 
 Codex pool-level spend control is retained in a separate enforcement bucket even when numerical windows or credits are also present and individual-limit metrics are absent. Its `enforcement.allowed` describes that reported control; it does not override other simultaneous allowance buckets. Transport closure or a failed stdin write makes retained observations stale and disables refresh, including unexpected ACP exits.
 
@@ -110,11 +145,13 @@ Support is for Agent Ex's selected transport, not every interface offered by a p
 
 `ExecutionResult.contextUsage` and `ExecutionResult.rateLimitSnapshot` contain final observations captured independently of whether the caller supplies `onEvent`. The legacy `ExecutionResult.rateLimits` array and `rate_limit` events retain compatibility. Read-only `SessionAttachment`/`HistoryAttachment` expose snapshot surfaces without refresh. Historical snapshots retain original timestamps and can be stale. Codex live restore does not import account-unidentified historical quota data into the current auth scope; it waits for a live observation/read.
 
-The old Claude `checkQuota` inferred allowance from authentication configuration. It is deprecated and now returns `available: false`, `detail.measured: false` with a reason, while preserving billing/auth classification. That is unknown allowance, not a measured rejection. `quotaProbing` is false; use the separate capacity surface.
+The old Claude `checkQuota` inferred allowance from authentication configuration. It is deprecated and now returns `available: false`, `detail.measured: false` with a reason, while preserving billing/auth classification. That is unknown allowance, not a measured rejection. `quotaProbing` is false; use the separate session capacity surface or sessionless read.
 
 ## Protocol evidence and limits
 
 Verified on 2026-10-09 using non-inference, bounded local checks:
+
+- **Sessionless reads (0.0.44):** the public API returned fresh authoritative snapshots on Claude Code 2.1.295 (eight buckets) and Codex 0.160.0 (three buckets). Before/after filesystem checks found zero new or modified Claude project/session/transcript files and zero new or modified Codex session/archive/history/index files. No prompts were sent. Run `pnpm --filter @agentex/agent exec tsx scripts/telemetry-read-smoke.ts --live` with other native sessions idle to repeat these checks. Claude's [CLI reference](https://code.claude.com/docs/en/cli-reference) documents persistence, MCP and settings-source flags; the vendor SDK publishes `get_usage`/`skip_behaviors`.
 
 - **Codex 0.160.0:** generated app-server TypeScript schema confirms `ThreadTokenUsage { total, last, modelContextWindow }`, dynamic `rateLimitsByLimitId`, window percentages/durations/resets, credits, individual limits, and enforcement fields. An ephemeral native initialize → `account/read` → `account/rateLimits/read` returned service-backed multi-pool data. The cumulative `total` is not used for context. See [app-server documentation](https://learn.chatgpt.com/docs/app-server).
 - **ACP SDK 1.7.0:** real SDK transport tests receive idle and active `usage_update` notifications. The previous 0.24.0 validator rejected this new standard before the adapter could parse it, so the SDK dependency was upgraded. See the [session-usage proposal](https://agentclientprotocol.com/rfds/session-usage).

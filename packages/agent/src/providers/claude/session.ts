@@ -450,7 +450,7 @@ export class ClaudeSessionImpl implements AgentSession {
         if (response["rate_limits_available"] === false) {
           this.telemetry.setRateLimitSupport("unsupported", "Plan telemetry is unavailable for the selected Claude auth context"); return;
         }
-        const update = claudeUsageRateLimits(response, new Date().toISOString());
+        const update = claudeUsageRateLimits(response, new Date().toISOString(), "replace");
         if (!update) { this.telemetry.unavailableRates("Runtime returned no plan rate-limit data"); return; }
         this.dispatchEvent({ type: "rate_limits", update, ...this.telemetryBase(response, update.snapshot.observedAt) });
       } catch (error) {

@@ -1021,8 +1021,9 @@ export function claudeRateLimitEvent(payload: unknown, observedAt: string): Rate
   return { mode: "merge", snapshot: { provider: "claude", buckets: [...buckets.values()], observedAt } };
 }
 
-/** `get_usage` is experimental. Iterate native window ids, never a closed list. */
-export function claudeUsageRateLimits(payload: unknown, observedAt: string): RateLimitUpdate | null {
+/** `get_usage` is experimental. Iterate native window ids, never a closed list.
+ * Explicit control reads use replace; unsolicited/replayed reports default to merge. */
+export function claudeUsageRateLimits(payload: unknown, observedAt: string, mode?: "merge" | "replace"): RateLimitUpdate | null {
   const response = record(payload);
   const rates = record(response?.rate_limits);
   if (!rates) return null;
@@ -1093,6 +1094,6 @@ export function claudeUsageRateLimits(payload: unknown, observedAt: string): Rat
       metadata: metadata(window),
     });
   }
-  return { mode: Object.keys(rates).length === 0 ? "replace" : "merge", removedBucketIds, replacedCollectionIds,
+  return { mode: mode ?? (Object.keys(rates).length === 0 ? "replace" : "merge"), removedBucketIds, replacedCollectionIds,
     snapshot: { provider: "claude", buckets, observedAt, metadata: metadata({ subscription_type: response?.subscription_type, rate_limits: rates }) } };
 }

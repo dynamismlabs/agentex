@@ -13,6 +13,7 @@ import type {
   ProviderAuthFlow,
   ProviderAuthMethod,
   ProviderRuntimeContext,
+  RateLimitReadContext,
   ProviderRuntimeReport,
   SavedHistoryDiscoverOptions,
   SavedHistoryEvent,
@@ -40,6 +41,7 @@ type PublicTypes =
   | ProviderAuthFlow
   | ProviderAuthMethod
   | ProviderRuntimeContext
+  | RateLimitReadContext
   | ProviderRuntimeReport
   | SavedHistoryDiscoverOptions
   | SavedHistoryEvent

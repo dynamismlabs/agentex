@@ -12,7 +12,7 @@ async function checkQuota(ctx: QuotaContext): Promise<QuotaStatus> {
   return {
     available: false,
     billingType: auth.billingType,
-    detail: { method: auth.method, region: auth.region, measured: false, reason: "Authentication configuration does not measure capacity; use session.rateLimits.refresh()" },
+    detail: { method: auth.method, region: auth.region, measured: false, reason: "Authentication configuration does not measure capacity; use readRateLimits() or session.rateLimits.refresh()" },
   };
 }
 
@@ -63,6 +63,7 @@ export const claudeProvider: ProviderModule = {
   listModels: (options) => import("./discovery.js").then((m) => m.listClaudeModels(options)),
   sessionCodec: claudeSessionCodec,
   probeCapabilities: (ctx) => import("../../telemetry/probe.js").then((m) => m.probeNativeTelemetry("claude", ctx)),
+  readRateLimits: (ctx) => import("../../telemetry/rate-limit-read.js").then((m) => m.readNativeRateLimits("claude", ctx)),
   checkQuota,
   transcript: claudeTranscriptOps,
   attachSession: async (record, opts) =>

@@ -142,6 +142,15 @@ export interface ProviderRuntimeContext {
   refresh?: boolean;
 }
 
+/** Explicit provider/account telemetry read without creating a conversation. */
+export interface RateLimitReadContext extends ProviderRuntimeContext {
+  /** Cancels only this caller; a shared read continues for other callers. */
+  signal?: AbortSignal;
+  /** Whole-read deadline in milliseconds. Default 10,000; capped at 60,000.
+   * Positive finite values only. The last caller also awaits bounded process cleanup. */
+  timeoutMs?: number;
+}
+
 export interface ProviderRuntimeReport {
   binary: {
     status: CapabilityStatus;
@@ -352,8 +361,18 @@ export interface ProviderModule {
   sessionCodec?: SessionCodec;
   /** List available models in a runtime context. */
   listModels?(options?: ListModelsOptions): Promise<ProviderModel[]>;
-  /** Probe the selected binary and wire protocol for effective capabilities. */
+  /** Probe the selected binary and wire protocol for effective capabilities.
+   * Claude/Codex telemetry failures affect only telemetry capabilities, never
+   * binary/session availability. Matching concurrent native probes are deduplicated. */
   probeCapabilities?(ctx?: ProviderRuntimeContext): Promise<ProviderRuntimeReport>;
+  /**
+   * Explicit, bounded sessionless capacity read. Never sends an inference
+   * prompt or creates conversation history. Matching concurrent reads share
+   * one native process; completed observations are not cached by Agent Ex.
+   * A successful value is an authoritative replace update, independent of
+   * probeCapabilities and existing session snapshot/refresh surfaces.
+   */
+  readRateLimits?(ctx?: RateLimitReadContext): Promise<TelemetryObservation<RateLimitUpdate>>;
   /** Optional management surface for harness-owned upstream providers. */
   upstreamProviders?: UpstreamProviderManager;
   /**
@@ -362,7 +381,7 @@ export interface ProviderModule {
    * to query it (ACP, codex), so it's async and accepts cwd/env/config.
    */
   listModes?(options?: ListModesOptions): Promise<AgentMode[]>;
-  /** @deprecated Use session.rateLimits; legacy booleans cannot express unknown capacity. */
+  /** @deprecated Use session.rateLimits or readRateLimits; legacy booleans cannot express unknown capacity. */
   checkQuota?(ctx: QuotaContext): Promise<QuotaStatus>;
   /**
    * Polymorphic on-disk transcript access. Present only on providers that
@@ -977,7 +996,7 @@ export interface RateLimitBucket {
 export interface RateLimitSnapshot {
   provider: string;
   accountId?: string;
-  /** Opaque session-local auth scope, never credentials. */
+  /** Opaque transport/read-local auth scope, never credentials. */
   authContextId?: string;
   buckets: RateLimitBucket[];
   observedAt: string;
@@ -1007,7 +1026,7 @@ export interface TelemetryObservation<T> {
   support: "supported" | "unsupported" | "unknown";
   status: "unsupported" | "unobserved" | "unavailable" | "fresh" | "stale";
   value: T | null;
-  /** True only after source support is established and the live transport can refresh. */
+  /** True only after source support is established and an explicit refresh/read is available. */
   refreshSupported: boolean;
   reason?: string;
 }

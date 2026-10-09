@@ -1,6 +1,6 @@
 {
   "name": "@agentex/agent",
-  "version": "0.0.43",
+  "version": "0.0.44",
   "description": "Programmatic execution of AI coding agents including Claude Code, Codex, Cursor, OpenCode, and Antigravity",
   "repository": {
     "type": "git",

@@ -1,6 +1,13 @@
 # Changelog
 
-## 0.0.43 (unreleased) — Context, capacity telemetry and Codex MCP
+## 0.0.44 (unreleased) — Sessionless capacity reads and isolated telemetry probes
+
+- Added optional `provider.readRateLimits({ cwd, env, config, signal, timeoutMs })` on Claude Code and Codex. It returns a `TelemetryObservation<RateLimitUpdate>` with an authoritative `replace` snapshot and native observation timestamp, independently of `probeCapabilities` and session caches. Other providers omit the API.
+- Reads use bounded native account controls without inference or conversation creation: Codex initialize/account/read/account/rateLimits/read, gated to service-backed ChatGPT auth; Claude initialize/get_usage with `skip_behaviors: true`, persistence disabled, and no MCP/settings sources. Verified live on Codex 0.160.0 and Claude Code 2.1.295 with zero new/modified history, session or transcript files.
+- Matching concurrent reads and probes are deduplicated by runtime/config/cwd/effective auth context. Reads have independent caller cancellation/deadlines (10s default, 60s maximum), always close their process, and retain no completed-result cache. Existing and new telemetry share normalization/redaction; bare token/auth-token metadata fields are now also stripped.
+- Telemetry handshake/read failures no longer degrade installed binary or session availability. Codex MCP compatibility remains independently version-gated even if account telemetry times out. Explicit Claude session capacity refresh now emits the same authoritative `replace` update as a sessionless read; unsolicited partial reports keep merge semantics.
+
+## 0.0.43 — Context, capacity telemetry and Codex MCP
 
 - Codex CLI 0.160+ now honors host-supplied stdio/streamable HTTP MCP servers in execute, new sessions and resumed threads. HTTP headers and stdio environment values stay out of argv and are isolated per invocation/server. Attached configurations default to strict ambient MCP isolation, verified through bounded native inventory reads without replacing `CODEX_HOME` or rewriting user config. Ambiguous server-name collisions and unverified isolation fail before session startup. Host-owned servers receive automatic Codex approval while other approvals and MCP elicitations remain intact. See the [Codex MCP guide](docs/codex-mcp.md).
 

@@ -432,9 +432,27 @@ try {
 
 Unknown values stay absent; measured zero stays zero. Observations distinguish unsupported, unobserved, unavailable, fresh, and stale data. An empty reported bucket collection differs from no snapshot and does not prove available capacity. Partial updates preserve unrelated buckets and their timestamps; expired resets mark data stale without inventing fresh zero usage. Caches are isolated per session/auth transport.
 
+Claude and Codex also expose an explicit **sessionless** account read, independent of capability probing:
+
+```typescript
+const abortController = new AbortController();
+const observation = await getProvider("codex").readRateLimits?.({
+  cwd: process.cwd(),
+  timeoutMs: 10_000,
+  signal: abortController.signal,
+});
+if (observation?.value) {
+  const { mode, snapshot } = observation.value; // mode is "replace"
+  // Replace the app's cached observation for this provider/auth context.
+  console.log(snapshot.observedAt, snapshot.buckets);
+}
+```
+
+These bounded native controls send no inference prompt and create no conversation history. Matching concurrent reads share one process; each caller has its own cancellation/deadline. Agent Ex keeps no completed read cache. Other providers omit the method. Unsupported auth/runtime returns an explicit unsupported or unavailable observation; keep existing app data while a read runs or fails. Claude disables persistence, MCP and settings sources; Codex reads only service-backed ChatGPT allowance without starting a thread.
+
 Codex supports context notifications and authenticated account-capacity refresh. Claude supports verified headless context/usage controls plus rate-limit events, including independent Opus/Sonnet family windows and future native pools. Generic ACP supports context only when a harness emits the optional `usage_update` standard. Antigravity headless, Cursor native stream-json, OpenCode native HTTP/SSE, Pi RPC, Process, OpenClaw, and generic HTTP-agent have no verified telemetry source in their selected protocols and report unsupported. No Fable-specific reset is assumed.
 
-Check the static `contextUsage`/`rateLimits`/refresh capabilities, an explicit `probeCapabilities` result where available, and the session observation's runtime support. See the [telemetry guide](docs/telemetry.md) for the support matrix, units, model-specific buckets, refresh/replay semantics, compatibility, and protocol evidence.
+Check the static `contextUsage`/`rateLimits`/refresh capabilities, an explicit `probeCapabilities` result where available, and the observation's runtime support. Claude/Codex telemetry probe timeouts degrade only telemetry capabilities; binary/session availability and independent Codex MCP version gating remain intact. Matching concurrent probes are deduplicated. See the [telemetry guide](docs/telemetry.md) for the support matrix, units, model-specific buckets, read/refresh/replay semantics, compatibility, and protocol evidence.
 
 ## Stream Events
 

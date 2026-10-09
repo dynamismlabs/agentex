@@ -41,6 +41,13 @@ describe("native telemetry on the session transport", () => {
     await session.close(); const closed = await session.rateLimits!.refresh!(); expect(closed.refreshSupported).toBe(false);
     expect(await readFile(log, "utf8")).toBe(calls.join("\n"));
   });
+  it("Claude explicit session reads emit authoritative replacement updates", async () => {
+    const events: StreamEvent[] = []; const session = await make("claude", {}, (event) => { events.push(event); });
+    await session.rateLimits!.refresh!();
+    expect(events.filter((event) => event.type === "rate_limits")).toEqual([
+      expect.objectContaining({ update: expect.objectContaining({ mode: "replace" }) }),
+    ]);
+  });
   it("Codex observes root context without a subscriber; compaction replaces it and partial limits retain other pools", async () => {
     const session = await make("codex"); await session.rateLimits!.refresh!();
     const first = await session.send("first"); await first.result;

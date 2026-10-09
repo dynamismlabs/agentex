@@ -107,7 +107,7 @@ export function metadata(value: Record<string, unknown>): Record<string, unknown
     if (Array.isArray(v)) return v.map((item) => clean(item, depth + 1));
     const out: Record<string, unknown> = {};
     for (const [key, item] of Object.entries(v)) {
-      if (/(?:authorization|credential|password|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|cookie|^env$)/i.test(key)) continue;
+      if (/(?:authorization|credential|password|secret|api[_-]?key|auth[_-]?token|access[_-]?token|refresh[_-]?token|id[_-]?token|^token$|cookie|^env$)/i.test(key)) continue;
       const result = clean(item, depth + 1);
       if (result !== undefined) out[key] = result;
     }

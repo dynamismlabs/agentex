@@ -142,6 +142,7 @@ export type {
   ProviderModule,
   ProviderCapabilities,
   ProviderRuntimeContext,
+  RateLimitReadContext,
   ProviderRuntimeReport,
   CapabilityStatus,
   AgentMode,
