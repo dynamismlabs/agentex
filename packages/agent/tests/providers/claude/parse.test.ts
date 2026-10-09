@@ -731,7 +731,7 @@ describe("getClaudeTaskDetails", () => {
   });
 
   it("returns null for a non-task unknown event", () => {
-    const ev = parseOne({ type: "system", subtype: "compact_boundary" });
+    const ev = parseOne({ type: "system", subtype: "future_status" });
     expect(ev.type).toBe("unknown");
     expect(getClaudeTaskDetails(ev)).toBeNull();
   });

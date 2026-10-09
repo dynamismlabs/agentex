@@ -649,7 +649,7 @@ describe("parseCodexStreamLine — v2 JSON-RPC (codex --json app-server)", () =>
     expect(event).not.toBeNull();
     expect(event!.type).toBe("rate_limit");
     if (event?.type === "rate_limit") {
-      expect(event.status).toBe("allowed");
+      expect(event.status).toBe("unknown");
       expect(event.limitType).toBe("codex");
     }
   });

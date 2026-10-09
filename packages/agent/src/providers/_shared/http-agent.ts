@@ -50,10 +50,12 @@ function readSessionKey(sessionParams: Record<string, unknown> | null | undefine
 }
 
 /** Execute a single turn against a remote HTTP agent gateway. */
-export async function runHttpAgent(
-  opts: HttpAgentOptions,
-  ctx: ExecutionContext,
-): Promise<ExecutionResult> {
+export async function runHttpAgent(opts: HttpAgentOptions, ctx: ExecutionContext): Promise<ExecutionResult> {
+  const { observeExecution } = await import("../../telemetry/integration.js");
+  return observeExecution(ctx, { context: false, rates: false }, (context) => runHttpAgentInner(opts, context));
+}
+
+async function runHttpAgentInner(opts: HttpAgentOptions, ctx: ExecutionContext): Promise<ExecutionResult> {
   const runId = ctx.runId ?? uuidv7();
   const model = ctx.model ?? ctx.config?.model ?? null;
   const config = ctx.config ?? {};
@@ -287,6 +289,10 @@ export function httpAgentProvider(opts: HttpAgentOptions): ProviderModule {
       sessions: false,
       modelDiscovery: false,
       quotaProbing: false,
+      contextUsage: false,
+      rateLimits: false,
+      contextUsageRefresh: false,
+      rateLimitsRefresh: false,
       mcp: false,
       skills: false,
       instructions: false,

@@ -1,3 +1,4 @@
+import { observeExecution } from "../../telemetry/integration.js";
 import * as path from "node:path";
 import type { ExecutionContext, ExecutionResult } from "../../types.js";
 import { findBinary } from "../../utils/binary.js";
@@ -14,7 +15,11 @@ import { prepareWorkspace } from "../../utils/workspace.js";
 import type { PreparedWorkspace } from "../../utils/workspace.js";
 import { parseClaudeStreamJson, parseStreamLine, isClaudeUnknownSessionError, isClaudeAuthRequired, CLAUDE_LOGIN_COMMAND, type PartialStreamContext } from "./parse.js";
 
-export async function executeClaudeProvider(ctx: ExecutionContext): Promise<ExecutionResult> {
+export function executeClaudeProvider(ctx: ExecutionContext): Promise<ExecutionResult> {
+  return observeExecution(ctx, { context: true, rates: true }, executeClaudeProviderInner);
+}
+
+async function executeClaudeProviderInner(ctx: ExecutionContext): Promise<ExecutionResult> {
   const runId = ctx.runId ?? uuidv7();
   let cwd = ctx.cwd ?? process.cwd();
   const config = ctx.config ?? {};

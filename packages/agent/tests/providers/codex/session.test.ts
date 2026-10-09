@@ -13,13 +13,13 @@ import type {
 
 function makeFakeProc(): { proc: ChildProcess; writes: string[] } {
   const writes: string[] = [];
-  const stdin = {
+  const stdin = Object.assign(new EventEmitter(), {
     write: (chunk: string) => {
       writes.push(chunk);
       return true;
     },
     end: () => {},
-  };
+  });
   const stdout = new EventEmitter() as EventEmitter & { setEncoding: (e: string) => void };
   stdout.setEncoding = () => {};
   const stderr = new EventEmitter() as EventEmitter & { setEncoding: (e: string) => void };
@@ -1297,7 +1297,7 @@ function makeRpcProc(
   stderr.setEncoding = () => {};
   const writes: Array<Record<string, unknown>> = [];
 
-  const stdin = {
+  const stdin = Object.assign(new EventEmitter(), {
     write: (chunk: string) => {
       for (const line of chunk.split("\n")) {
         const trimmed = line.trim();
@@ -1320,7 +1320,7 @@ function makeRpcProc(
       return true;
     },
     end: () => {},
-  };
+  });
 
   const proc = new EventEmitter() as unknown as ChildProcess;
   Object.assign(proc, { stdin, stdout, stderr, kill: () => true });

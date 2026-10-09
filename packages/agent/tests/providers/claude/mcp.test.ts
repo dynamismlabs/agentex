@@ -37,7 +37,7 @@ const sseServer: McpServerConfig = {
 };
 
 function makeFakeProc(): ChildProcess {
-  const stdin = { write: () => true, end: () => {} };
+  const stdin = Object.assign(new EventEmitter(), { write: () => true, end: () => {} });
   const stdout = new EventEmitter() as EventEmitter & { setEncoding: (e: string) => void };
   stdout.setEncoding = () => {};
   const stderr = new EventEmitter() as EventEmitter & { setEncoding: (e: string) => void };

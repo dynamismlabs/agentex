@@ -27,7 +27,7 @@ function drivenSession(): { session: CodexSessionImpl; events: StreamEvent[] } {
   const stderr = new EventEmitter() as EventEmitter & { setEncoding: (e: string) => void };
   stderr.setEncoding = () => {};
   const proc = new EventEmitter() as unknown as ChildProcess;
-  Object.assign(proc, { stdin: { write: () => true, end: () => {} }, stdout, stderr, kill: () => true });
+  Object.assign(proc, { stdin: Object.assign(new EventEmitter(), { write: () => true, end: () => {} }), stdout, stderr, kill: () => true });
   const events: StreamEvent[] = [];
   const session = new CodexSessionImpl(
     proc,

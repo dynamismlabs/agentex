@@ -40,6 +40,8 @@ export function historyFromSessionAttachment(
 ): HistoryAttachment {
   const checkpointKind = `${providerType}:byte-offset:v1`;
   return {
+    contextUsage: attachment.contextUsage,
+    rateLimits: attachment.rateLimits,
     record: attachment.record,
     historySource: attachment.transcript
       ? { kind: "file", path: attachment.transcript.filePath }

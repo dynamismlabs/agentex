@@ -78,3 +78,40 @@ export async function* readJsonlLines(
     yield { text: decodeLine(bytes), start: lineStart, end: lineStart + bytes.length };
   }
 }
+
+/** Defensive helpers shared by native telemetry adapters. */
+export function record(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+}
+export function nonnegative(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+export function textValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+export function isoTime(value: unknown, unit: "seconds" | "iso" = "iso"): string | undefined {
+  const ms = unit === "seconds" ? (typeof value === "number" && Number.isFinite(value) ? value * 1000 : NaN)
+    : typeof value === "string" ? Date.parse(value) : NaN;
+  if (!Number.isFinite(ms) || Math.abs(ms) > 8.64e15) return undefined;
+  return new Date(ms).toISOString();
+}
+/** Keep additive protocol detail but exclude credentials recursively; never store environment/config. */
+export function metadata(value: Record<string, unknown>): Record<string, unknown> {
+  const seen = new WeakSet<object>();
+  const clean = (v: unknown, depth: number): unknown => {
+    if (depth > 12) return undefined;
+    if (v === null || typeof v === "boolean" || typeof v === "number") return v;
+    if (typeof v === "string") return /^(?:Bearer|Basic)\s/i.test(v) ? "[redacted]" : v;
+    if (typeof v !== "object" || seen.has(v)) return undefined;
+    seen.add(v);
+    if (Array.isArray(v)) return v.map((item) => clean(item, depth + 1));
+    const out: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(v)) {
+      if (/(?:authorization|credential|password|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|cookie|^env$)/i.test(key)) continue;
+      const result = clean(item, depth + 1);
+      if (result !== undefined) out[key] = result;
+    }
+    return out;
+  };
+  return clean(value, 0) as Record<string, unknown>;
+}

@@ -1,3 +1,4 @@
+import { observeExecution } from "../../telemetry/integration.js";
 import type { ExecutionContext, ExecutionResult } from "../../types.js";
 import { ensureCommandResolvable } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
@@ -7,7 +8,11 @@ import { prepareWorkspace } from "../../utils/workspace.js";
 import type { PreparedWorkspace } from "../../utils/workspace.js";
 import { uuidv7 } from "../../utils/uuid.js";
 
-export async function executeProcessProvider(ctx: ExecutionContext): Promise<ExecutionResult> {
+export function executeProcessProvider(ctx: ExecutionContext): Promise<ExecutionResult> {
+  return observeExecution(ctx, { context: false, rates: false }, executeProcessProviderInner);
+}
+
+async function executeProcessProviderInner(ctx: ExecutionContext): Promise<ExecutionResult> {
   const runId = ctx.runId ?? uuidv7();
   let cwd = ctx.cwd ?? process.cwd();
   const config = ctx.config ?? {};

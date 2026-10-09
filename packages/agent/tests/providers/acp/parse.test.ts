@@ -72,9 +72,9 @@ describe("mapAcpUpdate", () => {
   });
 
   it("maps unknown update kinds to a forward-compat unknown event", () => {
-    const e = mapAcpUpdate({ sessionUpdate: "usage_update", size: 10, used: 3 }, info);
+    const e = mapAcpUpdate({ sessionUpdate: "future_update", size: 10, used: 3 }, info);
     expect(e?.type).toBe("unknown");
-    if (e?.type === "unknown") expect(e.subtype).toBe("usage_update");
+    if (e?.type === "unknown") expect(e.subtype).toBe("future_update");
   });
 });
 

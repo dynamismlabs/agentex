@@ -84,6 +84,8 @@ Under `never` with full access, Codex approves MCP and ChatGPT app tool calls it
 
 An MCP server's own form or URL request goes to `onElicitation`, and is declined without one. MCP and app calls surface as `tool_call` / `tool_result` events under the same `mcp__<server>__<tool>` name.
 
+Codex CLI 0.160+ also honors `config.mcpServers` for both `execute()` and new/resumed sessions. Attached configurations default to strict isolation from ambient configured MCP servers; set `strictMcpConfig: false` to retain them. Header values and stdio environment values stay out of argv, and `CODEX_HOME`, auth and history remain in place. Host-supplied servers enforce their own tool policy and are automatically approved by Codex, avoiding duplicate host permission requests. Other servers and native ChatGPT apps retain the approval behavior above. See the [Codex MCP guide](docs/codex-mcp.md) for configuration, runtime requirements and verified resume behavior.
+
 ### Antigravity (Google)
 
 Google moved personal accounts (Free, Google AI Pro, Google AI Ultra) from Gemini CLI to the [Antigravity CLI](https://antigravity.google/docs/cli/overview) on 2026-06-18. Signing in to Gemini CLI with one of those accounts now fails with "This client is no longer supported for Gemini Code Assist for individuals". Use the `antigravity` provider for them. The `gemini` provider still works with a paid API key or Gemini Code Assist Standard/Enterprise.
@@ -314,8 +316,8 @@ interface ProviderConfig {
   skipPermissions?: boolean;
   skillDirs?: string[];
   instructionsFile?: string;
-  mcpServers?: McpServerConfig[];   // stdio | http | sse — staged as a 0600 file, passed via --mcp-config
-  strictMcpConfig?: boolean;        // claude: --strict-mcp-config — MCP surface is exactly what you attach
+  mcpServers?: McpServerConfig[];   // Claude: stdio | http | sse; Codex 0.160+: stdio | streamable HTTP
+  strictMcpConfig?: boolean;        // ambient configured MCP isolation; Codex defaults true when servers are supplied
   allowedTools?: string[];          // claude: --allowed-tools (patterns verbatim; codex ignores)
   disallowedTools?: string[];       // claude: --disallowed-tools (deny wins; codex ignores)
   includePartialMessages?: boolean; // claude, antigravity: emit assistant_delta/thinking_delta typewriter events
@@ -330,8 +332,9 @@ interface ProviderConfig {
 }
 ```
 
-MCP servers attach via a generated config file, never argv — http `headers` can
-carry bearer tokens and argv is world-readable via `ps`:
+Claude stages MCP configuration in a private file. Codex uses native config
+overrides with header and stdio-env values in child-only environment variables.
+Credentials in those fields never enter argv:
 
 ```typescript
 config.mcpServers = [
@@ -372,6 +375,8 @@ interface ExecutionResult {
   durationApiMs?: number | null;      // Time in model API calls, separate from wall clock
   permissionDenials?: unknown[];      // Claude permission_denials array, verbatim
   rateLimits?: RateLimitInfo[];       // Rate-limit signals observed during the run
+  contextUsage?: TelemetryObservation<ContextUsage>; // Latest effective context observation
+  rateLimitSnapshot?: TelemetryObservation<RateLimitSnapshot>; // Independent capacity buckets
 
   raw?: Record<string, unknown> | null; // True escape hatch: final provider-native event verbatim
   workspace?: PreparedWorkspace;       // Present if config.workspace was set
@@ -402,6 +407,35 @@ interface RateLimitInfo {
 
 Use `aggregateUsage(result.usage)` to collapse per-model usage into a single total.
 
+## Context and provider capacity
+
+Session context occupancy and provider/account capacity are separate optional measurements. Neither changes billed/run token accounting. Never sum historical turn tokens to estimate context, and never add utilization percentages from independent quota buckets.
+
+```typescript
+const provider = getProvider("claude");
+const session = await provider.createSession!({ cwd: process.cwd() });
+try {
+  const cachedContext = session.contextUsage?.getSnapshot(); // synchronous, no I/O
+  const cachedCapacity = session.rateLimits?.getSnapshot(); // independent cache
+  const context = await session.contextUsage?.refresh?.(); // native control, where supported
+  const capacity = await session.rateLimits?.refresh?.();
+
+  if (context?.status === "fresh") console.log(context.value?.usedPercent);
+  for (const bucket of capacity?.value?.buckets ?? []) {
+    // Account/shared, family-specific, and opaque provider pools can apply together.
+    console.log(bucket.id, bucket.applicability, bucket.usedPercent, bucket.resetAt, bucket.stale);
+  }
+} finally {
+  await session.close();
+}
+```
+
+Unknown values stay absent; measured zero stays zero. Observations distinguish unsupported, unobserved, unavailable, fresh, and stale data. An empty reported bucket collection differs from no snapshot and does not prove available capacity. Partial updates preserve unrelated buckets and their timestamps; expired resets mark data stale without inventing fresh zero usage. Caches are isolated per session/auth transport.
+
+Codex supports context notifications and authenticated account-capacity refresh. Claude supports verified headless context/usage controls plus rate-limit events, including independent Opus/Sonnet family windows and future native pools. Generic ACP supports context only when a harness emits the optional `usage_update` standard. Antigravity headless, Cursor native stream-json, OpenCode native HTTP/SSE, Pi RPC, Process, OpenClaw, and generic HTTP-agent have no verified telemetry source in their selected protocols and report unsupported. No Fable-specific reset is assumed.
+
+Check the static `contextUsage`/`rateLimits`/refresh capabilities, an explicit `probeCapabilities` result where available, and the session observation's runtime support. See the [telemetry guide](docs/telemetry.md) for the support matrix, units, model-specific buckets, refresh/replay semantics, compatibility, and protocol evidence.
+
 ## Stream Events
 
 Emitted during execution via `onEvent`. Every event carries the same normalized ID set on top of its variant-specific fields:
@@ -430,6 +464,9 @@ Variants:
 - `unknown` — Fallback for unrecognized wire events (`subtype` = the provider's `type` field). Forward-compat access to new CLI events via `raw` without a library update.
 - `tool_result` — Tool returned a result (`toolCallId: string | null`, `toolName: string | null`, `content`, `isError`, `exitCode: number | null`). `toolName` mirrors the matching `tool_call.name` (correlated for you), so you don't need your own `toolCallId → name` cache; null when no preceding `tool_call` was seen on the stream.
 - `rate_limit` — Provider reported rate-limit state (`status`, `limitType`, `resetAt`, `overageStatus`, `isUsingOverage`)
+- `context_usage` — Current effective context observation (`usage: ContextUsage`), independent of run accounting.
+- `context_usage_invalidated` — Compaction/reset invalidated the last context observation (`reason`).
+- `rate_limits` — Independent provider-capacity update (`update: RateLimitUpdate`); partial notifications merge only supplied buckets.
 - `permission_mode` — Permission mode change mid-session (`permissionMode: string`). Claude only, e.g., when the user accepts a plan and the session leaves `plan` mode.
 - `background_task` — Provider-neutral lifecycle for work that can outlive the root turn (`taskId`, `taskType`, `phase`, `status`, `description`, `summary`, `parentTaskId`, `toolUseId`, `report`). A terminal task event never settles the root turn.
 - `turn_start` — A turn opened (`turnId`, `trigger`). `trigger` is `"send"` when the host dispatched it and `"resume"` when the provider started it on its own — Claude does the latter when a background task's result comes back, opening a turn no `send()` can see. Track "is the agent working" from `turn_start` → `turn_end`, not from your own dispatch. `turnId` is session-local (`turn-1`, `turn-2`, …), not a provider id. `turn_start` deliberately does not name the task behind a `resume`: Claude delivers a task's result and opens the turn as two unlinked records, so with several tasks in flight the pairing is not recoverable from the wire — correlate through `background_task.report` and `toolUseId` instead.
@@ -1300,7 +1337,9 @@ registerProvider(myProvider);
 - `findBinary(name, configOverride?)` — resolve a provider CLI on disk.
 - `ensureCommandResolvable(command)` — like `findBinary` but accepts an absolute path too.
 - `clearBinaryCache()` — invalidate the binary-resolution cache.
-- `provider.checkQuota?(ctx)` — rate-limit / quota status (when `capabilities.quotaProbing`).
+- `provider.checkQuota?(ctx)` — deprecated legacy quota surface. Claude returns unmeasured/unknown capacity; use `session.rateLimits`.
+- `session.contextUsage?.getSnapshot(options?)` / `session.rateLimits?.getSnapshot(options?)` — independent, synchronous observations with no provider request.
+- `session.contextUsage?.refresh?.()` / `session.rateLimits?.refresh?.()` — explicit bounded native reads, when supported by the selected runtime/auth context.
 - `provider.listModels?(opts?)` — enumerate models the binary can drive, where the CLI exposes a catalog (for example `cursor`, `opencode`, and `antigravity` via `agy models`). Otherwise pass the model you want directly via `ExecutionContext.model` or `ProviderConfig.model`.
 
 ### Workspace

@@ -1,3 +1,4 @@
+import { observeExecution } from "../../telemetry/integration.js";
 import * as path from "node:path";
 import type { ExecutionContext, ExecutionResult, StreamEvent } from "../../types.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
@@ -17,7 +18,11 @@ import {
 } from "./parse.js";
 import { findCursorBinary } from "./runtime.js";
 
-export async function executeCursorProvider(ctx: ExecutionContext): Promise<ExecutionResult> {
+export function executeCursorProvider(ctx: ExecutionContext): Promise<ExecutionResult> {
+  return observeExecution(ctx, { context: false, rates: false }, executeCursorProviderInner);
+}
+
+async function executeCursorProviderInner(ctx: ExecutionContext): Promise<ExecutionResult> {
   const runId = ctx.runId ?? uuidv7();
   let cwd = ctx.cwd ?? process.cwd();
   const model = ctx.model ?? ctx.config?.model ?? "";

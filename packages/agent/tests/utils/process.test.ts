@@ -32,6 +32,19 @@ describe("runChildProcess", () => {
     expect(result.stdout).toBe("hello from stdin");
   });
 
+  it("survives a child closing stdin before consuming a large input", async () => {
+    const result = await runChildProcess({
+      runId: "test-closed-stdin",
+      command: process.execPath,
+      args: ["-e", "process.stdin.destroy(); process.stdout.write('done');"],
+      cwd: baseCwd,
+      env: baseEnv,
+      stdin: "x".repeat(4 * 1024 * 1024),
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe("done");
+  });
+
   it("captures non-zero exit code", async () => {
     const result = await runChildProcess({
       runId: "test-false",

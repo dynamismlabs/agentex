@@ -1,3 +1,4 @@
+import { TelemetryStore } from "../../telemetry/store.js";
 import type { ChildProcess } from "node:child_process";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -33,7 +34,7 @@ import { claudeEffortFlagValue } from "./effort.js";
 import { buildSkillsDir, cleanupSkillsDir } from "../../utils/skills.js";
 import { claudeFeatureArgs, cleanupMcpConfig, stageMcpConfig } from "./mcp.js";
 import { createToolNameTracker } from "../../utils/tool-names.js";
-import { parseStreamLine, classifyClaudeAuthFromResult, CLAUDE_LOGIN_COMMAND, type PartialStreamContext } from "./parse.js";
+import { claudeContextUsage, claudeUsageRateLimits, parseClaudeStreamEvent, classifyClaudeAuthFromResult, CLAUDE_LOGIN_COMMAND, type PartialStreamContext } from "./parse.js";
 
 /** A pending `send()` whose `result` Promise hasn't settled yet. */
 interface PendingResult {
@@ -359,6 +360,8 @@ export class ClaudeSessionImpl implements AgentSession {
   private _draining = false;
   /** Shared promise so concurrent / repeated `drain()` calls coalesce. */
   private _drainPromise: Promise<void> | null = null;
+  /** Includes cleanup when a stdin failure starts closing before the host does. */
+  private _closePromise: Promise<void> | null = null;
 
   /** Tracks the owning message id across --include-partial-messages lines. */
   private readonly _partialCtx: PartialStreamContext = { messageId: null };
@@ -401,6 +404,12 @@ export class ClaudeSessionImpl implements AgentSession {
   private _goalScanOffset = 0;
   private _goalPoll: ReturnType<typeof setInterval> | null = null;
   private readonly cwd: string;
+  private readonly telemetry = new TelemetryStore("unknown", "unknown");
+  readonly contextUsage = this.telemetry.context;
+  readonly rateLimits = this.telemetry.rateLimits;
+  private contextRefreshObserved = false;
+  private contextAutoRefreshRunning = false;
+  private contextAutoRefreshRequested = false;
 
   constructor(
     private readonly proc: ChildProcess,
@@ -409,6 +418,49 @@ export class ClaudeSessionImpl implements AgentSession {
     private readonly mcpConfigPath: string | null = null,
   ) {
     this.cwd = ctx.cwd ?? process.cwd();
+    this.telemetry.setContextRefresh(async () => {
+      const contextRevision = this.telemetry.contextScopeVersion;
+      try {
+        const response = await this.telemetryControl("get_context_usage", { detail: "summary" });
+        const usage = claudeContextUsage(response, new Date().toISOString());
+        if (!usage) { this.telemetry.invalidateContext("Runtime returned no context metrics"); return; }
+        this.contextRefreshObserved = true;
+        if (contextRevision !== this.telemetry.contextScopeVersion) {
+          // A compaction/native update crossed this read. The source is proved,
+          // but the old response cannot make the changed context fresh.
+          this.contextAutoRefreshRequested = true;
+          if (!this.contextAutoRefreshRunning) {
+            setTimeout(() => { if (!this.isClosed()) this.requestContextRefresh(); }, 0).unref();
+          }
+          return;
+        }
+        this.dispatchEvent({ type: "context_usage", usage, ...this.telemetryBase(response, usage.observedAt) });
+      } catch (error) {
+        if (/unknown (?:request|subtype|method)|unsupported (?:request|subtype|method)|(?:request|method).*not supported|unrecognized (?:request|subtype|method)/i.test(error instanceof Error ? error.message : "")) {
+          this.telemetry.setContextSupport("unsupported", "Selected Claude runtime has no get_context_usage control"); return;
+        }
+        throw error;
+      }
+    });
+    this.telemetry.setRateLimitRefresh(async () => {
+      const authRevision = this.telemetry.rateLimitScopeVersion;
+      try {
+        const response = await this.telemetryControl("get_usage", { skip_behaviors: true });
+        if (authRevision !== this.telemetry.rateLimitScopeVersion) return;
+        if (response["rate_limits_available"] === false) {
+          this.telemetry.setRateLimitSupport("unsupported", "Plan telemetry is unavailable for the selected Claude auth context"); return;
+        }
+        const update = claudeUsageRateLimits(response, new Date().toISOString());
+        if (!update) { this.telemetry.unavailableRates("Runtime returned no plan rate-limit data"); return; }
+        this.dispatchEvent({ type: "rate_limits", update, ...this.telemetryBase(response, update.snapshot.observedAt) });
+      } catch (error) {
+        if (authRevision !== this.telemetry.rateLimitScopeVersion) return;
+        if (/unknown (?:request|subtype|method)|unsupported (?:request|subtype|method)|(?:request|method).*not supported|unrecognized (?:request|subtype|method)/i.test(error instanceof Error ? error.message : "")) {
+          this.telemetry.setRateLimitSupport("unsupported", "Selected Claude runtime has no get_usage control"); return;
+        }
+        throw error;
+      }
+    });
     this._goals = new GoalController({
       providerType: "claude",
       capability: claudeGoalCapability,
@@ -446,8 +498,16 @@ export class ClaudeSessionImpl implements AgentSession {
       }
     });
 
+    // A closed child stdin can emit EPIPE before its process exit arrives.
+    // Handle the stream error and run the same pending-request/resource cleanup
+    // as an explicit close, rather than allowing an uncaught host exception.
+    proc.stdin!.on("error", () => {
+      void this.close().catch(() => { /* best effort transport cleanup */ });
+    });
+
     proc.on("exit", (code, signal) => {
       if (this._state !== "closed") {
+        this.telemetry.close();
         this._state = "closed";
         const err = new Error(
           `Claude process exited unexpectedly (code=${code}, signal=${signal})`
@@ -458,6 +518,7 @@ export class ClaudeSessionImpl implements AgentSession {
 
     proc.on("error", (err) => {
       if (this._state !== "closed") {
+        this.telemetry.close();
         this._state = "closed";
         this.rejectAllPending(err);
       }
@@ -924,12 +985,18 @@ export class ClaudeSessionImpl implements AgentSession {
     }
   }
 
-  async close(): Promise<void> {
-    if (this._state === "closed") return;
+  close(): Promise<void> {
+    if (this._closePromise) return this._closePromise;
+    if (this._state === "closed") return Promise.resolve();
+    return this._closePromise = this.closeTransport();
+  }
+
+  private async closeTransport(): Promise<void> {
+    this.telemetry.close();
     this._state = "closed";
     // Anything still waiting has no turn left to settle it. Without this a
     // bare `close()` with a send in flight hung that caller for good.
-    this.rejectPendingSends(new Error("Session closed before the turn completed"));
+    this.rejectAllPending(new Error("Session closed before the turn completed"));
     // Final transcript scan so a goal_status (e.g. `met`) written since the last
     // ~800ms poll isn't lost on a fast close. No-op when no goal is observed.
     await this.scanGoalTranscript().catch(() => { /* best effort */ });
@@ -1026,7 +1093,7 @@ export class ClaudeSessionImpl implements AgentSession {
       const closingTurn = this.takeOpenTurn();
       const batch = this.claimSettlementBatch(closingTurn);
       this._seenResult = true;
-      this.handleStreamMessage(msg, line);
+      this.handleStreamMessage(msg);
       // Announced after the result event, so the payload precedes the close.
       this.emitTurnEnd(closingTurn, "result");
       void this.handleResult(msg, batch);
@@ -1034,7 +1101,7 @@ export class ClaudeSessionImpl implements AgentSession {
     }
 
     // Stream events — forward via onEvent and parse for agentex StreamEvent
-    this.handleStreamMessage(msg, line);
+    this.handleStreamMessage(msg);
   }
 
   // -------------------------------------------------------------------------
@@ -1080,9 +1147,43 @@ export class ClaudeSessionImpl implements AgentSession {
     }
   }
 
+  /** Provenance for locally requested native telemetry responses. */
+  private telemetryBase(raw: Record<string, unknown>, timestamp: string) {
+    return { raw, timestamp, providerType: "claude", sessionId: this._sessionId,
+      messageId: null, eventId: null, turnId: null, parentToolCallId: null };
+  }
+
+  /** Bounded native read; cleans pending request/timer on timeout, response, or close. */
+  private telemetryControl(subtype: string, fields: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (this.isClosed()) return Promise.reject(new Error("Session closed"));
+    const requestId = randomUUID();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this._pendingControlResponses.delete(requestId);
+        reject(new Error("Telemetry control timed out"));
+      }, 10_000);
+      timer.unref();
+      this._pendingControlResponses.set(requestId, {
+        resolve: (response) => { clearTimeout(timer); resolve(response); },
+        reject: (error) => { clearTimeout(timer); reject(error); },
+      });
+      const failWrite = (error: Error | null | undefined) => {
+        if (!error) return;
+        const pending = this._pendingControlResponses.get(requestId);
+        this._pendingControlResponses.delete(requestId);
+        pending?.reject(error);
+      };
+      try {
+        this.proc.stdin!.write(ndjsonLine({ type: "control_request", request_id: requestId, request: { subtype, ...fields } }), failWrite);
+      } catch (error) {
+        failWrite(error instanceof Error ? error : new Error("Telemetry control write failed"));
+      }
+    });
+  }
+
   /**
    * Handle a `control_response` from the CLI — a reply to an outgoing
-   * `control_request` we sent (currently only `cancel_async_message`).
+   * `control_request` we sent.
    *
    * Wire shape:
    *   {type:"control_response", response:{request_id, subtype:"success"|"error", response:{...} | error}}
@@ -1377,7 +1478,8 @@ export class ClaudeSessionImpl implements AgentSession {
   // Stream event forwarding
   // -------------------------------------------------------------------------
 
-  private handleStreamMessage(msg: Record<string, unknown>, rawLine: string): void {
+  private handleStreamMessage(msg: Record<string, unknown>): void {
+    if (msg["type"] === "auth_status") this.telemetry.resetRates();
     // A line can arrive during close()'s grace window. Acting on it would
     // reopen a turn on a dead session, flip `state` off "closed", and emit a
     // `turn_start` to a host that has already drained — with nothing left to
@@ -1464,13 +1566,10 @@ export class ClaudeSessionImpl implements AgentSession {
       this.openTurn(claimedUuid ? "send" : "resume", claimedUuid ?? (namedUuid || null), msg);
     }
 
-    // Parse + dispatch when there's an onEvent subscriber OR an active goal to
-    // observe, so native goal_status transitions update getGoal() even with no
-    // handler. dispatchEvent observes unconditionally and gates delivery on cb.
-    if (this.ctx.onEvent || this._goals.isTracking()) {
-      for (const event of parseStreamLine(rawLine, this._partialCtx)) {
-        this.dispatchEvent(event);
-      }
+    // Telemetry and native state are observed even without an event subscriber.
+    // The transport has already decoded this payload; normalize it once.
+    for (const event of parseClaudeStreamEvent(msg, this._partialCtx)) {
+      this.dispatchEvent(event);
     }
   }
 
@@ -1601,7 +1700,26 @@ export class ClaudeSessionImpl implements AgentSession {
     };
   }
 
+  /** Do not lose a compaction/capacity change that arrives while a previous read is in flight. */
+  private requestContextRefresh(): void {
+    this.contextAutoRefreshRequested = true;
+    if (this.contextAutoRefreshRunning) return;
+    this.contextAutoRefreshRunning = true;
+    void (async () => {
+      try {
+        while (this.contextAutoRefreshRequested && !this.isClosed()) {
+          this.contextAutoRefreshRequested = false;
+          await this.contextUsage.refresh?.();
+        }
+      } finally { this.contextAutoRefreshRunning = false; }
+    })();
+  }
+
   private dispatchEvent(event: StreamEvent): void {
+    this.telemetry.observe(event);
+    if (this.contextRefreshObserved && !event.parentToolCallId && (event.type === "result" || event.type === "context_usage_invalidated" || (event.type === "system" && Boolean(event.model)))) {
+      this.requestContextRefresh();
+    }
     // Enrich and record before anything can bail out. `_trackTaskFacts` also
     // maintains session state — which tasks are live, which results are
     // waiting for a resume turn — and gating that on a subscriber meant

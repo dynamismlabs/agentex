@@ -1,3 +1,4 @@
+import { nonnegative, record, textValue } from "../../utils/jsonl-lines.js";
 import type { BaseStreamEventFields, StreamEvent } from "../../types.js";
 
 function str(v: unknown): string | null {
@@ -71,6 +72,22 @@ export function mapAcpUpdate(update: Record<string, unknown>, info: AcpBaseInfo)
     case "agent_thought_chunk": {
       const text = extractContentText(update["content"]);
       return text != null ? { type: "thinking", text, ...base } : null;
+    }
+    case "usage_update": {
+      const usedTokens = nonnegative(update["used"]);
+      const capacityTokens = nonnegative(update["size"]);
+      if (usedTokens === undefined || capacityTokens === undefined || capacityTokens === 0) {
+        return { type: "unknown", subtype: "usage_update", ...base };
+      }
+      const usedPercent = nonnegative(usedTokens / capacityTokens * 100);
+      const cost = record(update["cost"]);
+      const amount = nonnegative(cost?.amount);
+      const currency = textValue(cost?.currency);
+      return { type: "context_usage", usage: {
+        usedTokens, capacityTokens, ...(usedPercent !== undefined ? { usedPercent } : {}),
+        observedAt: info.timestamp,
+        ...(amount !== undefined && currency ? { sessionCost: { amount, currency } } : {}),
+      }, ...base };
     }
     case "user_message_chunk":
       return null;

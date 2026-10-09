@@ -1,3 +1,5 @@
+import { observeExecution } from "../../telemetry/integration.js";
+import { TelemetryStore } from "../../telemetry/store.js";
 import type { ChildProcess } from "node:child_process";
 import { spawn } from "node:child_process";
 import { Readable, Writable } from "node:stream";
@@ -115,6 +117,9 @@ export async function createAcpSession(
 }
 
 class AcpSession implements AgentSession {
+  private readonly telemetry = new TelemetryStore("unknown", "unsupported");
+  readonly contextUsage = this.telemetry.context;
+  readonly rateLimits = this.telemetry.rateLimits;
   private _state: SessionState = "idle";
   private _sessionId: string | null = null;
   private proc: ChildProcess | null = null;
@@ -184,11 +189,13 @@ class AcpSession implements AgentSession {
       }
     });
     proc.on("exit", () => {
+      this.telemetry.close();
       if (this._state !== "closed") this._state = "closed";
     });
     // Catch spawn failures (ENOENT, EACCES) — an unhandled 'error' event would
     // otherwise crash the host process.
     proc.on("error", () => {
+      this.telemetry.close();
       if (this._state !== "closed") this._state = "closed";
     });
 
@@ -279,6 +286,7 @@ class AcpSession implements AgentSession {
       }
     } catch (err) {
       // Spawn/handshake failed — tear down so we don't leak the child process.
+      this.telemetry.close();
       this._state = "closed";
       try {
         proc.kill();
@@ -304,7 +312,8 @@ class AcpSession implements AgentSession {
     if (!update) return;
     // Drop stragglers from a finished/aborted turn (ACP events aren't turn-tagged,
     // so a late update would otherwise be attributed to the next turn).
-    if (!this._turnActive) return;
+    if (!this._turnActive && update["sessionUpdate"] !== "usage_update") return;
+    if (params.sessionId !== this._sessionId && this._sessionId !== null) return;
 
     const kind = update["sessionUpdate"];
     if (kind === "agent_message_chunk") {
@@ -327,6 +336,7 @@ class AcpSession implements AgentSession {
       timestamp: new Date().toISOString(),
     });
     if (event) {
+      this.telemetry.observe(event);
       if (event.type === "tool_result" && !event.toolName && event.toolCallId) {
         const cached = this._toolNames.get(event.toolCallId);
         if (cached) event.toolName = cached;
@@ -551,6 +561,7 @@ class AcpSession implements AgentSession {
   }
 
   async close(): Promise<void> {
+    this.telemetry.close();
     this._state = "closed";
     const proc = this.proc;
     this.proc = null;
@@ -667,10 +678,11 @@ function mapTurnStatus(status: TurnResult["status"]): ExecutionStatus {
  * session machinery load only when an ACP provider is actually invoked
  * (spec §5.1).
  */
-export async function runAcpExecute(
-  deps: AcpSessionDeps,
-  ctx: ExecutionContext,
-): Promise<ExecutionResult> {
+export function runAcpExecute(deps: AcpSessionDeps, ctx: ExecutionContext): Promise<ExecutionResult> {
+  return observeExecution(ctx, { context: true, rates: false }, (context) => runAcpExecuteInner(deps, context));
+}
+
+async function runAcpExecuteInner(deps: AcpSessionDeps, ctx: ExecutionContext): Promise<ExecutionResult> {
   const runId = ctx.runId ?? uuidv7();
   const startedAt = new Date().toISOString();
   const startMs = Date.now();

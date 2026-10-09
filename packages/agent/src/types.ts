@@ -3,6 +3,14 @@ export interface ProviderCapabilities {
   sessions: boolean;
   modelDiscovery: boolean;
   quotaProbing: boolean;
+  /** Can consume current-context observations (runtime emission is optional). */
+  contextUsage?: boolean;
+  /** Can consume provider capacity observations, independent of token accounting. */
+  rateLimits?: boolean;
+  /** A proved non-inference context refresh exists in the selected protocol. */
+  contextUsageRefresh?: boolean;
+  /** A proved non-inference provider capacity refresh exists. */
+  rateLimitsRefresh?: boolean;
   mcp: boolean;
   skills: boolean;
   skillInventory?: "provider-init" | "local-discovery" | "none";
@@ -354,7 +362,7 @@ export interface ProviderModule {
    * to query it (ACP, codex), so it's async and accepts cwd/env/config.
    */
   listModes?(options?: ListModesOptions): Promise<AgentMode[]>;
-  /** Check current quota/rate limit status. Not all providers support this. */
+  /** @deprecated Use session.rateLimits; legacy booleans cannot express unknown capacity. */
   checkQuota?(ctx: QuotaContext): Promise<QuotaStatus>;
   /**
    * Polymorphic on-disk transcript access. Present only on providers that
@@ -534,6 +542,8 @@ export interface AttachOptions {
 
 /** Read-only reattachment to a session's durable state. See `attachSession`. */
 export interface SessionAttachment {
+  readonly contextUsage?: TelemetrySurface<ContextUsage>;
+  readonly rateLimits?: TelemetrySurface<RateLimitSnapshot>;
   /** The input record, normalized through the provider's `sessionCodec`. */
   record: SessionRecord;
   /** Located on-disk transcript, or null (then `lastTurn` is "unknown"). */
@@ -574,6 +584,8 @@ export interface HistoryCatchUpOptions {
 }
 
 export interface HistoryAttachment {
+  readonly contextUsage?: TelemetrySurface<ContextUsage>;
+  readonly rateLimits?: TelemetrySurface<RateLimitSnapshot>;
   record: SessionRecord;
   historySource: HistorySource | null;
   lastTurn: LastTurnStatus;
@@ -697,11 +709,17 @@ export interface ProviderConfig {
   instructionsFile?: string;
   mcpServers?: McpServerConfig[];
   /**
-   * Only use MCP servers from `mcpServers` (claude: `--strict-mcp-config`),
+   * Only use MCP servers from `mcpServers` (claude: `--strict-mcp-config`;
+   * Codex 0.160+: verified native config overrides),
    * ignoring ambient configs (a stray `.mcp.json` in cwd, user-scope servers).
    * Hosts embedding sessions should set this so the session's MCP surface is
    * exactly what they attach. Works without `mcpServers` too — strict with no
    * config blocks all ambient MCP.
+   * Codex defaults to strict when `mcpServers` is supplied, including an empty
+   * array. Set false to retain ambient configured servers. Codex's separate
+   * native ChatGPT apps integration is not controlled by this option.
+   * MCP-configured Codex resumes use the supplied/restored cwd so discovery
+   * and the resumed thread load the same project configuration.
    */
   strictMcpConfig?: boolean;
   /**
@@ -777,6 +795,7 @@ export interface ProviderConfig {
 // Quota probing
 // ---------------------------------------------------------------------------
 
+/** @deprecated Use RateLimitSnapshot; available=false with detail.measured=false means unknown. */
 export interface QuotaStatus {
   /** Whether the provider currently has available capacity */
   available: boolean;
@@ -889,6 +908,116 @@ export interface RateLimitInfo {
   isUsingOverage: boolean | null;
 }
 
+// ---------------------------------------------------------------------------
+// Optional telemetry — independent from billed/run token accounting.
+// ---------------------------------------------------------------------------
+
+/** Current effective session context, as observed by the harness. Never cumulative. */
+export interface ContextUsage {
+  model?: string;
+  usedTokens?: number;
+  capacityTokens?: number;
+  /** Provider-reported percentage, or usedTokens / capacityTokens * 100. Can exceed 100. */
+  usedPercent?: number;
+  /** ISO 8601 source timestamp, or receive time when the source has none. */
+  observedAt: string;
+  /** Optional ACP cumulative session cost; never a per-turn charge. */
+  sessionCost?: { amount: number; currency: string };
+  /** Sanitized additive native telemetry detail. */
+  metadata?: Record<string, unknown>;
+}
+
+/** Ownership is independent from the models/requests to which a bucket applies. */
+export interface RateLimitOwner {
+  kind: "account" | "workspace" | "unknown";
+  id?: string;
+}
+
+export type RateLimitApplicability =
+  | { kind: "all_models" }
+  | { kind: "models"; modelIds: string[] }
+  | { kind: "model_family"; family: string }
+  | { kind: "provider_pool"; pool: string }
+  | { kind: "unknown" };
+
+/** One independent allowance. Do not sum percentages across buckets. */
+export interface RateLimitBucket {
+  /** Opaque stable native identity plus window identity where necessary. */
+  id: string;
+  label?: string;
+  /** Opaque native collection identity, when a source can replace a subset of buckets. */
+  collectionId?: string;
+  owner: RateLimitOwner;
+  applicability: RateLimitApplicability;
+  usedPercent?: number;
+  /** Absolute quantities only when supplied, with the provider's units. */
+  used?: number;
+  remaining?: number;
+  limit?: number;
+  unit?: string;
+  durationMs?: number;
+  resetAt?: string;
+  /** Native status/reason. Percentages alone do not imply enforcement. */
+  enforcement?: { status?: string; reason?: string; allowed?: boolean };
+  overage?: {
+    status?: string;
+    reason?: string;
+    isUsing?: boolean;
+    enabled?: boolean;
+    resetAt?: string;
+  };
+  credits?: { hasCredits?: boolean; unlimited?: boolean; balance?: string };
+  observedAt: string;
+  /** Added to reads; reset expiry marks stale without fabricating zero usage. */
+  stale?: boolean;
+  metadata?: Record<string, unknown>;
+}
+
+/** Latest observed provider/account allowance, potentially with buckets of different ages. */
+export interface RateLimitSnapshot {
+  provider: string;
+  accountId?: string;
+  /** Opaque session-local auth scope, never credentials. */
+  authContextId?: string;
+  buckets: RateLimitBucket[];
+  observedAt: string;
+  /** Native permission for ordinary included usage, when reported. */
+  ordinaryUsageAllowed?: boolean;
+  metadata?: Record<string, unknown>;
+}
+
+/** Notification updates are normally partial; only authoritative reads may replace. */
+export interface RateLimitUpdate {
+  snapshot: RateLimitSnapshot;
+  mode: "merge" | "replace";
+  removedBucketIds?: string[];
+  /** Authoritative native subcollections; unrelated buckets remain untouched. */
+  replacedCollectionIds?: string[];
+}
+
+export interface TelemetryReadOptions {
+  /** Age threshold for freshness; defaults to 60 seconds. Infinity disables age expiry. */
+  maxAgeMs?: number;
+  /** Optional clock for deterministic reads/replay. Defaults to Date.now(). */
+  now?: number;
+}
+
+/** Unknown support means an optional protocol signal has not yet been demonstrated. */
+export interface TelemetryObservation<T> {
+  support: "supported" | "unsupported" | "unknown";
+  status: "unsupported" | "unobserved" | "unavailable" | "fresh" | "stale";
+  value: T | null;
+  /** True only after source support is established and the live transport can refresh. */
+  refreshSupported: boolean;
+  reason?: string;
+}
+
+/** Reads never perform I/O. Refresh is explicit, bounded and deduplicated. */
+export interface TelemetrySurface<T> {
+  getSnapshot(options?: TelemetryReadOptions): TelemetryObservation<T>;
+  refresh?(): Promise<TelemetryObservation<T>>;
+}
+
 // Execution output
 export interface ExecutionResult {
   runId: string;
@@ -901,6 +1030,9 @@ export interface ExecutionResult {
   errorMessage: string | null;
   errorCode: string | null;
   usage?: Record<string, ModelUsage>;
+  /** Final latest-observed telemetry; independent from usage. */
+  contextUsage?: TelemetryObservation<ContextUsage>;
+  rateLimitSnapshot?: TelemetryObservation<RateLimitSnapshot>;
   costUsd: number | null;
   model: string | null;
   summary: string | null;
@@ -1092,6 +1224,9 @@ export type AuthRequiredReason =
  */
 // Stream events — discriminated union
 export type StreamEvent =
+  | ({ type: "context_usage"; usage: ContextUsage } & BaseStreamEventFields)
+  | ({ type: "rate_limits"; update: RateLimitUpdate } & BaseStreamEventFields)
+  | ({ type: "context_usage_invalidated"; reason: string } & BaseStreamEventFields)
   | ({
       type: "system";
       subtype: string;
@@ -1556,11 +1691,15 @@ export interface UpstreamProviderManager {
  * An MCP server to attach to the agent. Two transports:
  * - **stdio** (default when `type` is omitted): the agent spawns `command`.
  * - **http / sse**: the agent connects to `url`; `headers` may carry auth
- *   tokens — agentex stages the config as a 0600 temp file and passes
- *   `--mcp-config <path>`, never inline argv (argv is world-readable via `ps`).
+ *   tokens. Claude stages a 0600 config file; Codex uses unique child-only
+ *   environment variables. Header and stdio-env values never enter argv.
  *
- * Honored by the claude provider. Codex has no MCP wiring yet
- * (`capabilities.mcp` is `false` there); the field is ignored.
+ * Honored by Claude and Codex (CLI 0.160+). Codex supports stdio and streamable
+ * HTTP; legacy SSE is rejected. Host-owned Codex servers enforce their own
+ * tool permissions and receive no duplicate Codex approval prompt. Their
+ * ordinary MCP elicitations still reach `onElicitation`. Codex rejects names
+ * that collide with ambient servers instead of inheriting ambient credentials
+ * or per-tool policies; `codex_apps` is reserved for the native app integration.
  */
 export type McpServerConfig =
   | {
@@ -1710,6 +1849,10 @@ export interface SendOptions {
 
 /** A persistent session handle for multi-turn conversations. */
 export interface AgentSession {
+  /** Independent optional context telemetry. Reading is synchronous and performs no I/O. */
+  readonly contextUsage?: TelemetrySurface<ContextUsage>;
+  /** Provider/account telemetry observed on this auth-scoped session transport. */
+  readonly rateLimits?: TelemetrySurface<RateLimitSnapshot>;
   readonly sessionId: string | null;
   /**
    * Reflects the most recent observed lifecycle event, not whether `send()`

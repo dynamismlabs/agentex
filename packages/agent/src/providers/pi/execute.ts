@@ -1,3 +1,4 @@
+import { observeExecution } from "../../telemetry/integration.js";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -33,7 +34,11 @@ function buildSessionPath(runId: string): string {
   return path.join(PI_SESSIONS_DIR, `${safeTimestamp}-${runId}.jsonl`);
 }
 
-export async function executePiProvider(ctx: ExecutionContext): Promise<ExecutionResult> {
+export function executePiProvider(ctx: ExecutionContext): Promise<ExecutionResult> {
+  return observeExecution(ctx, { context: false, rates: false }, executePiProviderInner);
+}
+
+async function executePiProviderInner(ctx: ExecutionContext): Promise<ExecutionResult> {
   const runId = ctx.runId ?? uuidv7();
   let cwd = ctx.cwd ?? process.cwd();
   const model = ctx.model ?? ctx.config?.model ?? "";

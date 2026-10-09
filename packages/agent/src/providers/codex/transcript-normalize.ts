@@ -1,4 +1,5 @@
-import type { BaseStreamEventFields, StreamEvent } from "../../types.js";
+import { isoTime, metadata, nonnegative, record, textValue } from "../../utils/jsonl-lines.js";
+import type { ContextUsage, RateLimitBucket, RateLimitUpdate, BaseStreamEventFields, StreamEvent } from "../../types.js";
 import type { CodexTranscriptLine } from "./transcript.js";
 
 /**
@@ -16,6 +17,7 @@ import type { CodexTranscriptLine } from "./transcript.js";
  *   response_item / custom_tool_call_output      → tool_result
  *   event_msg     / task_complete                → result (completed, or failed with `error`)
  *   event_msg     / turn_aborted                 → result (interrupted)
+ *   event_msg     / token_count                  → context_usage, rate_limits
  *
  * Current Codex runs shell work through freeform tools: `exec` takes a script
  * and `apply_patch` takes a patch, so most tool activity in a current rollout
@@ -130,6 +132,27 @@ function mapLine(line: CodexTranscriptLine, sessionId: string | null): StreamEve
   }
 
   if (line.type === "event_msg") {
+    if (innerType === "token_count") {
+      const info = record(payload["info"]);
+      const last = record(info?.last_token_usage);
+      const usage = codexContextUsage({
+        last: { totalTokens: last?.total_tokens }, modelContextWindow: info?.model_context_window,
+      }, base.timestamp, textValue(payload["model"]));
+      const events: StreamEvent[] = usage ? [{ type: "context_usage", usage, ...base }] : [];
+      const nativeRates = record(payload["rate_limits"]);
+      if (nativeRates) {
+        const convert = (value: Record<string, unknown>): Record<string, unknown> => {
+          const out: Record<string, unknown> = {};
+          const keys: Record<string, string> = { limit_id: "limitId", limit_name: "limitName", used_percent: "usedPercent", window_minutes: "windowDurationMins", resets_at: "resetsAt", has_credits: "hasCredits", rate_limit_reached_type: "rateLimitReachedType", plan_type: "planType" };
+          for (const [key, v] of Object.entries(value)) out[keys[key] ?? key] = record(v) ? convert(record(v)!) : v;
+          return out;
+        };
+        const update = codexRateLimits({ rateLimits: convert(nativeRates) }, base.timestamp);
+        if (update) events.push({ type: "rate_limits", update, ...base });
+      }
+      return events;
+    }
+
     if (innerType === "task_complete") {
       // A turn that failed (for example a model the account cannot use) still
       // ends in task_complete, with `error` set and no agent message.
@@ -280,4 +303,99 @@ function parseToolArguments(args: unknown): Record<string, unknown> | null {
   } catch {
     return null;
   }
+}
+
+
+/** `last` is current request context; `total` is cumulative thread accounting. */
+export function codexContextUsage(tokenUsage: unknown, observedAt: string, model?: string): ContextUsage | null {
+  const source = record(tokenUsage);
+  if (!source) return null;
+  const usedTokens = nonnegative(record(source.last)?.totalTokens);
+  const capacityTokens = nonnegative(source.modelContextWindow);
+  if (usedTokens === undefined && capacityTokens === undefined) return null;
+  const usedPercent = usedTokens !== undefined && capacityTokens && capacityTokens > 0
+    ? nonnegative(usedTokens / capacityTokens * 100) : undefined;
+  return {
+    ...(model ? { model } : {}),
+    ...(usedTokens !== undefined ? { usedTokens } : {}),
+    ...(capacityTokens !== undefined ? { capacityTokens } : {}),
+    ...(usedPercent !== undefined ? { usedPercent } : {}),
+    observedAt,
+  };
+}
+
+/** Preserve each native pool and each of its independent windows, including future window keys. */
+export function codexRateLimits(payload: unknown, observedAt: string, mode: "merge" | "replace" = "merge"): RateLimitUpdate | null {
+  const source = record(payload);
+  if (!source) return null;
+  const all = record(source.rateLimitsByLimitId);
+  const single = record(source.rateLimits);
+  if (!all && !single) return null;
+  const pools = all ? Object.entries(all) : [[textValue(single?.limitId) ?? "unknown", single]] as const;
+  const buckets: RateLimitBucket[] = [];
+  const removedBucketIds: string[] = [];
+  const accountId = textValue(source.accountId);
+  for (const [key, value] of pools) {
+    const pool = record(value);
+    if (!pool) continue;
+    const poolId = textValue(pool.limitId) ?? key;
+    const owner = { kind: "account" as const, ...(accountId ? { id: accountId } : {}) };
+    const applicability = poolId === "unknown" ? { kind: "unknown" as const } : { kind: "provider_pool" as const, pool: poolId };
+    const reason = textValue(pool.rateLimitReachedType);
+    const base = { owner, applicability, observedAt,
+      ...(textValue(pool.limitName) ? { label: textValue(pool.limitName) } : {}),
+      ...(reason ? { enforcement: { reason, status: reason } } : {}),
+      metadata: metadata(pool),
+    };
+    for (const [windowId, windowValue] of Object.entries(pool)) {
+      const id = bucketId(poolId, windowId);
+      if (windowValue === null && (windowId === "primary" || windowId === "secondary" || windowId === "credits" || windowId === "individualLimit")) {
+        removedBucketIds.push(id);
+        continue;
+      }
+      const window = record(windowValue);
+      if (!window || !(windowId === "primary" || windowId === "secondary" || "usedPercent" in window)) continue;
+      const usedPercent = nonnegative(window.usedPercent);
+      const durationMs = nonnegative((nonnegative(window.windowDurationMins) ?? NaN) * 60_000);
+      const resetAt = isoTime(window.resetsAt, "seconds");
+      buckets.push({ ...base, id,
+        ...(usedPercent !== undefined ? { usedPercent } : {}),
+        ...(durationMs !== undefined ? { durationMs } : {}),
+        ...(resetAt ? { resetAt } : {}), metadata: metadata({ poolId, windowId, ...pool, window }),
+      });
+    }
+    const credits = record(pool.credits);
+    if (credits) buckets.push({ ...base, id: bucketId(poolId, "credits"), unit: "credits", credits: {
+      ...(typeof credits.hasCredits === "boolean" ? { hasCredits: credits.hasCredits } : {}),
+      ...(typeof credits.unlimited === "boolean" ? { unlimited: credits.unlimited } : {}),
+      ...(textValue(credits.balance) ? { balance: textValue(credits.balance) } : {}),
+    }, metadata: metadata({ poolId, ...credits }) });
+    const individual = record(pool.individualLimit);
+    if (individual) {
+      const remainingPercent = nonnegative(individual.remainingPercent);
+      const resetAt = isoTime(individual.resetsAt, "seconds");
+      buckets.push({ ...base, id: bucketId(poolId, "individualLimit"),
+        ...(remainingPercent !== undefined && remainingPercent <= 100 ? { usedPercent: 100 - remainingPercent } : {}),
+        ...(resetAt ? { resetAt } : {}),
+        ...(typeof pool.spendControlReached === "boolean" ? { enforcement: { allowed: !pool.spendControlReached, ...(reason ? { reason } : {}) } } : {}),
+        metadata: metadata({ poolId, ...individual }),
+      });
+    }
+    // Pool-level spend control is independent of allowance windows/credits.
+    // Keep a stable enforcement bucket even when individual-limit metrics are
+    // absent, or later appear/disappear in partial updates.
+    if (typeof pool.spendControlReached === "boolean" || (reason && !buckets.some((b) => b.metadata?.poolId === poolId))) {
+      buckets.push({ ...base, id: bucketId(poolId, "enforcement"), metadata: metadata({ poolId, ...pool }),
+        enforcement: { ...(reason ? { status: reason, reason } : {}), ...(typeof pool.spendControlReached === "boolean" ? { allowed: !pool.spendControlReached } : {}) } });
+    }
+  }
+  return { mode, removedBucketIds, snapshot: {
+    provider: "codex", ...(accountId ? { accountId } : {}), buckets, observedAt,
+    ...(typeof source.ordinaryUsageAllowed === "boolean" ? { ordinaryUsageAllowed: source.ordinaryUsageAllowed } : {}),
+    metadata: metadata(source),
+  } };
+}
+
+function bucketId(pool: string, window: string): string {
+  return `${encodeURIComponent(pool)}:${encodeURIComponent(window)}`;
 }

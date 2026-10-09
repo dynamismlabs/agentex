@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.0.43 (unreleased) — Context, capacity telemetry and Codex MCP
+
+- Codex CLI 0.160+ now honors host-supplied stdio/streamable HTTP MCP servers in execute, new sessions and resumed threads. HTTP headers and stdio environment values stay out of argv and are isolated per invocation/server. Attached configurations default to strict ambient MCP isolation, verified through bounded native inventory reads without replacing `CODEX_HOME` or rewriting user config. Ambiguous server-name collisions and unverified isolation fail before session startup. Host-owned servers receive automatic Codex approval while other approvals and MCP elicitations remain intact. See the [Codex MCP guide](docs/codex-mcp.md).
+
+- Added optional `ContextUsage` and multi-bucket `RateLimitSnapshot` types, independent events, session/attachment snapshot surfaces, explicit native refresh, and final execution observations. Existing token/cost accounting remains unchanged, and legacy rate-limit event/result shapes are retained. Codex legacy status stays unknown unless native enforcement is supplied.
+- Codex now preserves current-context notifications, independent account/model-pool windows, credits and enforcement, with runtime/auth gating. Claude consumes native headless context/usage controls and rate-limit events, including model-family windows and runtime `unifiedWindows`. Generic ACP consumes optional standard `usage_update`; upgraded its SDK to 1.7.0 so the notification reaches the adapter.
+- Added per-auth/session isolation, partial bucket merging, individual freshness/reset handling, refresh deduplication, auth-change fences, and pending-control cleanup. Snapshot reads make no upstream request, and reset expiry does not fabricate zero usage.
+- Deprecated auth-inferred Claude `checkQuota` availability; it now reports unmeasured/unknown capacity. Documented verified support and explicit limitations for Antigravity and other selected transports in [the telemetry guide](docs/telemetry.md).
+- Fixed unhandled stdin `EPIPE` during process execution and persistent Claude/Codex telemetry refresh. Failed writes settle pending controls/RPCs and close session telemetry; repeated close calls await the same cleanup.
+- Codex pool spend-control enforcement now remains normalized independently of numerical windows/individual-limit availability. Unexpected ACP process exit/error marks retained context observations stale.
+
 ## 0.0.42 — Codex approvals reach the host
 
 Codex sessions never ran with the permissions the host asked for, and MCP tool approvals never reached the host. Together they made every ChatGPT app write in a Codex session (a GitHub branch, a pull request update) fail as "user rejected MCP tool call" in under 10 ms, with nobody asked. Checked live against `codex` 0.160.0 with a probe MCP server: allowed, denied, and `skipPermissions`, plus the same script on 0.0.40 reproducing the failure.

@@ -26,7 +26,11 @@ describe("ProviderCapabilities", () => {
     expect(caps).toEqual({
       sessions: true,
       modelDiscovery: true,
-      quotaProbing: true,
+      quotaProbing: false,
+      contextUsage: true,
+      rateLimits: true,
+      contextUsageRefresh: true,
+      rateLimitsRefresh: true,
       mcp: true,
       skills: true,
       skillInventory: "provider-init",
@@ -77,7 +81,7 @@ describe("ProviderCapabilities", () => {
       resume: true,
       permissionRequests: true,
       questionRequests: true,
-      strictMcpIsolation: false,
+      strictMcpIsolation: true,
       sessionModelChange: true,
       sessionVariantChange: false,
       sessionEffortChange: true,
@@ -143,12 +147,13 @@ describe("ProviderCapabilities", () => {
     }
   });
 
-  it("codex has sessions and model discovery but no mcp or quota", () => {
+  it("codex has sessions, model discovery and isolated MCP but no legacy quota probe", () => {
     const caps = getProvider("codex").capabilities;
     expect(caps.sessions).toBe(true);
     expect(caps.modelDiscovery).toBe(true);
     expect(caps.quotaProbing).toBe(false);
-    expect(caps.mcp).toBe(false);
+    expect(caps.mcp).toBe(true);
+    expect(caps.strictMcpIsolation).toBe(true);
   });
 
   it("declares provider-specific skill inventory and invocation behavior", () => {
@@ -199,6 +204,10 @@ describe("ProviderCapabilities", () => {
       sessions: true,
       modelDiscovery: true,
       quotaProbing: false,
+      contextUsage: false,
+      rateLimits: false,
+      contextUsageRefresh: false,
+      rateLimitsRefresh: false,
       mcp: false,
       skills: true,
       instructions: true,

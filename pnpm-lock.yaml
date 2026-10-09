@@ -11,8 +11,8 @@ importers:
   packages/agent:
     dependencies:
       '@agentclientprotocol/sdk':
-        specifier: ^0.24.0
-        version: 0.24.0(zod@3.25.76)
+        specifier: ^1.7.0
+        version: 1.7.0(zod@3.25.76)
     devDependencies:
       '@mariozechner/pi-coding-agent':
         specifier: ^0.62.0
@@ -130,8 +130,8 @@ importers:
 
 packages:
 
-  '@agentclientprotocol/sdk@0.24.0':
-    resolution: {integrity: sha512-vvu9appvGvfYstBj19C6NCepV6SvUhY5VRv60KUZ4XzhTah/olOYul5Zo4C+x2enyshMSvgB2mm/OEmrsHaSmA==}
+  '@agentclientprotocol/sdk@1.7.0':
+    resolution: {integrity: sha512-ZORuxsuEnLjRly7t6Ad7zAsWitjWsyprswyPUHz/yycPb+tTm3DGa8XheaHhRXqX8LS9snuxaYavXSRA50TlHw==}
     peerDependencies:
       zod: ^3.25.0 || ^4.0.0
 
@@ -3147,7 +3147,7 @@ packages:
 
 snapshots:
 
-  '@agentclientprotocol/sdk@0.24.0(zod@3.25.76)':
+  '@agentclientprotocol/sdk@1.7.0(zod@3.25.76)':
     dependencies:
       zod: 3.25.76
 

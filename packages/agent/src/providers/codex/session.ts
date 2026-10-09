@@ -1,3 +1,6 @@
+import { readLatestCodexTelemetry } from "../../telemetry/codex-durable.js";
+import { TelemetryStore } from "../../telemetry/store.js";
+import { codexRateLimits } from "./transcript-normalize.js";
 import type { ChildProcess } from "node:child_process";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -29,7 +32,7 @@ import { translateEndpoint } from "../../utils/endpoint.js";
 import { injectWorkspaceSkills } from "../../utils/skills.js";
 import { resolveInstructions } from "../../utils/instructions.js";
 import { createToolNameTracker } from "../../utils/tool-names.js";
-import { parseCodexStreamLines, codexBackgroundTaskReport, codexMcpToolName } from "./parse.js";
+import { parseCodexStreamLines, parseCodexStreamEvent, codexBackgroundTaskReport, codexMcpToolName } from "./parse.js";
 import { withPlanModePreamble } from "./plan-mode.js";
 import { scanCodexSessionUsage } from "./usage-scanner.js";
 import { codexSessionCodec } from "./codec.js";
@@ -39,6 +42,7 @@ import {
   codexPermissionThreadParams,
   codexThreadPermissions,
 } from "./permissions.js";
+import { prepareCodexMcp, splitCodexExtraArgs } from "./mcp.js";
 
 /**
  * Extract a resume thread id from session params (reusing the codec's
@@ -346,8 +350,10 @@ function classifyMessage(msg: Record<string, unknown>): IncomingMessage | null {
 // ---------------------------------------------------------------------------
 
 export async function createCodexSession(ctx: SessionContext): Promise<AgentSession> {
-  const cwd = ctx.cwd ?? process.cwd();
   const config = ctx.config ?? {};
+  const hasMcpConfig = config.mcpServers !== undefined || config.strictMcpConfig === true;
+  const restoredCwd = hasMcpConfig ? codexSessionCodec.deserialize(ctx.sessionParams)?.["cwd"] : undefined;
+  const cwd = ctx.cwd ?? (typeof restoredCwd === "string" ? restoredCwd : process.cwd());
 
   // Resolve binary
   const resolved = await findBinary("codex", config.command);
@@ -361,6 +367,9 @@ export async function createCodexSession(ctx: SessionContext): Promise<AgentSess
   const endpointTx = translateEndpoint("codex", config.endpoint);
   Object.assign(env, endpointTx.env);
   for (const key of endpointTx.unset) delete env[key];
+  const extra = splitCodexExtraArgs(config.extraArgs);
+  const mcp = await prepareCodexMcp(config, resolved, [...endpointTx.args, ...extra.configArgs], cwd, env);
+  Object.assign(env, mcp.env);
 
   // Inject skills
   if (config.skillDirs && config.skillDirs.length > 0) {
@@ -384,15 +393,16 @@ export async function createCodexSession(ctx: SessionContext): Promise<AgentSess
   // subcommand: app-server ignores `--sandbox` and
   // `--dangerously-bypass-approvals-and-sandbox` (see ./permissions.ts). The
   // handshake repeats them on the thread itself.
-  // extraArgs land after the subcommand — semantics depend on the user's intent.
+  // Native config flags precede the subcommand; runtime extraArgs follow it.
   const args = [...resolved.prefixArgs];
   args.push(...codexPermissionConfigArgs(codexThreadPermissions(config)));
   // Custom endpoint model_providers overrides are top-level `-c` options, placed
   // with the other top-level flags before the `app-server` subcommand (the
   // position that is always valid for global options).
   if (endpointTx.args.length > 0) args.push(...endpointTx.args);
+  args.push(...extra.configArgs, ...mcp.args);
   args.push("app-server");
-  if (config.extraArgs) args.push(...config.extraArgs);
+  args.push(...extra.runtimeArgs);
 
   const proc = spawn(resolved.bin, args, {
     cwd,
@@ -407,7 +417,11 @@ export async function createCodexSession(ctx: SessionContext): Promise<AgentSess
   const session = new CodexSessionImpl(proc, ctx, cwd, config.model ?? null, instructions);
 
   // Perform JSON-RPC initialize handshake + thread/start
-  await session.handshake();
+  try { await session.handshake(); }
+  catch (error) {
+    await session.close().catch(() => { /* best effort after failed startup */ });
+    throw error;
+  }
 
   // Wire up AbortSignal
   if (ctx.signal) {
@@ -468,6 +482,8 @@ export class CodexSessionImpl implements AgentSession {
   private _draining = false;
   /** Shared promise so concurrent / repeated `drain()` calls coalesce. */
   private _drainPromise: Promise<void> | null = null;
+  /** Includes cleanup when a stdin failure starts closing before the host does. */
+  private _closePromise: Promise<void> | null = null;
 
   /**
    * Root turn targeted by `interrupt()`. The id is learned asynchronously from
@@ -525,6 +541,10 @@ export class CodexSessionImpl implements AgentSession {
   /** Session-scoped goal engine (best-effort native thread goal + emulation). */
   private readonly _goals: GoalController;
 
+  private readonly telemetry = new TelemetryStore("unknown", "unknown");
+  readonly contextUsage = this.telemetry.context;
+  readonly rateLimits = this.telemetry.rateLimits;
+
   constructor(
     private readonly proc: ChildProcess,
     private readonly ctx: SessionContext,
@@ -535,6 +555,36 @@ export class CodexSessionImpl implements AgentSession {
     this._resumeThreadId = readCodexResumeId(ctx.sessionParams);
     this._expectedThreadId = this._resumeThreadId;
 
+    this.telemetry.setRateLimitRefresh(async () => {
+      const authRevision = this.telemetry.rateLimitScopeVersion;
+      if (this.ctx.config?.endpoint) {
+        this.telemetry.setRateLimitSupport("unsupported", "Custom endpoints do not expose Codex account capacity");
+        return;
+      }
+      const account = await this.boundedRpcRequest("account/read", { refreshToken: false }, 5000);
+      if (authRevision !== this.telemetry.rateLimitScopeVersion) return;
+      const authType = str(asObj(account, "account"), "type");
+      if (!["chatgpt"].includes(authType)) {
+        this.telemetry.setRateLimitSupport("unsupported", "Codex account rate limits require service-backed authentication");
+        return;
+      }
+      try {
+        const response = await this.boundedRpcRequest("account/rateLimits/read", {}, 10_000);
+        if (authRevision !== this.telemetry.rateLimitScopeVersion) return;
+        const update = codexRateLimits(response, new Date().toISOString(), "replace");
+        if (!update) { this.telemetry.unavailableRates("The selected runtime/auth context returned no account rate-limit data"); return; }
+        this.dispatchEvent({ type: "rate_limits", update, timestamp: update.snapshot.observedAt,
+          providerType: "codex", sessionId: this._threadId, messageId: null, eventId: null,
+          turnId: null, parentToolCallId: null, raw: response });
+      } catch (error) {
+        if (authRevision !== this.telemetry.rateLimitScopeVersion) return;
+        if (/method.*not found|unknown method|unsupported/i.test(error instanceof Error ? error.message : "")) {
+          this.telemetry.setRateLimitSupport("unsupported", "Selected Codex runtime does not support account/rateLimits/read");
+          return;
+        }
+        throw error;
+      }
+    });
     this._goals = new GoalController({
       providerType: "codex",
       capability: codexGoalCapability,
@@ -579,8 +629,15 @@ export class CodexSessionImpl implements AgentSession {
       }
     });
 
+    // Writable errors (notably EPIPE) are independent of ChildProcess errors
+    // and may precede exit. Close the transport and settle all pending RPCs.
+    proc.stdin!.on("error", () => {
+      void this.close().catch(() => { /* best effort transport cleanup */ });
+    });
+
     proc.on("exit", (code, signal) => {
       if (this._state !== "closed") {
+        this.telemetry.close();
         this._state = "closed";
         const message = `Codex process exited unexpectedly (code=${code}, signal=${signal})`;
         this.finalizeActiveBackgroundTasks("failed", message, {
@@ -596,6 +653,7 @@ export class CodexSessionImpl implements AgentSession {
 
     proc.on("error", (err) => {
       if (this._state !== "closed") {
+        this.telemetry.close();
         this._state = "closed";
         this.finalizeActiveBackgroundTasks("failed", err.message, {
           method: "process/error",
@@ -766,10 +824,9 @@ export class CodexSessionImpl implements AgentSession {
     const id = this._nextId++;
     const msg: Record<string, unknown> = { jsonrpc: "2.0", id, method };
     if (params) msg["params"] = params;
-    this.proc.stdin!.write(JSON.stringify(msg) + "\n");
-
     return new Promise((resolve, reject) => {
       this._pendingRpc.set(id, { resolve, reject });
+      this.writeRpcRequest(id, msg);
     });
   }
 
@@ -780,8 +837,6 @@ export class CodexSessionImpl implements AgentSession {
     timeoutMs = BACKGROUND_TASK_READ_TIMEOUT_MS,
   ): Promise<Record<string, unknown>> {
     const id = this._nextId++;
-    this.proc.stdin!.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
-
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         if (!this._pendingRpc.delete(id)) return;
@@ -799,7 +854,23 @@ export class CodexSessionImpl implements AgentSession {
           reject(err);
         },
       });
+      this.writeRpcRequest(id, { jsonrpc: "2.0", id, method, params });
     });
+  }
+
+  /** Install pending state before writing; a failed write cannot leave a waiter or timer behind. */
+  private writeRpcRequest(id: number, msg: Record<string, unknown>): void {
+    const failWrite = (error: Error | null | undefined) => {
+      if (!error) return;
+      const pending = this._pendingRpc.get(id);
+      this._pendingRpc.delete(id);
+      pending?.reject(error);
+    };
+    try {
+      this.proc.stdin!.write(JSON.stringify(msg) + "\n", failWrite);
+    } catch (error) {
+      failWrite(error instanceof Error ? error : new Error("Codex RPC write failed"));
+    }
   }
 
   /**
@@ -850,10 +921,13 @@ export class CodexSessionImpl implements AgentSession {
     //    a divergent rewind copy. The thread keeps its original cwd/model, so we
     //    pass only the thread id (+ refreshed developer instructions, and the
     //    approval policy and sandbox this session runs with, which may differ
-    //    from the ones the thread was created under).
+    //    from the ones the thread was created under). MCP-configured resumes
+    //    explicitly select the cwd used by discovery, so an old thread cannot
+    //    load unverified project servers. Restored sessionParams carry that cwd.
     const permissionParams = codexPermissionThreadParams(codexThreadPermissions(this.ctx.config));
     if (this._resumeThreadId) {
       const resumeParams: Record<string, unknown> = { threadId: this._resumeThreadId, ...permissionParams };
+      if (this.ctx.config?.mcpServers !== undefined || this.ctx.config?.strictMcpConfig === true) resumeParams["cwd"] = this.cwd;
       if (this.instructions) resumeParams["developerInstructions"] = this.instructions;
       try {
         const res = await this.rpcRequest("thread/resume", resumeParams);
@@ -866,6 +940,13 @@ export class CodexSessionImpl implements AgentSession {
         // (goals live in SQLite, not the transcript, so a resumed thread would
         // otherwise report null until the next goal notification).
         await this.hydrateGoalFromThread();
+        try {
+          for (const event of await readLatestCodexTelemetry(this._threadId, this.ctx.env)) {
+            // Rollouts do not identify the account that observed historical quotas.
+            // Restore session context only; live account data must be observed again.
+            if (event.type === "context_usage") this.telemetry.observe(event);
+          }
+        } catch { /* A missing/pruned native transcript is unavailable telemetry. */ }
         return;
       } catch (err) {
         // A failed resume can emit thread/started before its error response.
@@ -1187,8 +1268,14 @@ export class CodexSessionImpl implements AgentSession {
     return this._drainPromise;
   }
 
-  async close(): Promise<void> {
-    if (this._state === "closed") return;
+  close(): Promise<void> {
+    if (this._closePromise) return this._closePromise;
+    if (this._state === "closed") return Promise.resolve();
+    return this._closePromise = this.closeTransport();
+  }
+
+  private async closeTransport(): Promise<void> {
+    this.telemetry.close();
     this._state = "closed";
     this.finalizeActiveBackgroundTasks("stopped", "Codex session closed", {
       method: "session/closed",
@@ -1254,7 +1341,7 @@ export class CodexSessionImpl implements AgentSession {
         this.handleServerRequest(msg.id, msg.method, msg.params);
         break;
       case "notification":
-        this.handleNotification(msg.method, msg.params, line);
+        this.handleNotification(msg.method, msg.params, line, raw);
         break;
       case "legacy_event":
         this.handleLegacyEvent(msg.event, line);
@@ -1342,6 +1429,12 @@ export class CodexSessionImpl implements AgentSession {
     params: Record<string, unknown>,
     meta: Record<string, unknown>,
   ): Promise<void> {
+    // Host-owned servers enforce their own tool policy. Codex must not ask the
+    // host for a duplicate permission on top of that server-side decision.
+    if (this.ctx.config?.mcpServers?.some((server) => server.name === str(params, "serverName"))) {
+      this.rpcResponse(id, { action: "accept" });
+      return;
+    }
     const requestThreadId = str(params, "threadId") || null;
     const foreign = this.isForeignThread(requestThreadId);
     if (!foreign) this._state = "waiting_for_approval";
@@ -2181,8 +2274,9 @@ export class CodexSessionImpl implements AgentSession {
     });
   }
 
-  private handleNotification(method: string, params: Record<string, unknown>, rawLine: string): void {
+  private handleNotification(method: string, params: Record<string, unknown>, rawLine: string, raw: Record<string, unknown>): void {
     if (this._state === "closed") return;
+    if (method === "account/updated") this.telemetry.resetRates();
     this.trackMcpToolCall(method, params);
     // codex/event — legacy wrapper
     if (method === "codex/event") {
@@ -2209,20 +2303,20 @@ export class CodexSessionImpl implements AgentSession {
     if (method === "thread/started") {
       // codex-cli 0.130.0+ shape: { thread: { id, sessionId, ... } }
       if (!this._threadId) this._threadId = notificationThreadId;
-      this.emitStreamEvent(rawLine);
+      this.emitStreamEvent(rawLine, raw);
       return;
     }
 
     if (method === "turn/started") {
       this.captureActiveTurnId(str(asObj(params, "turn"), "id") || str(params, "turnId"));
       // The parser intentionally suppresses this lifecycle-only event.
-      this.emitStreamEvent(rawLine);
+      this.emitStreamEvent(rawLine, raw);
       return;
     }
 
     if (method === "item/started") {
       this._state = "tool_executing";
-      this.emitStreamEvent(rawLine);
+      this.emitStreamEvent(rawLine, raw);
       return;
     }
 
@@ -2236,11 +2330,11 @@ export class CodexSessionImpl implements AgentSession {
         // vanishing — that escape hatch is how unmodeled wire shapes stay
         // visible, and collab is exactly where new shapes keep appearing.
         if (!this.handleCollabAgentToolCall(item, parseJson(rawLine) ?? params, null)) {
-          this.emitStreamEvent(rawLine);
+          this.emitStreamEvent(rawLine, raw);
         }
         return;
       }
-      this.emitStreamEvent(rawLine);
+      this.emitStreamEvent(rawLine, raw);
       return;
     }
 
@@ -2255,7 +2349,7 @@ export class CodexSessionImpl implements AgentSession {
       this._turnErrorMessage = str(params, "message") || str(params, "error") || "Turn failed";
       // Emit before resolve so the result event is queued onto _eventChain
       // before resolveTurn awaits it.
-      this.emitStreamEvent(rawLine);
+      this.emitStreamEvent(rawLine, raw);
       this.resolveTurn();
       return;
     }
@@ -2267,12 +2361,12 @@ export class CodexSessionImpl implements AgentSession {
       // continues, and either way `turn/completed` is the turn terminus.
       const msg = str(asObj(params, "error"), "message") || str(params, "message");
       if (msg) this._turnErrorMessage = msg;
-      this.emitStreamEvent(rawLine);
+      this.emitStreamEvent(rawLine, raw);
       return;
     }
 
     // Forward unrecognized notifications
-    this.emitStreamEvent(rawLine);
+    this.emitStreamEvent(rawLine, raw);
   }
 
   // -------------------------------------------------------------------------
@@ -2544,14 +2638,13 @@ export class CodexSessionImpl implements AgentSession {
     void this._goals.onTurnSettled(result);
   }
 
-  private emitStreamEvent(rawLine: string): void {
-    // Parse when there's an onEvent subscriber OR an active goal to observe, so
-    // native goal_status transitions update getGoal() even with no handler.
-    if (!this.ctx.onEvent && !this._goals.isTracking()) return;
+  private emitStreamEvent(rawLine: string, raw?: Record<string, unknown>): void {
+    // Observe native state and telemetry even without a subscriber. Reuse the
+    // transport's decoded payload when available.
     // Pass current threadId so NDJSON-shaped events (via codex/event wrapper)
     // carry sessionId. v2 notifications parse threadId from params directly
     // and ignore this arg.
-    for (const event of parseCodexStreamLines(rawLine, this._threadId)) {
+    for (const event of raw ? parseCodexStreamEvent(raw, this._threadId) : parseCodexStreamLines(rawLine, this._threadId)) {
       this.dispatchEvent(event);
     }
   }
@@ -2563,6 +2656,7 @@ export class CodexSessionImpl implements AgentSession {
    * throwing handler does not break delivery of subsequent events.
    */
   private dispatchEvent(event: StreamEvent): void {
+    this.telemetry.observe(event);
     if (event.type === "background_task" && !this.observeBackgroundTask(event)) return;
     // Track native goal_status transitions (keeps getGoal() accurate).
     this._goals.observe(event);

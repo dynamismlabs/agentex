@@ -1,3 +1,4 @@
+import { unsupportedSessionTelemetry } from "../../telemetry/integration.js";
 import type {
   AgentSession,
   CancelResult,
@@ -57,7 +58,7 @@ export async function createAntigravitySession(ctx: SessionContext): Promise<Age
       // Non-fatal
     }
   }
-  return new AntigravitySession(ctx, binary, instructions);
+  return unsupportedSessionTelemetry(new AntigravitySession(ctx, binary, instructions));
 }
 
 /**

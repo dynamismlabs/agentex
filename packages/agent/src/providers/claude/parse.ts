@@ -1,7 +1,9 @@
+import { isoTime, metadata, nonnegative, record, textValue } from "../../utils/jsonl-lines.js";
 import type {
   AuthRequiredReason,
   BaseStreamEventFields,
   ModelUsage,
+  ContextUsage, RateLimitApplicability, RateLimitBucket, RateLimitUpdate,
   RateLimitInfo,
   StreamEvent,
 } from "../../types.js";
@@ -84,7 +86,7 @@ function baseFieldsFromEvent(
   messageId: string | null,
 ): BaseStreamEventFields {
   return {
-    timestamp: new Date().toISOString(),
+    timestamp: isoTime(event["timestamp"]) ?? new Date().toISOString(),
     providerType: PROVIDER_TYPE,
     sessionId: asNullableString(event["session_id"]),
     messageId,
@@ -125,7 +127,7 @@ function rateLimitFromEvent(event: Record<string, unknown>): RateLimitInfo | nul
   return {
     status: asString(info["status"], "unknown"),
     limitType: asNullableString(info["rateLimitType"]),
-    resetAt: resetEpoch !== null ? new Date(resetEpoch * 1000).toISOString() : null,
+    resetAt: resetEpoch !== null ? isoTime(resetEpoch, "seconds") ?? null : null,
     overageStatus: asNullableString(info["overageStatus"]),
     isUsingOverage: typeof info["isUsingOverage"] === "boolean" ? info["isUsingOverage"] : null,
   };
@@ -386,8 +388,26 @@ function parsePartialStreamEvent(
 
 export function parseStreamLine(line: string, partial?: PartialStreamContext): StreamEvent[] {
   const event = parseJson(line);
-  if (!event) return [];
+  return event ? parseClaudeStreamEvent(event, partial) : [];
+}
 
+/** @internal Normalize an already-decoded native payload without reparsing JSON. */
+export function parseClaudeStreamEvent(event: Record<string, unknown>, partial?: PartialStreamContext): StreamEvent[] {
+  const parsed = parseStreamLineContent(event, partial);
+  const base = baseFieldsFromEvent(event, null);
+  const usage = claudeContextUsage(event["context_usage"], base.timestamp);
+  if (usage) parsed.push({ type: "context_usage", usage, ...base });
+  const update = event["type"] === "rate_limit_event"
+    ? claudeRateLimitEvent(event["rate_limit_info"], base.timestamp)
+    : claudeUsageRateLimits(event["usage_report"], base.timestamp);
+  if (update) parsed.push({ type: "rate_limits", update, ...base });
+  if ((event["type"] === "system" && event["subtype"] === "compact_boundary") || event["type"] === "conversation_reset") {
+    parsed.push({ type: "context_usage_invalidated", reason: String(event["subtype"] ?? event["type"]), ...base });
+  }
+  return parsed;
+}
+
+function parseStreamLineContent(event: Record<string, unknown>, partial?: PartialStreamContext): StreamEvent[] {
   const type = asString(event["type"], "");
 
   // `--include-partial-messages` wraps raw API streaming events in
@@ -923,4 +943,156 @@ export function isClaudeMaxTurns(stdout: string): boolean {
     }
   }
   return false;
+}
+
+
+/** Verified get_context_usage summary response, or structured /context wrapper. */
+export function claudeContextUsage(payload: unknown, observedAt: string): ContextUsage | null {
+  const source = record(payload);
+  if (!source) return null;
+  const usedTokens = nonnegative(source.totalTokens ?? source.total_tokens);
+  // rawMaxTokens is the resolved effective compaction window, including policy overrides.
+  const capacityTokens = nonnegative(source.rawMaxTokens ?? source.raw_max_tokens ?? source.maxTokens);
+  const usedPercent = nonnegative(source.percentage);
+  if (usedTokens === undefined && capacityTokens === undefined && usedPercent === undefined) return null;
+  return {
+    ...(textValue(source.model) ? { model: textValue(source.model) } : {}),
+    ...(usedTokens !== undefined ? { usedTokens } : {}),
+    ...(capacityTokens !== undefined ? { capacityTokens } : {}),
+    ...(usedPercent !== undefined ? { usedPercent } : {}),
+    observedAt,
+    metadata: metadata({ source: "harness_context_estimate", over_limit: source.over_limit, autocompactSource: source.autocompactSource }),
+  };
+}
+
+function applicability(id: string): RateLimitApplicability {
+  if (id === "seven_day_opus") return { kind: "model_family", family: "opus" };
+  if (id === "seven_day_sonnet") return { kind: "model_family", family: "sonnet" };
+  if (id === "five_hour" || id === "seven_day") return { kind: "all_models" };
+  return id === "unknown" ? { kind: "unknown" } : { kind: "provider_pool", pool: id };
+}
+function base(id: string, observedAt: string): RateLimitBucket {
+  return { id, owner: { kind: "account" }, applicability: applicability(id), observedAt };
+}
+
+/** Stream utilization is a fraction, may exceed 1; control utilization is a percentage. */
+export function claudeRateLimitEvent(payload: unknown, observedAt: string): RateLimitUpdate | null {
+  const info = record(payload);
+  if (!info || Object.keys(info).length === 0) return null;
+  const windows = record(info.unifiedWindows);
+  const buckets = new Map<string, RateLimitBucket>();
+  for (const [id, value] of Object.entries(windows ?? {})) {
+    const window = record(value);
+    if (!window) continue;
+    const fraction = nonnegative(window.utilization);
+    const resetAt = isoTime(window.resetsAt, "seconds");
+    buckets.set(id, { ...base(id, observedAt),
+      ...(fraction !== undefined ? { usedPercent: fraction * 100 } : {}),
+      ...(resetAt ? { resetAt } : {}), metadata: metadata(window),
+    });
+  }
+  const id = textValue(info.rateLimitType) ?? "unknown";
+  const active = buckets.get(id) ?? base(id, observedAt);
+  const fraction = nonnegative(info.utilization);
+  const resetAt = isoTime(info.resetsAt, "seconds");
+  const status = textValue(info.status);
+  buckets.set(id, { ...active,
+    ...(fraction !== undefined ? { usedPercent: fraction * 100 } : {}),
+    ...(resetAt ? { resetAt } : {}),
+    ...(status ? { enforcement: { status } } : {}), metadata: metadata(info),
+  });
+  const overageStatus = textValue(info.overageStatus);
+  const overageReason = textValue(info.overageDisabledReason);
+  const overageResetAt = isoTime(info.overageResetsAt, "seconds");
+  if (overageStatus || overageReason || typeof info.isUsingOverage === "boolean" || typeof info.overageEnabled === "boolean" || textValue(info.errorCode)) {
+    const overage = {
+      ...(overageStatus ? { status: overageStatus } : {}),
+      ...(overageReason ? { reason: overageReason } : {}),
+      ...(overageResetAt ? { resetAt: overageResetAt } : {}),
+      ...(typeof info.isUsingOverage === "boolean" ? { isUsing: info.isUsingOverage } : {}),
+      ...(typeof info.overageEnabled === "boolean" ? { enabled: info.overageEnabled } : {}),
+    };
+    buckets.set("overage", { ...base("overage", observedAt), ...(buckets.get("overage") ?? {}), overage,
+      ...(overageResetAt ? { resetAt: overageResetAt } : {}),
+      enforcement: { ...(overageStatus ? { status: overageStatus } : {}), ...(textValue(info.errorCode) ? { reason: textValue(info.errorCode) } : {}) },
+      metadata: metadata(info),
+    });
+  }
+  return { mode: "merge", snapshot: { provider: "claude", buckets: [...buckets.values()], observedAt } };
+}
+
+/** `get_usage` is experimental. Iterate native window ids, never a closed list. */
+export function claudeUsageRateLimits(payload: unknown, observedAt: string): RateLimitUpdate | null {
+  const response = record(payload);
+  const rates = record(response?.rate_limits);
+  if (!rates) return null;
+  const buckets: RateLimitBucket[] = [];
+  const removedBucketIds: string[] = [];
+  const replacedCollectionIds: string[] = [];
+  for (const [id, value] of Object.entries(rates)) {
+    if (value === null) { removedBucketIds.push(id); continue; }
+    const window = record(value);
+    if (!window) continue;
+    if (!("utilization" in window || "resets_at" in window || "status" in window || "locked_reason" in window || "used_dollars" in window || "limit_dollars" in window || id === "extra_usage")) continue;
+    const usedPercent = nonnegative(window.utilization);
+    const resetAt = isoTime(window.resets_at);
+    const durationMs = nonnegative((nonnegative(window.window_duration_seconds) ?? NaN) * 1000);
+    const status = textValue(window.status);
+    const used = nonnegative(window.used_dollars ?? window.used_credits);
+    const remaining = nonnegative(window.remaining_dollars);
+    const limit = nonnegative(window.limit_dollars ?? window.monthly_limit);
+    const currency = textValue(window.currency);
+    const unit = "used_dollars" in window || "limit_dollars" in window
+      ? "USD" : currency ? `${currency}:minor` : "provider_credits";
+    const reason = textValue(window.locked_reason ?? window.disabled_reason);
+    buckets.push({ ...base(id, observedAt),
+      ...(usedPercent !== undefined ? { usedPercent } : {}),
+      ...(resetAt ? { resetAt } : {}),
+      ...(durationMs !== undefined ? { durationMs } : {}),
+      ...(status || reason ? { enforcement: { ...(status ? { status } : {}), ...(reason ? { reason } : {}) } } : {}),
+      ...(used !== undefined ? { used, unit } : {}),
+      ...(remaining !== undefined ? { remaining, unit } : {}),
+      ...(limit !== undefined ? { limit, unit } : {}),
+      ...(typeof window.is_enabled === "boolean" ? { overage: { enabled: window.is_enabled } } : {}),
+      metadata: metadata(window),
+    });
+  }
+  if (Array.isArray(rates.limits)) replacedCollectionIds.push("limits");
+  for (const value of Array.isArray(rates.limits) ? rates.limits : []) {
+    const row = record(value);
+    if (!row) continue;
+    const nativeId = textValue(row.id) ?? textValue(row.bucket_id)
+      ?? (textValue(row.kind) ? JSON.stringify([row.kind, row.group ?? null, row.scope ?? null]) : undefined);
+    if (!nativeId) continue;
+    const id = `limits:${encodeURIComponent(nativeId)}`;
+    const percent = nonnegative(row.percent);
+    const resetAt = isoTime(row.resets_at);
+    const status = textValue(row.severity);
+    const scope = record(row.scope);
+    const label = textValue(record(scope?.model)?.display_name) ?? textValue(record(scope?.surface)?.display_name);
+    buckets.push({ ...base(id, observedAt), collectionId: "limits",
+      ...(label ? { label } : {}),
+      ...(percent !== undefined ? { usedPercent: percent } : {}), ...(resetAt ? { resetAt } : {}),
+      ...(status ? { enforcement: { status } } : {}), metadata: metadata(row),
+    });
+  }
+  // Model-scoped rows provide a native display label, not an established model-id membership.
+  // Only an explicitly empty array proves none exist before the native allowlist
+  // is applied. A nonempty/omitted array can be filtered or served from cache.
+  if (Array.isArray(rates.model_scoped) && rates.model_scoped.length === 0) replacedCollectionIds.push("model_scoped");
+  for (const value of Array.isArray(rates.model_scoped) ? rates.model_scoped : []) {
+    const window = record(value);
+    const nativeId = textValue(window?.id) ?? textValue(window?.bucket_id) ?? textValue(window?.display_name);
+    if (!window || !nativeId) continue;
+    const id = `model_scoped:${encodeURIComponent(nativeId)}`;
+    const usedPercent = nonnegative(window.utilization);
+    const resetAt = isoTime(window.resets_at);
+    buckets.push({ ...base(id, observedAt), collectionId: "model_scoped",
+      ...(textValue(window.display_name) ? { label: textValue(window.display_name) } : {}),
+      ...(usedPercent !== undefined ? { usedPercent } : {}), ...(resetAt ? { resetAt } : {}),
+      metadata: metadata(window),
+    });
+  }
+  return { mode: Object.keys(rates).length === 0 ? "replace" : "merge", removedBucketIds, replacedCollectionIds,
+    snapshot: { provider: "claude", buckets, observedAt, metadata: metadata({ subscription_type: response?.subscription_type, rate_limits: rates }) } };
 }

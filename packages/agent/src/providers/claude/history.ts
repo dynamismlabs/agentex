@@ -34,6 +34,9 @@ const DROP_EVENT_TYPES = new Set([
   "thinking_delta",
   "permission_mode",
   "rate_limit",
+  "rate_limits",
+  "context_usage",
+  "context_usage_invalidated",
   "unknown",
 ]);
 

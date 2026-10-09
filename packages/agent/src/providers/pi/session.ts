@@ -1,3 +1,4 @@
+import { unsupportedSessionTelemetry } from "../../telemetry/integration.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -50,7 +51,7 @@ interface PendingTurn {
 export async function createPiSession(ctx: SessionContext): Promise<AgentSession> {
   const session = new PiSession(ctx);
   await session.connect();
-  return session;
+  return unsupportedSessionTelemetry(session);
 }
 
 /** @internal Exported for unit testing — not part of the public API. */

@@ -1,3 +1,4 @@
+import { observeExecution } from "../../telemetry/integration.js";
 import * as path from "node:path";
 import type { ExecutionContext, ExecutionResult } from "../../types.js";
 import { findBinary } from "../../utils/binary.js";
@@ -15,7 +16,11 @@ import {
 } from "./parse.js";
 import { prepareOpenCodeSkillConfig } from "./skill-config.js";
 
-export async function executeOpenCodeProvider(ctx: ExecutionContext): Promise<ExecutionResult> {
+export function executeOpenCodeProvider(ctx: ExecutionContext): Promise<ExecutionResult> {
+  return observeExecution(ctx, { context: false, rates: false }, executeOpenCodeProviderInner);
+}
+
+async function executeOpenCodeProviderInner(ctx: ExecutionContext): Promise<ExecutionResult> {
   const runId = ctx.runId ?? uuidv7();
   let cwd = ctx.cwd ?? process.cwd();
   const model = ctx.model ?? ctx.config?.model ?? "";

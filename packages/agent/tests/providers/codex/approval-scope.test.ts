@@ -25,7 +25,7 @@ function session(onUserInputRequest?: (r: UserInputRequest) => Promise<UserInput
   const writes: Record<string, unknown>[] = [];
   const proc = new EventEmitter() as unknown as ChildProcess;
   Object.assign(proc, {
-    stdin: {
+    stdin: Object.assign(new EventEmitter(), {
       write: (chunk: string) => {
         for (const line of chunk.split("\n")) {
           if (line.trim()) writes.push(JSON.parse(line) as Record<string, unknown>);
@@ -33,7 +33,7 @@ function session(onUserInputRequest?: (r: UserInputRequest) => Promise<UserInput
         return true;
       },
       end: () => {},
-    },
+    }),
     stdout,
     stderr,
     kill: () => true,

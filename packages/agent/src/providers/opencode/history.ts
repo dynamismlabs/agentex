@@ -1,3 +1,4 @@
+import { TelemetryStore } from "../../telemetry/store.js";
 import { createHash } from "node:crypto";
 
 import type {
@@ -404,7 +405,10 @@ export async function attachOpenCodeHistory(
     cwd,
     displayId: sessionId,
   });
+  const telemetry = new TelemetryStore();
   return {
+    contextUsage: telemetry.context,
+    rateLimits: telemetry.rateLimits,
     record: normalized,
     historySource: { kind: "service", description: "OpenCode authenticated session message history" },
     lastTurn,

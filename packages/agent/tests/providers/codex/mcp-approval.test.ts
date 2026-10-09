@@ -26,7 +26,7 @@ function session(ctx: Partial<SessionContext> = {}) {
   const writes: Record<string, unknown>[] = [];
   const proc = new EventEmitter() as unknown as ChildProcess;
   Object.assign(proc, {
-    stdin: {
+    stdin: Object.assign(new EventEmitter(), {
       write: (chunk: string) => {
         for (const line of chunk.split("\n")) {
           if (line.trim()) writes.push(JSON.parse(line) as Record<string, unknown>);
@@ -34,7 +34,7 @@ function session(ctx: Partial<SessionContext> = {}) {
         return true;
       },
       end: () => {},
-    },
+    }),
     stdout,
     stderr,
     kill: () => true,
@@ -124,6 +124,21 @@ const toolApproval = (id: number, opts: { threadId?: string; params?: unknown } 
 });
 
 describe("MCP tool approvals", () => {
+  it("auto-approves only host-supplied servers and preserves other server approvals", async () => {
+    const seen: UserInputRequest[] = [];
+    const { impl, replyTo } = session({
+      config: { mcpServers: [{ name: "ri", command: "node" }] },
+      onUserInputRequest: async (request) => { seen.push(request); return { allow: false }; },
+    });
+    const owned = toolApproval(90); owned.params.serverName = "ri";
+    await feed(impl, owned);
+    expect(replyTo(90)?.["result"]).toEqual({ action: "accept" });
+    expect(seen).toHaveLength(0);
+    expect(impl.state).toBe("thinking");
+    await feed(impl, toolApproval(91));
+    expect(replyTo(91)?.["result"]).toEqual({ action: "decline" });
+    expect(seen).toHaveLength(1);
+  });
   it("asks the host as a tool permission and accepts when allowed", async () => {
     let seen: UserInputRequest | null = null;
     let stateDuring: string | null = null;
@@ -256,6 +271,16 @@ const formElicitation = (id: number, extra: Record<string, unknown> = {}) => ({
 });
 
 describe("MCP elicitations", () => {
+  it("still routes host-owned server forms to onElicitation", async () => {
+    let seen: ElicitationRequest | null = null;
+    const { impl, replyTo } = session({
+      config: { mcpServers: [{ name: "deploys", command: "node" }] },
+      onElicitation: async (request) => { seen = request; return { action: "decline" }; },
+    });
+    await feed(impl, formElicitation(92));
+    expect(seen).toMatchObject({ mcpServerName: "deploys", mode: "form" });
+    expect(replyTo(92)?.["result"]).toEqual({ action: "decline" });
+  });
   it("declines without an onElicitation handler", async () => {
     const { impl, replyTo } = session({ onUserInputRequest: async () => ({ allow: true }) });
     await feed(impl, formElicitation(20));

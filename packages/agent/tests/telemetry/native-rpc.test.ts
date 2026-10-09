@@ -1,0 +1,22 @@
+import { afterEach, expect, it } from "vitest";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { NativeTelemetryRpc } from "../../src/telemetry/native-rpc.js";
+const rpcs: NativeTelemetryRpc[] = [];
+const dirs: string[] = [];
+afterEach(async () => { await Promise.all(rpcs.splice(0).map((rpc) => rpc.close())); await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true }))); });
+it.each(["codex", "claude"] as const)("%s capability transport bounds requests and cleans pending controls and child processes", async (protocol) => {
+  const dir = await mkdtemp(join(tmpdir(), "agentex-telemetry-rpc-")); dirs.push(dir);
+  const pidFile = join(dir, "pid");
+  const rpc = new NativeTelemetryRpc(process.execPath, [fileURLToPath(new URL("../fixtures/mock-telemetry-harness.mjs", import.meta.url))], process.cwd(), { ...process.env, MOCK_TELEMETRY_PROTOCOL: protocol, MOCK_IGNORE_METHOD: "never", MOCK_TELEMETRY_PID_FILE: pidFile } as Record<string, string>, protocol); rpcs.push(rpc);
+  await rpc.request("initialize");
+  await expect(rpc.request("never", {}, 25)).rejects.toThrow("timed out");
+  const pending = rpc.request("never");
+  const settled = expect(pending).rejects.toThrow("closed");
+  await rpc.close(); await settled;
+  await expect(rpc.request("initialize")).rejects.toThrow("closed");
+  const pid = Number(await readFile(pidFile, "utf8"));
+  expect(() => process.kill(pid, 0)).toThrow();
+});

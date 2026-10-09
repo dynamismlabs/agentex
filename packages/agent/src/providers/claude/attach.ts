@@ -1,3 +1,4 @@
+import { TelemetryStore } from "../../telemetry/store.js";
 import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
 import type {
@@ -159,7 +160,14 @@ export async function attachClaudeSession(
     lastTurn = await classifyLastTurn(transcript.filePath);
   }
 
+  const telemetry = new TelemetryStore("unknown", "unknown");
+  // Seed from durable observations at their original time. No provider request is made.
+  if (transcript) {
+    for await (const { event } of readClaudeTranscript({ filePath: transcript.filePath })) telemetry.observe(event);
+  }
   return {
+    contextUsage: telemetry.context,
+    rateLimits: telemetry.rateLimits,
     record: normalized,
     transcript,
     lastTurn,
@@ -174,6 +182,7 @@ export async function attachClaudeSession(
             ...(catchOpts?.fromOffset !== undefined ? { fromOffset: catchOpts.fromOffset } : {}),
             ...(catchOpts?.sinceEventId !== undefined ? { sinceEventId: catchOpts.sinceEventId } : {}),
           })) {
+            telemetry.observe(event);
             yield { event, offset, eventId: event.eventId };
           }
         },

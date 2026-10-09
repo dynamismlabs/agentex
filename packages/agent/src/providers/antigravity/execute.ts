@@ -1,3 +1,4 @@
+import { observeExecution } from "../../telemetry/integration.js";
 import type { ExecutionContext, ExecutionResult, ExecutionStatus, StreamEvent } from "../../types.js";
 import { detectAuth } from "../../utils/auth.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
@@ -20,7 +21,11 @@ import { AGY_SIGN_IN_MESSAGE, buildAgyArgs, findAgyBinary, readAgyResumeId } fro
  * The prompt travels over stdin, so it is never size-limited by argv or
  * visible in `ps`.
  */
-export async function executeAntigravityProvider(ctx: ExecutionContext): Promise<ExecutionResult> {
+export function executeAntigravityProvider(ctx: ExecutionContext): Promise<ExecutionResult> {
+  return observeExecution(ctx, { context: false, rates: false }, executeAntigravityProviderInner);
+}
+
+async function executeAntigravityProviderInner(ctx: ExecutionContext): Promise<ExecutionResult> {
   const runId = ctx.runId ?? uuidv7();
   const startedAt = new Date().toISOString();
   const startMs = Date.now();

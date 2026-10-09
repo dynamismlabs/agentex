@@ -314,3 +314,15 @@ export type {
   ReconcileSkillCommandsOptions,
   InvokeSkillOptions,
 } from "./utils/skill-commands.js";
+
+export type {
+  ContextUsage,
+  RateLimitOwner,
+  RateLimitApplicability,
+  RateLimitBucket,
+  RateLimitSnapshot,
+  RateLimitUpdate,
+  TelemetryReadOptions,
+  TelemetryObservation,
+  TelemetrySurface,
+} from "./types.js";

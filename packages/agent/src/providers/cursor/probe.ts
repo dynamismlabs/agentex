@@ -76,6 +76,10 @@ export async function probeCursorCapabilities(
           : {}),
     },
     capabilities: {
+      contextUsage: { supported: false, status: "degraded", reason: "Selected cursor transport has no verified context or provider-capacity source" },
+      contextUsageRefresh: { supported: false, status: "degraded", reason: "Selected cursor transport has no verified context or provider-capacity source" },
+      rateLimits: { supported: false, status: "degraded", reason: "Selected cursor transport has no verified context or provider-capacity source" },
+      rateLimitsRefresh: { supported: false, status: "degraded", reason: "Selected cursor transport has no verified context or provider-capacity source" },
       sessions: supported(Boolean(protocolSupported), "Cursor stream-json session flags are unavailable"),
       resume: supported(Boolean(protocolSupported), "Cursor resume support is unavailable"),
       modelDiscovery: supported(modelDiscovery, "Cursor model listing is unavailable"),

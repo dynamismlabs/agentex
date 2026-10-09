@@ -101,6 +101,11 @@ export function runChildProcess(opts: RunProcessOptions): Promise<RunProcessResu
       opts.onStart(child.pid);
     }
 
+    // A command can exit without consuming its input. Handle the pipe error
+    // before writing so that a fast exit cannot crash the host with EPIPE;
+    // the child's exit status remains the authoritative process result.
+    child.stdin.on("error", () => { /* Process close settles the result. */ });
+
     // Write stdin and close
     if (opts.stdin != null) {
       child.stdin.write(opts.stdin);

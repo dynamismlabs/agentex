@@ -32,6 +32,11 @@ class MockAgent {
 
   async newSession() {
     const sessionId = "sess-" + Math.random().toString(16).slice(2, 10);
+    if (process.env.MOCK_ACP_CONTEXT) {
+      setTimeout(() => this.connection.sessionUpdate({ sessionId, update: {
+        sessionUpdate: "usage_update", used: 12, size: 100, cost: { amount: 3, currency: "USD" },
+      } }), 30);
+    }
     return {
       sessionId,
       modes: {
@@ -60,6 +65,9 @@ class MockAgent {
   async prompt(params) {
     const sessionId = params.sessionId;
     const text = (params.prompt ?? []).map((p) => (p && p.type === "text" ? p.text : "")).join(" ");
+    if (process.env.MOCK_ACP_CONTEXT) await this.connection.sessionUpdate({ sessionId, update: {
+      sessionUpdate: "usage_update", used: text === "compact" ? 3 : 70, size: text === "compact" ? 200 : 100,
+    } });
     const ac = new AbortController();
     this.pending.set(sessionId, ac);
 

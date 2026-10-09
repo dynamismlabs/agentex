@@ -1,3 +1,4 @@
+import { unsupportedSessionTelemetry } from "../../telemetry/integration.js";
 import type {
   AgentSession,
   CancelResult,
@@ -61,7 +62,7 @@ function readResumeId(sessionParams: Record<string, unknown> | null | undefined)
 export async function createOpenCodeSession(ctx: SessionContext): Promise<AgentSession> {
   const session = new OpenCodeSession(ctx);
   await session.connect();
-  return session;
+  return unsupportedSessionTelemetry(session);
 }
 
 class OpenCodeSession implements AgentSession {

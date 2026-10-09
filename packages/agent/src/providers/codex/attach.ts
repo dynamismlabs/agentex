@@ -1,3 +1,4 @@
+import { TelemetryStore } from "../../telemetry/store.js";
 import type {
   AttachOptions,
   CatchUpOptions,
@@ -56,6 +57,9 @@ function isTurnBoundary(line: CodexTranscriptLine, sessionId: string): boolean {
     "system",
     "permission_mode",
     "rate_limit",
+    "rate_limits",
+    "context_usage",
+    "context_usage_invalidated",
     "goal_status",
     "unknown",
   ].includes(event.type));
@@ -141,7 +145,16 @@ export async function attachCodexSession(
     else lastTurn = "interrupted";
   }
 
+  const telemetry = new TelemetryStore("unknown", "unknown");
+  // Seed from durable observations at their original time. No provider request is made.
+  if (transcript) {
+    for await (const { event: line } of readCodexTranscript({ filePath: transcript.filePath })) {
+      for (const event of codexLineToStreamEvents(line, { sessionId })) telemetry.observe(event);
+    }
+  }
   return {
+    contextUsage: telemetry.context,
+    rateLimits: telemetry.rateLimits,
     record: normalized,
     transcript,
     lastTurn,
@@ -158,6 +171,7 @@ export async function attachCodexSession(
             ...(catchOpts?.fromOffset !== undefined ? { fromOffset: catchOpts.fromOffset } : {}),
           })) {
             for (const event of codexLineToStreamEvents(line, { sessionId: sid })) {
+              telemetry.observe(event);
               yield { event, offset, eventId: event.eventId };
             }
           }

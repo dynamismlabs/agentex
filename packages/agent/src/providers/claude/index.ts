@@ -10,9 +10,9 @@ async function checkQuota(ctx: QuotaContext): Promise<QuotaStatus> {
   ensurePathInEnv(env);
   const auth = detectAuth("claude", env);
   return {
-    available: auth.method !== "subscription" || !!env["ANTHROPIC_API_KEY"],
+    available: false,
     billingType: auth.billingType,
-    detail: { method: auth.method, region: auth.region },
+    detail: { method: auth.method, region: auth.region, measured: false, reason: "Authentication configuration does not measure capacity; use session.rateLimits.refresh()" },
   };
 }
 
@@ -21,7 +21,11 @@ export const claudeProvider: ProviderModule = {
   capabilities: {
     sessions: true,
     modelDiscovery: true,
-    quotaProbing: true,
+    quotaProbing: false,
+    contextUsage: true,
+    rateLimits: true,
+    contextUsageRefresh: true,
+    rateLimitsRefresh: true,
     mcp: true,
     skills: true,
     skillInventory: "provider-init",
@@ -58,6 +62,7 @@ export const claudeProvider: ProviderModule = {
   resolveAuth: (ctx) => resolveAuthForProvider("claude", ctx),
   listModels: (options) => import("./discovery.js").then((m) => m.listClaudeModels(options)),
   sessionCodec: claudeSessionCodec,
+  probeCapabilities: (ctx) => import("../../telemetry/probe.js").then((m) => m.probeNativeTelemetry("claude", ctx)),
   checkQuota,
   transcript: claudeTranscriptOps,
   attachSession: async (record, opts) =>

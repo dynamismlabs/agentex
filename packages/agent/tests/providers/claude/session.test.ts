@@ -105,10 +105,10 @@ function makeFakeProc(): {
   stdinWrites: string[];
 } {
   const stdinWrites: string[] = [];
-  const stdin = {
+  const stdin = Object.assign(new EventEmitter(), {
     write: (chunk: string) => { stdinWrites.push(chunk); return true; },
     end: () => {},
-  };
+  });
   const stdout = new EventEmitter() as EventEmitter & { setEncoding: (e: string) => void };
   stdout.setEncoding = () => {};
   const stderr = new EventEmitter() as EventEmitter & { setEncoding: (e: string) => void };

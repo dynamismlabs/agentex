@@ -1,3 +1,4 @@
+import { codexContextUsage, codexRateLimits } from "./transcript-normalize.js";
 import type {
   BackgroundTaskReport,
   BaseStreamEventFields,
@@ -331,12 +332,9 @@ export function parseCodexJsonl(stdout: string): CodexParsedResult {
  *                   ignores this arg.
  */
 function parseCodexStreamLineRaw(
-  line: string,
+  event: Record<string, unknown>,
   sessionId: string | null = null,
 ): StreamEvent | StreamEvent[] | null {
-  const event = parseJson(line);
-  if (!event) return null;
-
   // v2 JSON-RPC notification: has `method` + `params`.
   if (typeof event["method"] === "string") {
     return parseV2Notification(event);
@@ -599,18 +597,25 @@ function parseV2Notification(event: Record<string, unknown>): StreamEvent | Stre
   // ---- Rate limits ----
 
   if (method === "account/rateLimits/updated") {
+    const base = makeBase(null);
+    const update = codexRateLimits(params, base.timestamp);
+    if (!update) return null;
     const rateLimits = parseObject(params["rateLimits"]);
-    const primary = parseObject(rateLimits["primary"]);
-    const usedPercent = asNullableNumber(primary["usedPercent"]);
-    return {
+    const reason = asNullableString(rateLimits["rateLimitReachedType"]);
+    const allowed = params["ordinaryUsageAllowed"];
+    const resetAt = update.snapshot.buckets[0]?.resetAt ?? null;
+    return [{
       type: "rate_limit",
-      status: usedPercent !== null && usedPercent >= 100 ? "rejected" : "allowed",
+      status: reason ?? (allowed === true ? "allowed" : allowed === false ? "rejected" : "unknown"),
       limitType: asNullableString(rateLimits["limitId"]),
-      resetAt: null,
-      overageStatus: null,
-      isUsingOverage: null,
-      ...makeBase(null),
-    };
+      resetAt, overageStatus: null, isUsingOverage: null, ...base,
+    }, { type: "rate_limits", update, ...base }];
+  }
+
+  if (method === "thread/tokenUsage/updated") {
+    const base = makeBase(null);
+    const usage = codexContextUsage(params["tokenUsage"], base.timestamp, asNullableString(params["model"]) ?? undefined);
+    return usage ? { type: "context_usage", usage, ...base } : null;
   }
 
   // ---- Goal lifecycle (experimental; wire shape unofficial — read loosely) ----
@@ -636,7 +641,6 @@ function parseV2Notification(event: Record<string, unknown>): StreamEvent | Stre
   // ---- Pure telemetry / status ----
 
   if (
-    method === "thread/tokenUsage/updated" ||
     method === "thread/status/changed" ||
     method === "mcpServer/startupStatus/updated"
   ) {
@@ -663,7 +667,13 @@ export function parseCodexStreamLines(
   line: string,
   sessionId: string | null = null,
 ): StreamEvent[] {
-  const parsed = parseCodexStreamLineRaw(line, sessionId);
+  const event = parseJson(line);
+  return event ? parseCodexStreamEvent(event, sessionId) : [];
+}
+
+/** @internal Normalize an already-decoded native payload without reparsing JSON. */
+export function parseCodexStreamEvent(event: Record<string, unknown>, sessionId: string | null = null): StreamEvent[] {
+  const parsed = parseCodexStreamLineRaw(event, sessionId);
   if (parsed === null) return [];
   return Array.isArray(parsed) ? parsed : [parsed];
 }

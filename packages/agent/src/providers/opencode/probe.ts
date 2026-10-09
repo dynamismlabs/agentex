@@ -66,6 +66,10 @@ export async function probeOpenCodeCapabilities(
       const has = (path: string, method: string) => Boolean(rec(paths[path])[method]);
       const supportsDisconnect = has("/auth/{providerID}", "delete");
       const capabilities: ProviderRuntimeReport["capabilities"] = {
+        contextUsage: { supported: false, status: "degraded", reason: "Selected opencode transport exposes no verified current-context or account-capacity observation" },
+        contextUsageRefresh: { supported: false, status: "degraded", reason: "Selected opencode transport exposes no verified current-context or account-capacity observation" },
+        rateLimits: { supported: false, status: "degraded", reason: "Selected opencode transport exposes no verified current-context or account-capacity observation" },
+        rateLimitsRefresh: { supported: false, status: "degraded", reason: "Selected opencode transport exposes no verified current-context or account-capacity observation" },
         sessions: capability(has("/session", "post") && has("/session/{sessionID}/message", "post")),
         resume: capability(has("/session/{sessionID}", "get")),
         modelDiscovery: capability(has("/provider", "get")),

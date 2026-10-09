@@ -1,3 +1,5 @@
+import { readLatestCodexTelemetry } from "../../telemetry/codex-durable.js";
+import { observeExecution } from "../../telemetry/integration.js";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -22,12 +24,30 @@ import {
 } from "./parse.js";
 import { withPlanModePreamble } from "./plan-mode.js";
 import { scanCodexSessionUsage } from "./usage-scanner.js";
+import { prepareCodexMcp, splitCodexExtraArgs } from "./mcp.js";
+import { codexSessionCodec } from "./codec.js";
 
-export async function executeCodexProvider(ctx: ExecutionContext): Promise<ExecutionResult> {
+export function executeCodexProvider(ctx: ExecutionContext): Promise<ExecutionResult> {
+  return observeExecution(ctx, { context: true, rates: true }, executeCodexProviderInner, async (result, store) => {
+    if (result.sessionDisplayId) {
+      for (const event of await readLatestCodexTelemetry(result.sessionDisplayId, ctx.env)) {
+        // Historical rollouts have no reliable auth identity. Only quota data
+        // observed during this execution belongs to its effective auth context.
+        if (event.type === "rate_limits" && Date.parse(event.timestamp) < Date.parse(result.startedAt)) continue;
+        store.observe(event);
+        try { await ctx.onEvent?.(event); } catch { /* Subscriber errors do not affect execution. */ }
+      }
+    }
+  });
+}
+
+async function executeCodexProviderInner(ctx: ExecutionContext): Promise<ExecutionResult> {
   const runId = ctx.runId ?? uuidv7();
-  let cwd = ctx.cwd ?? process.cwd();
   const model = ctx.model ?? ctx.config?.model;
   const config = ctx.config ?? {};
+  const hasMcpConfig = config.mcpServers !== undefined || config.strictMcpConfig === true;
+  const restoredCwd = hasMcpConfig ? codexSessionCodec.deserialize(ctx.sessionParams)?.["cwd"] : undefined;
+  let cwd = ctx.cwd ?? (typeof restoredCwd === "string" ? restoredCwd : process.cwd());
   const startedAt = new Date().toISOString();
 
   // 1. Resolve binary
@@ -76,6 +96,17 @@ export async function executeCodexProvider(ctx: ExecutionContext): Promise<Execu
   const endpointTx = translateEndpoint("codex", config.endpoint);
   Object.assign(env, endpointTx.env);
   for (const key of endpointTx.unset) delete env[key];
+  let extra: ReturnType<typeof splitCodexExtraArgs>;
+  let mcp: Awaited<ReturnType<typeof prepareCodexMcp>>;
+  try {
+    extra = splitCodexExtraArgs(config.extraArgs);
+    mcp = await prepareCodexMcp(config, resolvedBinary, [...endpointTx.args, ...extra.configArgs], cwd, env);
+  }
+  catch (error) {
+    await workspace?.cleanup({ deleteBranch: true }).catch(() => { /* best effort before startup */ });
+    throw error;
+  }
+  Object.assign(env, mcp.env);
 
   // 3. Resolve instructions. In plan mode, prepend a preamble that tells the
   //    agent to investigate-and-propose rather than attempt-and-fail — Codex
@@ -135,6 +166,7 @@ export async function executeCodexProvider(ctx: ExecutionContext): Promise<Execu
   const buildArgs = (resumeSessionId: string | null): string[] => {
     const args = [...resolvedBinary.prefixArgs];
     if (config.search) args.push("--search");
+    args.push(...endpointTx.args, ...extra.configArgs, ...mcp.args);
     args.push("exec", "--json");
     // planMode and skipPermissions are mutually exclusive — planMode wins.
     if (config.planMode) {
@@ -144,9 +176,7 @@ export async function executeCodexProvider(ctx: ExecutionContext): Promise<Execu
     }
     if (model) args.push("--model", model);
     if (config.effort) args.push("-c", `model_reasoning_effort=${JSON.stringify(config.effort)}`);
-    // Custom endpoint model_providers overrides — before extraArgs so hosts can override.
-    if (endpointTx.args.length > 0) args.push(...endpointTx.args);
-    if (config.extraArgs) args.push(...config.extraArgs);
+    args.push(...extra.runtimeArgs);
     if (resumeSessionId) {
       args.push("resume", resumeSessionId, "-");
     } else {

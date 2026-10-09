@@ -27,7 +27,7 @@ function replay(): { events: StreamEvent[]; session: ClaudeSessionImpl } {
   const stderr = new EventEmitter() as EventEmitter & { setEncoding: (e: string) => void };
   stderr.setEncoding = () => {};
   const proc = new EventEmitter() as unknown as ChildProcess;
-  Object.assign(proc, { stdin: { write: () => true, end: () => {} }, stdout, stderr, kill: () => true });
+  Object.assign(proc, { stdin: Object.assign(new EventEmitter(), { write: () => true, end: () => {} }), stdout, stderr, kill: () => true });
 
   const events: StreamEvent[] = [];
   const session = new ClaudeSessionImpl(proc, { onEvent: (e) => { events.push(e); } }, null);
