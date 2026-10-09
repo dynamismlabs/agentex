@@ -6,7 +6,7 @@ Agent Ex exposes three independent measurements:
 | --- | --- | --- |
 | Run/turn accounting | Tokens and cost reported for work performed | Existing `TokenUsage`, `ModelUsage`, `TurnResult.usage`, `ExecutionResult.usage` |
 | Session context | Occupancy of the conversation's effective context window | `ContextUsage`, `context_usage`, `session.contextUsage` |
-| Provider capacity | Independent allowances funding requests in an account, workspace, model family, or provider pool | `RateLimitSnapshot`, `rate_limits`, `session.rateLimits` |
+| Provider capacity | Independent allowances funding requests in an account, workspace, model family, or provider pool | `RateLimitSnapshot`, `rate_limits`, `session.rateLimits`, `provider.readRateLimits()` |
 
 Historical billed tokens do not measure current context. Cached input still occupies context; repeated prompts, compaction, restores, and model changes make summing turns incorrect. No adapter substitutes cumulative accounting for context occupancy or hardcodes model capacities.
 
@@ -58,7 +58,7 @@ After a successful explicit Claude context refresh, the session also reads the n
 
 ## Read account capacity without a session
 
-Since 0.0.44, Claude and Codex implement `provider.readRateLimits?(ctx)` separately from `probeCapabilities`. `RateLimitReadContext` extends `ProviderRuntimeContext` (`cwd`, `env`, `config`) with optional `signal: AbortSignal` and `timeoutMs`. No session is created and no probe is required:
+Since 0.0.44, Claude and Codex implement `provider.readRateLimits?(ctx)` separately from `probeCapabilities`. `RateLimitReadContext` uses the runtime context's `cwd`, `env`, and `config`, omits its `refresh` option, and adds optional `signal: AbortSignal` and `timeoutMs`. It honors `config.command`; custom `config.endpoint` is unsupported and other config fields are ignored. No session is created and no probe is required:
 
 ```ts
 import { getProvider, type RateLimitReadContext } from "@agentex/agent";
@@ -106,7 +106,7 @@ For an app's hover-to-refresh UI, read only when its cached capacity is stale, r
 
 An absent optional numeric field means unknown. `usedTokens: 0` and `usedPercent: 0` are measured zero. `value: null` is no snapshot; `value.buckets: []` is an explicitly reported empty collection. Neither absence nor emptiness proves available capacity.
 
-Freshness defaults to 60 seconds and is evaluated at read time. Pass `maxAgeMs` to choose another threshold (`Infinity` disables age expiry), and `now` for a replay/test clock. Every bucket retains its own `observedAt` and gets its own `stale` flag on reads. One fresh bucket does not refresh other buckets. An expired `resetAt` makes the old observation stale; it never invents a newly measured zero.
+Cached session/attachment snapshot reads default to a 60-second freshness threshold, evaluated when `getSnapshot()` is called. Pass `maxAgeMs` to choose another threshold (`Infinity` disables age expiry), and `now` for a replay/test clock. Every bucket retains its own `observedAt` and gets its own `stale` flag on snapshot reads. One fresh bucket does not refresh other buckets. An expired `resetAt` makes the old observation stale; it never invents a newly measured zero. Sessionless `provider.readRateLimits()` returns a new observation rather than reading this cache; reset expiry still marks returned buckets stale.
 
 ## Bucket identity, applicability, and enforcement
 

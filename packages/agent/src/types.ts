@@ -142,8 +142,10 @@ export interface ProviderRuntimeContext {
   refresh?: boolean;
 }
 
-/** Explicit provider/account telemetry read without creating a conversation. */
-export interface RateLimitReadContext extends ProviderRuntimeContext {
+/** Explicit provider/account telemetry read without creating a conversation.
+ * Honors cwd, env and config.command; custom config.endpoint is unsupported.
+ * All other config fields are ignored for this non-inference account read. */
+export interface RateLimitReadContext extends Omit<ProviderRuntimeContext, "refresh"> {
   /** Cancels only this caller; a shared read continues for other callers. */
   signal?: AbortSignal;
   /** Whole-read deadline in milliseconds. Default 10,000; capped at 60,000.
@@ -371,6 +373,8 @@ export interface ProviderModule {
    * one native process; completed observations are not cached by Agent Ex.
    * A successful value is an authoritative replace update, independent of
    * probeCapabilities and existing session snapshot/refresh surfaces.
+   * Honors cwd, env and config.command; custom config.endpoint is unsupported,
+   * and other config fields are ignored.
    */
   readRateLimits?(ctx?: RateLimitReadContext): Promise<TelemetryObservation<RateLimitUpdate>>;
   /** Optional management surface for harness-owned upstream providers. */
