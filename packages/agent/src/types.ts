@@ -1,5 +1,10 @@
+import type { NativeTitleOptions } from "./titles.js";
 /** Static declaration of what a provider supports. */
 export interface ProviderCapabilities {
+  /** Native metadata controls. These never imply automatic naming or library emulation. */
+  sessionTitleRead?: boolean;
+  sessionTitleWrite?: boolean;
+  nativeTitleGeneration?: boolean;
   sessions: boolean;
   modelDiscovery: boolean;
   quotaProbing: boolean;
@@ -1247,6 +1252,7 @@ export type AuthRequiredReason =
  */
 // Stream events — discriminated union
 export type StreamEvent =
+  | ({ type: "title_changed"; title: string | null } & BaseStreamEventFields)
   | ({ type: "context_usage"; usage: ContextUsage } & BaseStreamEventFields)
   | ({ type: "rate_limits"; update: RateLimitUpdate } & BaseStreamEventFields)
   | ({ type: "context_usage_invalidated"; reason: string } & BaseStreamEventFields)
@@ -1872,6 +1878,12 @@ export interface SendOptions {
 
 /** A persistent session handle for multi-turn conversations. */
 export interface AgentSession {
+  /** Read the harness-owned title without generating one. */
+  readTitle?(options?: NativeTitleOptions): Promise<string | null>;
+  /** Set a nonempty title through the native protocol, without inference. */
+  setTitle?(title: string, options?: NativeTitleOptions): Promise<void>;
+  /** Invoke a native naming operation, returning a suggestion without persisting it. */
+  generateNativeTitle?(description: string, options?: NativeTitleOptions): Promise<string | null>;
   /** Independent optional context telemetry. Reading is synchronous and performs no I/O. */
   readonly contextUsage?: TelemetrySurface<ContextUsage>;
   /** Provider/account telemetry observed on this auth-scoped session transport. */

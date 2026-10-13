@@ -35,6 +35,15 @@ async function probeRuntime(runtime: TelemetryRuntime, signal: AbortSignal): Pro
   const version = await runChildProcess({ runId: `${runtime.provider}-telemetry-version`, command: binary.bin,
     args: [...binary.prefixArgs, "--version"], cwd: runtime.cwd, env: runtime.env, timeoutSec: 5, graceSec: 1, signal });
   report.binary.version = version.stdout.match(/\d+\.\d+\.\d+/)?.[0] ?? null;
+  const parts = report.binary.version?.split(".").map(Number);
+  const atLeast = (major: number, minor: number, patch: number) => !!parts &&
+    (parts[0]! > major || (parts[0] === major && (parts[1]! > minor || (parts[1] === minor && parts[2]! >= patch))));
+
+  const titleControls = runtime.provider === "claude" ? atLeast(2, 1, 295) : atLeast(0, 160, 0);
+  report.capabilities.sessionTitleRead = capability(runtime.provider === "claude" || titleControls);
+  report.capabilities.sessionTitleWrite = capability(titleControls, titleControls ? undefined : "Native title controls were not verified for this runtime version");
+  report.capabilities.nativeTitleGeneration = capability(runtime.provider === "claude" && titleControls,
+    runtime.provider === "codex" ? "Codex's client generates titles, not app-server" : titleControls ? undefined : "Native title generation requires a verified Claude Code version");
   if (runtime.provider === "codex") {
     const mcpSupported = codexMcpVersionSupported(report.binary.version);
     report.capabilities.mcp = report.capabilities.strictMcpIsolation = capability(mcpSupported,
@@ -83,6 +92,9 @@ function baseReport(provider: NativeTelemetryProvider, command: string): Provide
   const unavailable = capability(false, "Native telemetry handshake failed or timed out");
   return { binary: { status: "supported", command, version: null, protocolProfile: `${provider}-native-telemetry` }, capabilities: {
     contextUsage: unavailable, contextUsageRefresh: unavailable, rateLimits: unavailable, rateLimitsRefresh: unavailable,
+    sessionTitleRead: capability(false, "Native title support could not be verified"),
+    sessionTitleWrite: capability(false, "Native title support could not be verified"),
+    nativeTitleGeneration: capability(false, "Native title support could not be verified"),
   } };
 }
 function missingReport(): ProviderRuntimeReport {

@@ -1,3 +1,5 @@
+import { normalizeTitle, throwIfTitleAborted, type NativeTitleOptions } from "../../titles.js";
+import { readClaudeTitle } from "./titles.js";
 import { TelemetryStore } from "../../telemetry/store.js";
 import type { ChildProcess } from "node:child_process";
 import { spawn } from "node:child_process";
@@ -268,6 +270,7 @@ const TERMINAL_COMMAND_STATES = new Set(["completed", "cancelled", "discarded", 
 
 export class ClaudeSessionImpl implements AgentSession {
   private _state: SessionState = "idle";
+  private _title: string | null = null;
   private _sessionId: string | null = null;
   /**
    * The open root turn, or null.
@@ -1147,6 +1150,58 @@ export class ClaudeSessionImpl implements AgentSession {
     }
   }
 
+  async readTitle(options: NativeTitleOptions = {}): Promise<string | null> {
+    throwIfTitleAborted(options.signal);
+    const sessionId = this._sessionId ?? (str(this.ctx.sessionParams ?? {}, "sessionId") || str(this.ctx.sessionParams ?? {}, "session_id") || null);
+    if (!sessionId) return this._title;
+    const title = await readClaudeTitle(sessionId, this.cwd, this.ctx.env?.["CLAUDE_CONFIG_DIR"], options);
+    if (title !== this._title) this.publishTitle(title, { source: "transcript-metadata" });
+    return title;
+  }
+
+  async setTitle(title: string, options: NativeTitleOptions = {}): Promise<void> {
+    const name = normalizeTitle(title);
+    if (!name) throw new TypeError("Title must be nonempty");
+    const response = await this.titleControl("rename_session", { title: name, source: "host" }, options, 10_000);
+    this.publishTitle(name, response);
+  }
+
+  async generateNativeTitle(description: string, options: NativeTitleOptions = {}): Promise<string | null> {
+    const response = await this.titleControl("generate_session_title", { description, persist: false }, options, 30_000);
+    return normalizeTitle(response["title"]);
+  }
+
+  private publishTitle(title: string | null, raw: Record<string, unknown>): void {
+    if (title === this._title) return;
+    this.dispatchEvent({ type: "title_changed", title, ...this.telemetryBase(raw, new Date().toISOString()) });
+  }
+
+  private titleControl(subtype: string, fields: Record<string, unknown>, options: NativeTitleOptions, timeoutMs: number): Promise<Record<string, unknown>> {
+    throwIfTitleAborted(options.signal);
+    if (this.isClosed()) return Promise.reject(new Error("Session closed"));
+    const requestId = randomUUID();
+    return new Promise((resolve, reject) => {
+      const cleanup = () => { clearTimeout(timer); options.signal?.removeEventListener("abort", abort); this._pendingControlResponses.delete(requestId); };
+      const cancel = () => {
+        try { this.proc.stdin!.write(ndjsonLine({ type: "control_cancel_request", request_id: requestId })); } catch { /* session may have exited */ }
+      };
+      const abort = () => { cleanup(); cancel(); reject(options.signal?.reason ?? new DOMException("Aborted", "AbortError")); };
+      const timer = setTimeout(() => { cleanup(); cancel(); reject(new Error(`Claude ${subtype} timed out`)); }, options.timeoutMs ?? timeoutMs);
+      timer.unref();
+      this._pendingControlResponses.set(requestId, {
+        resolve: (response) => { cleanup(); resolve(response); },
+        reject: (error) => { cleanup(); reject(error); },
+      });
+      options.signal?.addEventListener("abort", abort, { once: true });
+      if (options.signal?.aborted) { abort(); return; }
+      try {
+        this.proc.stdin!.write(ndjsonLine({ type: "control_request", request_id: requestId, request: { subtype, ...fields } }), (error) => {
+          if (error) this._pendingControlResponses.get(requestId)?.reject(error);
+        });
+      } catch (error) { this._pendingControlResponses.get(requestId)?.reject(error instanceof Error ? error : new Error(String(error))); }
+    });
+  }
+
   /** Provenance for locally requested native telemetry responses. */
   private telemetryBase(raw: Record<string, unknown>, timestamp: string) {
     return { raw, timestamp, providerType: "claude", sessionId: this._sessionId,
@@ -1716,6 +1771,7 @@ export class ClaudeSessionImpl implements AgentSession {
   }
 
   private dispatchEvent(event: StreamEvent): void {
+    if (event.type === "title_changed" && !event.parentToolCallId) this._title = event.title;
     this.telemetry.observe(event);
     if (this.contextRefreshObserved && !event.parentToolCallId && (event.type === "result" || event.type === "context_usage_invalidated" || (event.type === "system" && Boolean(event.model)))) {
       this.requestContextRefresh();

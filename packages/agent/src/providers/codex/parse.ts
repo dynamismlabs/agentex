@@ -369,6 +369,10 @@ function parseV2Notification(event: Record<string, unknown>): StreamEvent | Stre
   const makeBase = (messageId: string | null) =>
     baseFields(event, threadId, messageId, turnId);
 
+  if (method === "thread/name/updated") {
+    return { type: "title_changed", title: asNullableString(params["threadName"]), ...makeBase(null) };
+  }
+
   // ---- Thread lifecycle ----
 
   if (method === "thread/started") {

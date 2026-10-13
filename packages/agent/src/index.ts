@@ -1,3 +1,7 @@
+export async function generateTitle(...args: Parameters<typeof import("./titles.js").generateTitle>) {
+  return (await import("./titles.js")).generateTitle(...args);
+}
+export type { NativeTitleOptions, FallbackTitleContext, GenerateTitleOptions, GeneratedTitle } from "./titles.js";
 // Functions
 export { getProvider, listProviders, registerProvider } from "./registry.js";
 export {

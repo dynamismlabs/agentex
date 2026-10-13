@@ -19,6 +19,9 @@ async function checkQuota(ctx: QuotaContext): Promise<QuotaStatus> {
 export const claudeProvider: ProviderModule = {
   type: "claude",
   capabilities: {
+    sessionTitleRead: true,
+    sessionTitleWrite: true,
+    nativeTitleGeneration: true,
     sessions: true,
     modelDiscovery: true,
     quotaProbing: false,

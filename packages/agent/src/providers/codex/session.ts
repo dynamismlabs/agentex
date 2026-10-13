@@ -1,3 +1,4 @@
+import { normalizeTitle, throwIfTitleAborted, type NativeTitleOptions } from "../../titles.js";
 import { readLatestCodexTelemetry } from "../../telemetry/codex-durable.js";
 import { TelemetryStore } from "../../telemetry/store.js";
 import { codexRateLimits } from "./transcript-normalize.js";
@@ -830,30 +831,51 @@ export class CodexSessionImpl implements AgentSession {
     });
   }
 
+  async readTitle(options: NativeTitleOptions = {}): Promise<string | null> {
+    throwIfTitleAborted(options.signal);
+    if (!this._threadId) return null;
+    const response = await this.boundedRpcRequest("thread/read", { threadId: this._threadId, includeTurns: false }, options.timeoutMs ?? 5000, options.signal);
+    return normalizeTitle(asObj(response, "thread")["name"]);
+  }
+
+  async setTitle(title: string, options: NativeTitleOptions = {}): Promise<void> {
+    throwIfTitleAborted(options.signal);
+    const name = normalizeTitle(title);
+    if (!name) throw new TypeError("Title must be nonempty");
+    if (!this._threadId || this._state === "closed") throw new Error("Session closed or not initialized");
+    await this.boundedRpcRequest("thread/name/set", { threadId: this._threadId, name }, options.timeoutMs ?? 5000, options.signal);
+  }
+
   /** A bounded RPC whose pending-map entry is removed if Codex never replies. */
   private boundedRpcRequest(
     method: string,
     params: Record<string, unknown>,
     timeoutMs = BACKGROUND_TASK_READ_TIMEOUT_MS,
+    signal?: AbortSignal,
   ): Promise<Record<string, unknown>> {
+    throwIfTitleAborted(signal);
     const id = this._nextId++;
     return new Promise((resolve, reject) => {
+      const cleanup = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", abort);
+        this._pendingRpc.delete(id);
+      };
+      const abort = () => {
+        cleanup();
+        reject(signal?.reason ?? new DOMException("Aborted", "AbortError"));
+      };
       const timer = setTimeout(() => {
-        if (!this._pendingRpc.delete(id)) return;
+        cleanup();
         reject(new Error(`codex ${method} timed out`));
       }, timeoutMs);
       if (typeof timer.unref === "function") timer.unref();
-
       this._pendingRpc.set(id, {
-        resolve: (result) => {
-          clearTimeout(timer);
-          resolve(result);
-        },
-        reject: (err) => {
-          clearTimeout(timer);
-          reject(err);
-        },
+        resolve: (result) => { cleanup(); resolve(result); },
+        reject: (err) => { cleanup(); reject(err); },
       });
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted) { abort(); return; }
       this.writeRpcRequest(id, { jsonrpc: "2.0", id, method, params });
     });
   }

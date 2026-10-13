@@ -1,3 +1,11 @@
+## 0.0.45
+
+- Add native session title reads and writes for Claude and Codex, plus native
+  Claude title-generation suggestions without persistence.
+- Add metadata `title_changed` events and installed-runtime title capabilities.
+- Add `generateTitle(session, options)` with explicit host fallback, provenance,
+  bounded native controls, and cancellation that never starts fallback work.
+
 # Changelog
 
 ## 0.0.44 (unreleased) — Sessionless capacity reads and isolated telemetry probes

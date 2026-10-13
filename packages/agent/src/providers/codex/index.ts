@@ -7,6 +7,9 @@ import { codexGoalCapability } from "./goal-capability.js";
 export const codexProvider: ProviderModule = {
   type: "codex",
   capabilities: {
+    sessionTitleRead: true,
+    sessionTitleWrite: true,
+    nativeTitleGeneration: false,
     sessions: true,
     modelDiscovery: true,
     quotaProbing: false,

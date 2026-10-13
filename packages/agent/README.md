@@ -1400,3 +1400,46 @@ registerProvider(myProvider);
 ## License
 
 MIT
+
+## Session titles
+
+Native title metadata and generation are separate capabilities. Claude exposes
+`readTitle`, `setTitle` and `generateNativeTitle` in verified CLI versions. Codex
+exposes `readTitle` and `setTitle` through app-server, and reports name changes as
+`title_changed` events. Codex has no native generation RPC. Other providers omit
+these optional controls until their native protocols are supported.
+
+```ts
+import { generateTitle } from "@agentex/agent";
+
+const existing = await session.readTitle?.();
+const suggestion = existing ? { title: existing, source: "native" as const } :
+  await generateTitle(session, {
+    description: userRequest,
+    signal,
+    fallbackTitleGenerator: ({ description, signal, reason, error }) =>
+      myApp.generateTitle(description, { signal, reason, error }),
+  });
+// Recheck the host's title revision before saving or synchronizing a suggestion.
+if (suggestion && myApp.canApplyTitle()) {
+  myApp.saveTitle(suggestion);
+  await session.setTitle?.(suggestion.title);
+}
+```
+
+`generateTitle` is a shared helper, not a provider-generated turn. It invokes
+actual native generation when available, and invokes the supplied fallback once
+on unsupported, empty, or failed generation. Without a supplied fallback it
+returns null. Cancellation propagates immediately and never starts a fallback.
+Fallback failures propagate. Results report `source: "native" | "fallback"`.
+Neither the helper nor native generation persists a suggestion. Reading an old
+name is deliberately separate, so a fresh retrospective request stays fresh.
+The library supplies no title prompt, model, automatic trigger, or fallback.
+
+`ProviderCapabilities` declares maximum native `sessionTitleRead`,
+`sessionTitleWrite`, and `nativeTitleGeneration` support. Runtime probes report
+verified installed-version support (Claude 2.1.295 and Codex 0.160.0 minimums for
+controls). Native requests are bounded and may fail on changed CLI protocols.
+`title_changed` is metadata, not conversational content, and only reflects
+changes the session observes. Claude reads bounded transcript metadata without
+rewriting it. All title writes go through the CLI's native control protocol.

@@ -409,6 +409,11 @@ export function parseClaudeStreamEvent(event: Record<string, unknown>, partial?:
 
 function parseStreamLineContent(event: Record<string, unknown>, partial?: PartialStreamContext): StreamEvent[] {
   const type = asString(event["type"], "");
+  if (type === "system" && event["subtype"] === "session_title_changed") {
+    const value = event["title"] ?? event["customTitle"] ?? event["aiTitle"];
+    return [{ type: "title_changed", title: typeof value === "string" ? value.trim() || null : null, ...baseFieldsFromEvent(event, null) }];
+  }
+
 
   // `--include-partial-messages` wraps raw API streaming events in
   // `stream_event` lines. Only present when the caller opted in via

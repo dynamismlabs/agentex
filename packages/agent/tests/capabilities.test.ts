@@ -24,6 +24,9 @@ describe("ProviderCapabilities", () => {
   it("claude declares its capabilities", () => {
     const caps = getProvider("claude").capabilities;
     expect(caps).toEqual({
+      sessionTitleRead: true,
+      sessionTitleWrite: true,
+      nativeTitleGeneration: true,
       sessions: true,
       modelDiscovery: true,
       quotaProbing: false,
