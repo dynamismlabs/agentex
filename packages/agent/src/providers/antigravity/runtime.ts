@@ -33,21 +33,33 @@ export function resolveAgyMode(config: ProviderConfig): string | null {
 }
 
 /**
+ * Whether agy runs with `--dangerously-skip-permissions`. Plan mode is the
+ * more conservative intent and wins over skipPermissions, however it was
+ * requested (planMode, modeId, or mode).
+ */
+export function agySkipsPermissions(config: ProviderConfig): boolean {
+  return Boolean(config.skipPermissions) && resolveAgyMode(config) !== "plan";
+}
+
+/**
  * Arguments for a headless `agy` process that reads user messages as NDJSON
  * on stdin and writes `stream-json` events. One process serves a whole
  * session; one-shot runs write a single message and close stdin.
+ * `skillArgs` come from `prepareAgySkills`.
  */
-export function buildAgyArgs(config: ProviderConfig, options: { resumeId: string | null; model: string | null }): string[] {
+export function buildAgyArgs(
+  config: ProviderConfig,
+  options: { resumeId: string | null; model: string | null; skillArgs?: string[] },
+): string[] {
   const args = ["--input-format", "stream-json", "--output-format", "stream-json"];
   if (options.resumeId) args.push("--conversation", options.resumeId);
   if (options.model) args.push("--model", options.model);
   if (config.effort) args.push("--effort", config.effort);
   const mode = resolveAgyMode(config);
   if (mode) args.push("--mode", mode);
-  // Plan mode is the more conservative intent and wins over skipPermissions.
-  // However it was requested (planMode, modeId, or mode).
-  if (config.skipPermissions && mode !== "plan") args.push("--dangerously-skip-permissions");
+  if (agySkipsPermissions(config)) args.push("--dangerously-skip-permissions");
   if (config.sandbox) args.push("--sandbox");
+  if (options.skillArgs) args.push(...options.skillArgs);
   if (config.extraArgs) args.push(...config.extraArgs);
   return args;
 }

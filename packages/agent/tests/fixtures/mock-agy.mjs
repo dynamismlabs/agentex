@@ -15,6 +15,8 @@
 // MOCK_AGY_AUTH=missing: `models` reports no sign-in
 // MOCK_AGY_HELP=old: `--help` without stream-json input support
 // MOCK_DUMP_ARGS_TO: append argv (JSON) per spawn
+// MOCK_DUMP_SKILLS_TO: append, per spawn, what each --add-dir folder's
+//   .agents/skills holds (JSON), the way agy finds skills in added folders
 // MOCK_DUMP_STDIN_TO: append each stdin line
 // MOCK_PID_FILE: write this process's pid
 
@@ -25,6 +27,21 @@ const behavior = process.env.MOCK_AGY_BEHAVIOR ?? "success";
 
 if (process.env.MOCK_DUMP_ARGS_TO) fs.appendFileSync(process.env.MOCK_DUMP_ARGS_TO, `${JSON.stringify(args)}\n`);
 if (process.env.MOCK_PID_FILE) fs.writeFileSync(process.env.MOCK_PID_FILE, String(process.pid));
+if (process.env.MOCK_DUMP_SKILLS_TO) {
+  const added = args.flatMap((arg, index) => (arg === "--add-dir" && args[index + 1] ? [args[index + 1]] : []));
+  const folders = added.map((dir) => {
+    const root = `${dir}/.agents/skills`;
+    if (!fs.existsSync(root)) return { dir, skills: null };
+    const skills = fs.readdirSync(root).sort().map((name) => {
+      const entry = `${root}/${name}`;
+      let skill = null;
+      try { skill = fs.readFileSync(`${entry}/SKILL.md`, "utf8"); } catch { /* unreadable */ }
+      return { name, link: fs.lstatSync(entry).isSymbolicLink() ? fs.readlinkSync(entry) : null, skill };
+    });
+    return { dir, skills };
+  });
+  fs.appendFileSync(process.env.MOCK_DUMP_SKILLS_TO, `${JSON.stringify(folders)}\n`);
+}
 
 const flag = (name) => {
   const index = args.indexOf(name);
@@ -39,6 +56,7 @@ if (args.includes("--version")) {
 if (args.includes("--help")) {
   const lines = [
     "Usage of agy:",
+    "  --add-dir                       Add a directory to the workspace (repeatable) (default [])",
     "  --conversation                  Resume a previous conversation by ID",
     "  --dangerously-skip-permissions  Auto-approve all tool permission requests without prompting",
     "  --effort                        Reasoning effort for the current CLI session (low|medium|high|max)",

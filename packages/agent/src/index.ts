@@ -305,6 +305,7 @@ export type {
   RemoveSkillsOptions,
   SkillRemoveEntry,
   SkillRemoveResult,
+  ListInstalledSkillsOptions,
   InstalledSkill,
 } from "./utils/skills.js";
 

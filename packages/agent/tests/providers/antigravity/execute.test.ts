@@ -1,7 +1,7 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 import { executeAntigravityProvider } from "../../../src/providers/antigravity/execute.js";
 import type { ExecutionContext, StreamEvent } from "../../../src/types.js";
 
@@ -271,5 +271,151 @@ describe("executeAntigravityProvider", () => {
     });
     expect(phases).toEqual(expect.arrayContaining(["preparing", "spawning", "running", "completed"]));
     expect(pid).toBeGreaterThan(0);
+  });
+});
+
+describe("executeAntigravityProvider skills", () => {
+  const originalHome = process.env.HOME;
+  let home: string;
+
+  beforeEach(async () => {
+    // The legacy-link cleanup reads the home folder; keep it off the real one.
+    home = await tempDir();
+    process.env.HOME = home;
+  });
+
+  afterEach(() => {
+    process.env.HOME = originalHome;
+  });
+
+  async function skill(parent: string, name: string): Promise<string> {
+    const dir = path.join(parent, name);
+    await mkdir(dir, { recursive: true });
+    await writeFile(path.join(dir, "SKILL.md"), `---\nname: ${name}\ndescription: ${name} skill\n---\n`);
+    return dir;
+  }
+
+  const exists = (p: string) => access(p).then(() => true, () => false);
+
+  interface AddedFolder { dir: string; skills: Array<{ name: string; link: string | null; skill: string | null }> | null }
+
+  it("adds the skills to the workspace in a temporary folder, removed after the run", async () => {
+    const cwd = await tempDir();
+    const outside = await skill(await tempDir(), "alpha");
+    const inside = await skill(path.join(cwd, "skills"), "beta");
+    const argsFile = path.join(cwd, "args.jsonl");
+    const skillsFile = path.join(cwd, "skills.jsonl");
+    const { result } = await run({
+      cwd,
+      env: { MOCK_DUMP_ARGS_TO: argsFile, MOCK_DUMP_SKILLS_TO: skillsFile },
+      config: { skillDirs: [outside, inside], extraArgs: ["--host-flag"] },
+    });
+    expect(result.status).toBe("completed");
+
+    const [args] = await readJsonLines<string[]>(argsFile);
+    const skillsDir = args![args!.indexOf("--add-dir") + 1]!;
+    expect(path.basename(skillsDir)).toMatch(/^agentex-skills-/);
+    // agy reads a linked skill only when its real folder is in the workspace;
+    // one already under cwd is, so only the outside one is added.
+    expect(args).toEqual([
+      "--input-format", "stream-json", "--output-format", "stream-json",
+      "--add-dir", skillsDir,
+      "--add-dir", await realpath(outside),
+      "--host-flag",
+    ]);
+
+    const [folders] = await readJsonLines<AddedFolder[]>(skillsFile);
+    expect(folders![0]).toEqual({
+      dir: skillsDir,
+      skills: [
+        { name: "alpha", link: outside, skill: expect.stringContaining("name: alpha") },
+        { name: "beta", link: inside, skill: expect.stringContaining("name: beta") },
+      ],
+    });
+
+    expect(await exists(skillsDir)).toBe(false);
+    // Nothing global: not agy's skill folders, not the legacy one.
+    expect(await exists(path.join(home, ".gemini"))).toBe(false);
+  });
+
+  it("removes the skills folder when the run fails", async () => {
+    const cwd = await tempDir();
+    const argsFile = path.join(cwd, "args.jsonl");
+    const { result } = await run({
+      cwd,
+      env: { MOCK_AGY_BEHAVIOR: "crash", MOCK_DUMP_ARGS_TO: argsFile },
+      config: { skillDirs: [await skill(await tempDir(), "alpha")] },
+    });
+    expect(result.status).toBe("failed");
+    const [args] = await readJsonLines<string[]>(argsFile);
+    expect(await exists(args![args!.indexOf("--add-dir") + 1]!)).toBe(false);
+  });
+
+  it("adds a skill folder shared by two skill names once, and none for a missing skill", async () => {
+    const cwd = await tempDir();
+    const real = await skill(await tempDir(), "alpha");
+    const alias = path.join(await tempDir(), "alias");
+    await symlink(real, alias, "dir");
+    const argsFile = path.join(cwd, "args.jsonl");
+    await run({
+      cwd,
+      env: { MOCK_DUMP_ARGS_TO: argsFile },
+      config: { skillDirs: [real, alias, path.join(cwd, "missing")] },
+    });
+    const [args] = await readJsonLines<string[]>(argsFile);
+    const added = args!.filter((_, index) => args![index - 1] === "--add-dir");
+    expect(added.slice(1)).toEqual([await realpath(real)]);
+  });
+
+  it("removes the links older versions left in agy's legacy folder, and nothing live there", async () => {
+    const alpha = await skill(await tempDir(), "alpha");
+    const other = await skill(await tempDir(), "other");
+    const legacy = path.join(home, ".gemini", "antigravity-cli", "skills");
+    await mkdir(legacy, { recursive: true });
+    await symlink(alpha, path.join(legacy, "alpha"), "dir");
+    await symlink(other, path.join(legacy, "other"), "dir");
+    // Left for a skill since renamed or deleted: no one can read it.
+    await symlink(path.join(home, "renamed-away"), path.join(legacy, "renamed"), "dir");
+    await skill(legacy, "mine");
+
+    await run({ config: { skillDirs: [alpha] } });
+
+    expect((await readdir(legacy)).sort()).toEqual(["mine", "other"]);
+    expect((await lstat(path.join(legacy, "other"))).isSymbolicLink()).toBe(true);
+  });
+
+  it("adds only the skills folder when agy skips permissions, since nothing is denied", async () => {
+    const cwd = await tempDir();
+    const argsFile = path.join(cwd, "args.jsonl");
+    await run({
+      cwd,
+      env: { MOCK_DUMP_ARGS_TO: argsFile },
+      config: { skillDirs: [await skill(await tempDir(), "alpha")], skipPermissions: true },
+    });
+    const [args] = await readJsonLines<string[]>(argsFile);
+    expect(args).toContain("--dangerously-skip-permissions");
+    expect(args!.filter((arg) => arg === "--add-dir")).toHaveLength(1);
+  });
+
+  it("still adds each skill's folder in plan mode, which keeps permissions", async () => {
+    const cwd = await tempDir();
+    const alpha = await skill(await tempDir(), "alpha");
+    const argsFile = path.join(cwd, "args.jsonl");
+    await run({
+      cwd,
+      env: { MOCK_DUMP_ARGS_TO: argsFile },
+      config: { skillDirs: [alpha], skipPermissions: true, planMode: true },
+    });
+    const [args] = await readJsonLines<string[]>(argsFile);
+    expect(args).not.toContain("--dangerously-skip-permissions");
+    expect(args!.slice(-2)).toEqual(["--add-dir", await realpath(alpha)]);
+  });
+
+  it("adds no folder without skills", async () => {
+    const cwd = await tempDir();
+    const argsFile = path.join(cwd, "args.jsonl");
+    await run({ cwd, env: { MOCK_DUMP_ARGS_TO: argsFile }, config: { skillDirs: [] } });
+    const [args] = await readJsonLines<string[]>(argsFile);
+    expect(args).not.toContain("--add-dir");
   });
 });

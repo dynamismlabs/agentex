@@ -8,7 +8,8 @@ export type SkillLocation = "global" | "workspace";
 
 /**
  * The two standard skill discovery channels:
- * - "agents": ~/.agents/skills/ or {cwd}/.agents/skills/ — scanned by Codex, Gemini, Antigravity, Cursor, OpenCode, Pi
+ * - "agents": ~/.agents/skills/ or {cwd}/.agents/skills/ — scanned by Codex, Gemini, Cursor, OpenCode, Pi.
+ *   Antigravity scans only the workspace one; its global folder is ~/.gemini/config/skills/.
  * - "claude": ~/.claude/skills/ or {cwd}/.claude/skills/ — scanned by Claude Code (the only agent that doesn't scan .agents/)
  */
 export type SkillChannel = "agents" | "claude";
@@ -24,9 +25,13 @@ const NATIVE_DIRS: Record<string, { global: string; workspace: (cwd: string) => 
     workspace: (cwd) => path.join(cwd, ".gemini", "skills"),
   },
   // Antigravity reads workspace skills from the standard .agents/skills
-  // channel; only its global folder is its own.
+  // channel, but not ~/.agents/skills: its global folder is its own. agy
+  // 1.4.3 gives the agent ~/.gemini/config/skills and never
+  // ~/.gemini/antigravity-cli/skills, whose skills only its /skills menu shows.
+  // Headless agy that doesn't skip permissions can't read a link installed
+  // here whose real folder is outside the chat's workspace.
   antigravity: {
-    global: path.join(os.homedir(), ".gemini", "antigravity-cli", "skills"),
+    global: path.join(os.homedir(), ".gemini", "config", "skills"),
     workspace: (cwd) => path.join(cwd, ".agents", "skills"),
   },
   cursor: {
@@ -57,6 +62,14 @@ export interface InstallSkillsOptions {
   /** Also install into each runtime's native directory (e.g. ~/.gemini/skills/, ~/.cursor/skills/).
    *  Usually unnecessary since most runtimes scan .agents/skills/. Default: false. */
   includeNativeDirs?: boolean;
+  /** Install into exactly these skills folders (e.g. `resolveNativeSkillsHome("antigravity")`),
+   *  instead of the ones `location` and `includeNativeDirs` pick. Each entry is reported with
+   *  the folder's absolute path as its `target`. */
+  folders?: string[];
+  /** Replace a link at a skill's name whose target no longer exists (left by a source that was
+   *  deleted), instead of reporting it as a conflict. No runtime can read a dead link, so it
+   *  would otherwise keep the name taken for good. Default: false. */
+  replaceDeadLinks?: boolean;
 }
 
 export interface SkillInstallEntry {
@@ -82,6 +95,21 @@ export interface RemoveSkillsOptions {
   cwd?: string;
   /** Also remove from native runtime directories. Default: false. */
   includeNativeDirs?: boolean;
+  /** Remove from exactly these skills folders, instead of the ones `location` and
+   *  `includeNativeDirs` pick. */
+  folders?: string[];
+}
+
+export interface ListInstalledSkillsOptions {
+  /** Where to list skills from. Defaults to "global". */
+  location?: SkillLocation;
+  /** Working directory. Required for "workspace" location. */
+  cwd?: string;
+  /** Also list native runtime directories, keyed by runtime. Default: false. */
+  includeNativeDirs?: boolean;
+  /** List exactly these skills folders, keyed by absolute path, instead of the ones
+   *  `location` and `includeNativeDirs` pick. */
+  folders?: string[];
 }
 
 export interface SkillRemoveEntry {
@@ -138,11 +166,17 @@ function resolveNativePaths(location: SkillLocation, cwd?: string): Array<{ targ
 }
 
 /** Build the full list of install/remove targets. */
-function resolveTargets(
-  location: SkillLocation,
-  cwd?: string,
-  includeNativeDirs?: boolean,
-): Array<{ target: string; skillsHome: string }> {
+function resolveTargets(options: {
+  location?: SkillLocation;
+  cwd?: string;
+  includeNativeDirs?: boolean;
+  folders?: string[];
+}): Array<{ target: string; skillsHome: string }> {
+  if (options.folders) {
+    const folders = [...new Set(options.folders.map((folder) => path.resolve(folder)))];
+    return folders.map((folder) => ({ target: folder, skillsHome: folder }));
+  }
+  const { location = "global", cwd, includeNativeDirs } = options;
   const targets = resolveStandardPaths(location, cwd);
   if (includeNativeDirs) {
     // A runtime whose native folder is a standard channel (Antigravity's
@@ -169,7 +203,8 @@ function resolveTargets(
  * - `.claude/skills/` — discovered by Claude Code
  *
  * Set `includeNativeDirs: true` to also install into each runtime's
- * native directory (e.g. `.gemini/skills/`, `.cursor/skills/`).
+ * native directory (e.g. `.gemini/skills/`, `.cursor/skills/`), or pass
+ * `folders` to install into exactly the folders you name.
  *
  * @example
  * ```typescript
@@ -180,6 +215,11 @@ function resolveTargets(
  * // Workspace install (project-local)
  * await installSkills(skillDirs, { location: "workspace", cwd: "/path/to/project" });
  * // Creates {cwd}/.agents/skills/... + {cwd}/.claude/skills/...
+ *
+ * // Exactly the folders named, e.g. Antigravity's global folder too
+ * await installSkills(skillDirs, {
+ *   folders: [resolveSkillsHome("agents"), resolveSkillsHome("claude"), resolveNativeSkillsHome("antigravity")!],
+ * });
  * ```
  */
 export async function installSkills(
@@ -187,17 +227,27 @@ export async function installSkills(
   options?: InstallSkillsOptions,
 ): Promise<SkillInstallResult> {
   const entries: SkillInstallEntry[] = [];
-  const location = options?.location ?? "global";
-  const targets = resolveTargets(location, options?.cwd, options?.includeNativeDirs);
+  const targets = resolveTargets(options ?? {});
 
   for (const { target, skillsHome } of targets) {
-    await fs.mkdir(skillsHome, { recursive: true });
+    // A folder that can't be made fails only its own entries.
+    let folderError: string | null = null;
+    try {
+      await fs.mkdir(skillsHome, { recursive: true });
+    } catch (err) {
+      folderError = err instanceof Error ? err.message : String(err);
+    }
 
     for (const dir of skillDirs) {
       const resolved = path.resolve(dir);
       const name = path.basename(resolved);
       const symlink = path.join(skillsHome, name);
+      if (folderError) {
+        entries.push({ target, skillName: name, status: "error", targetPath: symlink, error: folderError });
+        continue;
+      }
       try {
+        if (options?.replaceDeadLinks) await removeDeadLink(symlink, resolved);
         const status = await ensureSkillSymlink(resolved, symlink);
         entries.push({ target, skillName: name, status, targetPath: symlink });
       } catch (err) {
@@ -232,8 +282,7 @@ export async function removeSkills(
   options?: RemoveSkillsOptions,
 ): Promise<SkillRemoveResult> {
   const entries: SkillRemoveEntry[] = [];
-  const location = options?.location ?? "global";
-  const targets = resolveTargets(location, options?.cwd, options?.includeNativeDirs);
+  const targets = resolveTargets(options ?? {});
 
   for (const { target, skillsHome } of targets) {
     for (const dir of skillDirs) {
@@ -291,13 +340,15 @@ export async function removeSkills(
  *
  * const skills = await listInstalledSkills({ location: "workspace", cwd: "/my/project" });
  * // { agents: [...], claude: [...] }
+ *
+ * const skills = await listInstalledSkills({ folders: ["/Users/me/.gemini/config/skills"] });
+ * // { "/Users/me/.gemini/config/skills": [...] }
  * ```
  */
 export async function listInstalledSkills(
-  options?: { location?: SkillLocation; cwd?: string; includeNativeDirs?: boolean },
+  options?: ListInstalledSkillsOptions,
 ): Promise<Record<string, InstalledSkill[]>> {
-  const location = options?.location ?? "global";
-  const targets = resolveTargets(location, options?.cwd, options?.includeNativeDirs);
+  const targets = resolveTargets(options ?? {});
 
   const result: Record<string, InstalledSkill[]> = {};
 
@@ -384,6 +435,27 @@ export function resolveNativeSkillsWorkspace(runtime: SkillRuntime, cwd: string)
 // ---------------------------------------------------------------------------
 // Low-level helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Remove a link at `target` that leads nowhere and doesn't point at `source`.
+ * A live link, a real folder, and a dead link to `source` itself stay.
+ */
+async function removeDeadLink(target: string, source: string): Promise<void> {
+  let stat;
+  try {
+    stat = await fs.lstat(target);
+  } catch {
+    return;
+  }
+  if (!stat.isSymbolicLink()) return;
+  const existing = path.resolve(path.dirname(target), await fs.readlink(target));
+  if (existing === path.resolve(source)) return;
+  try {
+    await fs.stat(target);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") await fs.unlink(target);
+  }
+}
 
 /**
  * Idempotent symlink creation. Returns the outcome:
@@ -476,8 +548,10 @@ export async function injectWorkspaceSkills(
 }
 
 /**
- * Build an ephemeral tmpdir with .claude/skills/ containing symlinks.
- * Used by Claude provider — passed via --add-dir, cleaned up after execution.
+ * Build an ephemeral tmpdir of skill symlinks, laid out where the runtime
+ * looks in a folder added with --add-dir: .claude/skills/ for Claude,
+ * .agents/skills/ for Antigravity, skills/ otherwise.
+ * Used by the Claude and Antigravity providers, cleaned up after execution.
  *
  * Returns the tmpdir path (caller must clean up with cleanupSkillsDir).
  */
@@ -487,6 +561,8 @@ export async function buildSkillsDir(skillDirs: string[], runtime: SkillRuntime)
   let skillsRoot: string;
   if (runtime === "claude") {
     skillsRoot = path.join(tmpDir, ".claude", "skills");
+  } else if (runtime === "antigravity") {
+    skillsRoot = path.join(tmpDir, ".agents", "skills");
   } else {
     skillsRoot = path.join(tmpDir, "skills");
   }
@@ -495,7 +571,7 @@ export async function buildSkillsDir(skillDirs: string[], runtime: SkillRuntime)
   for (const dir of skillDirs) {
     const name = path.basename(dir);
     try {
-      await fs.symlink(dir, path.join(skillsRoot, name), "dir");
+      await fs.symlink(path.resolve(dir), path.join(skillsRoot, name), "dir");
     } catch (err) {
       console.warn(`Failed to symlink skill "${name}": ${err}`);
     }

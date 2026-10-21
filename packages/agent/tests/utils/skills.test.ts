@@ -66,6 +66,26 @@ describe("buildSkillsDir", () => {
     expect(stat.isSymbolicLink()).toBe(true);
   });
 
+  it("creates Antigravity skill dir structure, the .agents/skills agy reads in an added folder", async () => {
+    testSkillDir = await createTestSkillDir();
+    const tmpDir = await buildSkillsDir([testSkillDir], "antigravity");
+    tmpDirs.push(tmpDir);
+
+    const symlinkPath = path.join(tmpDir, ".agents", "skills", path.basename(testSkillDir));
+    expect((await fs.lstat(symlinkPath)).isSymbolicLink()).toBe(true);
+    expect(await fs.readlink(symlinkPath)).toBe(testSkillDir);
+  });
+
+  it("links a relative skill dir by its absolute path", async () => {
+    testSkillDir = await createTestSkillDir();
+    const tmpDir = await buildSkillsDir([path.relative(process.cwd(), testSkillDir)], "claude");
+    tmpDirs.push(tmpDir);
+
+    const symlinkPath = path.join(tmpDir, ".claude", "skills", path.basename(testSkillDir));
+    expect(await fs.readlink(symlinkPath)).toBe(testSkillDir);
+    expect(await fs.readFile(path.join(symlinkPath, "SKILL.md"), "utf-8")).toBe("# Test Skill");
+  });
+
   it("creates multiple symlinks", async () => {
     const skill1 = await createTestSkillDir();
     const skill2 = await createTestSkillDir();
@@ -139,8 +159,8 @@ describe("resolveNativeSkillsHome", () => {
     expect(resolveNativeSkillsHome("pi")).toBe(path.join(os.homedir(), ".pi", "agent", "skills"));
   });
 
-  it("returns ~/.gemini/antigravity-cli/skills for antigravity", () => {
-    expect(resolveNativeSkillsHome("antigravity")).toBe(path.join(os.homedir(), ".gemini", "antigravity-cli", "skills"));
+  it("returns ~/.gemini/config/skills for antigravity, the global folder agy gives the agent", () => {
+    expect(resolveNativeSkillsHome("antigravity")).toBe(path.join(os.homedir(), ".gemini", "config", "skills"));
   });
 
   it("returns null for claude (uses standard channel)", () => {
@@ -424,6 +444,93 @@ describe("installSkills", () => {
     // Verify a native dir was created
     const geminiLink = path.join(cwd, ".gemini", "skills", "native-skill");
     expect((await fs.lstat(geminiLink)).isSymbolicLink()).toBe(true);
+  });
+
+  it("installs into exactly the folders named, once each, ignoring location", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "install-folders-"));
+    tmpDirs.push(root);
+    const skill = await createSkillDir("folder-skill");
+    const a = path.join(root, "a", "skills");
+    const b = path.join(root, "b", "skills");
+
+    const result = await installSkills([skill], {
+      folders: [a, b, path.join(b, "..", "skills")],
+      location: "workspace",
+      includeNativeDirs: true,
+    });
+
+    expect(result.installed).toBe(2);
+    expect(result.entries.map((e) => [e.target, e.targetPath])).toEqual([
+      [a, path.join(a, "folder-skill")],
+      [b, path.join(b, "folder-skill")],
+    ]);
+    expect(await fs.readlink(path.join(a, "folder-skill"))).toBe(skill);
+    // Nothing went to the standard channels.
+    await expect(fs.access(path.join(root, ".agents"))).rejects.toThrow();
+  });
+
+  it("reports a folder it can't make as errors for that folder, and installs the rest", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "install-folders-"));
+    tmpDirs.push(root);
+    const skill = await createSkillDir("blocked-skill");
+    const file = path.join(root, "not-a-folder");
+    await fs.writeFile(file, "");
+    const blocked = path.join(file, "skills");
+    const good = path.join(root, "good");
+
+    const result = await installSkills([skill], { folders: [blocked, good] });
+
+    expect(result.errors).toBe(1);
+    expect(result.installed).toBe(1);
+    expect(result.entries[0]).toMatchObject({ target: blocked, skillName: "blocked-skill", status: "error" });
+    expect(result.entries[0]!.error).toMatch(/ENOTDIR|EEXIST/);
+    expect(await fs.readlink(path.join(good, "blocked-skill"))).toBe(skill);
+  });
+
+  it("reports a dead link at a skill's name as a conflict by default", async () => {
+    const folder = await fs.mkdtemp(path.join(os.tmpdir(), "install-dead-"));
+    tmpDirs.push(folder);
+    const skill = await createSkillDir("dead-skill");
+    await fs.symlink(path.join(folder, "gone"), path.join(folder, "dead-skill"), "dir");
+
+    const result = await installSkills([skill], { folders: [folder] });
+
+    expect(result.conflicts).toBe(1);
+    expect(await fs.readlink(path.join(folder, "dead-skill"))).toBe(path.join(folder, "gone"));
+  });
+
+  it("replaces a dead link with replaceDeadLinks, and leaves anything live", async () => {
+    const folder = await fs.mkdtemp(path.join(os.tmpdir(), "install-dead-"));
+    tmpDirs.push(folder);
+    const dead = await createSkillDir("dead");
+    const live = await createSkillDir("live");
+    const real = await createSkillDir("real");
+    const elsewhere = await createSkillDir("elsewhere");
+    await fs.symlink(path.join(folder, "gone"), path.join(folder, "dead"), "dir");
+    await fs.symlink(elsewhere, path.join(folder, "live"), "dir");
+    await fs.mkdir(path.join(folder, "real"));
+
+    const result = await installSkills([dead, live, real], { folders: [folder], replaceDeadLinks: true });
+
+    expect(Object.fromEntries(result.entries.map((e) => [e.skillName, e.status]))).toEqual({
+      dead: "created",
+      live: "conflict",
+      real: "conflict",
+    });
+    expect(await fs.readlink(path.join(folder, "dead"))).toBe(dead);
+    expect(await fs.readlink(path.join(folder, "live"))).toBe(elsewhere);
+    expect((await fs.lstat(path.join(folder, "real"))).isDirectory()).toBe(true);
+  });
+
+  it("keeps an existing link to the skill itself with replaceDeadLinks, even while the skill is missing", async () => {
+    const folder = await fs.mkdtemp(path.join(os.tmpdir(), "install-dead-"));
+    tmpDirs.push(folder);
+    const missing = path.join(folder, "source", "missing-skill");
+    await fs.symlink(missing, path.join(folder, "missing-skill"), "dir");
+
+    const result = await installSkills([missing], { folders: [folder], replaceDeadLinks: true });
+
+    expect(result.entries[0]!.status).toBe("skipped");
   });
 });
 
@@ -750,5 +857,32 @@ describe("install → list → remove round-trip", () => {
     for (const channel of Object.keys(afterRemove)) {
       expect(afterRemove[channel]!.length).toBe(0);
     }
+  });
+
+  it("folders round-trip, keyed by folder", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "roundtrip-folders-"));
+    tmpDirs.push(root);
+    const skill = await createSkillDir("folder-rt");
+    const other = await createSkillDir("folder-other");
+    const a = path.join(root, "a");
+    const b = path.join(root, "b");
+    const opts = { folders: [a, b] };
+
+    expect((await installSkills([skill], opts)).installed).toBe(2);
+    // Someone else's link in one folder is listed but never removed.
+    await fs.symlink(other, path.join(b, "folder-other"), "dir");
+
+    const listed = await listInstalledSkills(opts);
+    expect(Object.keys(listed)).toEqual([a, b]);
+    expect(listed[a]!.map((s) => s.name)).toEqual(["folder-rt"]);
+    expect(listed[b]!.map((s) => s.name).sort()).toEqual(["folder-other", "folder-rt"]);
+
+    const removed = await removeSkills([skill], opts);
+    expect(removed.removed).toBe(2);
+    expect(removed.entries.map((e) => e.target)).toEqual([a, b]);
+
+    const after = await listInstalledSkills(opts);
+    expect(after[a]).toEqual([]);
+    expect(after[b]!.map((s) => s.name)).toEqual(["folder-other"]);
   });
 });

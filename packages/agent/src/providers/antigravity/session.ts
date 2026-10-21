@@ -19,7 +19,6 @@ import { GoalController, EMULATED_GOAL_CAPABILITY } from "../../goals/index.js";
 import type { ResolvedBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { resolveInstructions } from "../../utils/instructions.js";
-import { injectHomeSkills } from "../../utils/skills.js";
 import { uuidv7 } from "../../utils/uuid.js";
 import {
   AgyConnection,
@@ -35,6 +34,7 @@ import {
   mapAgyTurnStatus,
 } from "./parse.js";
 import { AGY_SIGN_IN_MESSAGE, buildAgyArgs, findAgyBinary, readAgyResumeId } from "./runtime.js";
+import { cleanupAgySkills, prepareAgySkills, type AgySkills } from "./skills.js";
 
 interface ActiveTurn {
   turnId: string;
@@ -51,14 +51,13 @@ export async function createAntigravitySession(ctx: SessionContext): Promise<Age
   const binary = await findAgyBinary(ctx);
   const config = ctx.config ?? {};
   const instructions = await resolveInstructions(config.instructionsFile);
-  if (config.skillDirs && config.skillDirs.length > 0) {
-    try {
-      await injectHomeSkills(config.skillDirs, "antigravity");
-    } catch {
-      // Non-fatal
-    }
+  let skills: AgySkills | null = null;
+  try {
+    skills = await prepareAgySkills(config.skillDirs, ctx.cwd ?? process.cwd(), config);
+  } catch {
+    // Non-fatal
   }
-  return unsupportedSessionTelemetry(new AntigravitySession(ctx, binary, instructions));
+  return unsupportedSessionTelemetry(new AntigravitySession(ctx, binary, instructions, skills));
 }
 
 /**
@@ -92,15 +91,19 @@ class AntigravitySession implements AgentSession {
   private connectionResumeId: string | null = null;
   private readonly cwd: string;
   private readonly goals: GoalController;
+  /** The chat's skills, added to every agy process it starts. Removed on close. */
+  private skills: AgySkills | null;
 
   constructor(
     private readonly ctx: SessionContext,
     private readonly binary: ResolvedBinary,
     instructions: string | null,
+    skills: AgySkills | null,
   ) {
     this.cwd = ctx.cwd ?? process.cwd();
     this.conversationId = readAgyResumeId(ctx.sessionParams, this.cwd);
     this.instructions = instructions;
+    this.skills = skills;
     this.goals = new GoalController({
       providerType: ANTIGRAVITY_PROVIDER_TYPE,
       capability: EMULATED_GOAL_CAPABILITY,
@@ -162,7 +165,11 @@ class AntigravitySession implements AgentSession {
       command: this.binary.bin,
       args: [
         ...this.binary.prefixArgs,
-        ...buildAgyArgs(config, { resumeId: this.conversationId, model: config.model ?? null }),
+        ...buildAgyArgs(config, {
+          resumeId: this.conversationId,
+          model: config.model ?? null,
+          skillArgs: this.skills?.args,
+        }),
       ],
       cwd: this.cwd,
       env,
@@ -397,5 +404,8 @@ class AntigravitySession implements AgentSession {
     const connection = this.connection;
     this.connection = null;
     if (connection) await connection.terminate(this.ctx.config?.graceSec);
+    const skills = this.skills;
+    this.skills = null;
+    await cleanupAgySkills(skills);
   }
 }

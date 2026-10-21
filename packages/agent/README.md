@@ -111,6 +111,7 @@ await (await session.send("Now list its entry points")).result; // same agy proc
 - **Permissions.** Headless agy cannot ask. `skipPermissions` maps to `--dangerously-skip-permissions`. Without it, actions that would need approval (shell commands by default) are soft-denied and listed in `ExecutionResult.permissionDenials`, and the run still succeeds. Grant specific actions with `permissions.allow` rules in `~/.gemini/antigravity-cli/settings.json`. `permissionRequests` is therefore `false`.
 - **Modes, effort, models.** `listModes()` returns `default`, `accept-edits`, and `plan`. agy's `--mode` accepts only `accept-edits` and `plan`, so `default` passes no flag and agy uses the `agentMode` saved in its settings.json (request-review unless changed). `planMode` maps to `--mode plan`. Plan mode, however it is requested, suppresses `--dangerously-skip-permissions`. `config.effort` maps to `--effort` (`low`, `medium`, `high`, `max`). `listModels()` reads `agy models`, which needs a signed-in account.
 - **Instructions.** agy has no system-prompt flag, so `instructionsFile` rides on the first message each agy process accepts, like a per-process system prompt. Every `execute()` and every new session sends it, including resumes, so a saved conversation agy can no longer find still gets it. It stays pending until agy acknowledges a message that carried it, so a failed start or sign-in does not drop it. A session that respawns agy on a conversation it already briefed does not repeat it.
+- **Skills.** `skillDirs` go in a temporary folder of links (`.agents/skills/<name>`) that every agy process a run or session starts gets with `--add-dir`, removed when the run ends or the session closes. Nothing global changes, so a chat's skills never reach other agy sessions. Headless agy refuses to read a file whose real path is outside its workspace, linked or not, so unless it skips permissions each skill's own folder is added too (one already under `cwd` isn't), or the agent would see the skill and be denied its `SKILL.md`. Links keep a skill edited mid-chat current. agy 1.4.3 reads global skills from `~/.gemini/config/skills` and project skills from `.agents/skills`, never `~/.agents/skills`, and gives the agent nothing from `~/.gemini/antigravity-cli/skills`, where agentex 0.0.40–0.0.45 linked `skillDirs`. A run or session removes the links those versions left there for its skills, and any link there that leads nowhere.
 - **Sign-in.** An unsigned headless agy prints a login URL and waits a minute for a code. agentex stops it as soon as the prompt appears, emits `auth_required` with `loginCommand: "agy"`, and fails the turn with `errorCode: "auth_required"`.
 - **Usage.** agy reports cumulative usage per process. agentex reports each turn's share, keyed by the pinned model (or `"default"`). `cachedInputTokens` comes from `cache_read_tokens`.
 - **Not yet wired.** `config.mcpServers` (agy reads `~/.gemini/config/mcp_config.json` and `.agents/mcp_config.json` itself), and history import.
@@ -1133,14 +1134,24 @@ const skillDirs = ["/path/to/code-review", "/path/to/testing"];
 await installSkills(skillDirs, {
   location: "workspace",              // or "global"
   cwd: process.cwd(),                 // required for workspace installs
-  includeNativeDirs: false,           // true also installs into ~/.gemini/skills/, ~/.gemini/antigravity-cli/skills/, etc.
+  includeNativeDirs: false,           // true also installs into ~/.gemini/skills/, ~/.gemini/config/skills/, etc.
 });
 
 const installed = await listInstalledSkills({ location: "workspace", cwd: process.cwd() });
 await removeSkills(skillDirs, { location: "workspace", cwd: process.cwd() });
 ```
 
-Channels and locations follow the emerging `.agents/skills/` + `.claude/skills/` convention — see the `SkillRuntime`, `SkillLocation`, and `SkillChannel` types.
+Channels and locations follow the emerging `.agents/skills/` + `.claude/skills/` convention — see the `SkillRuntime`, `SkillLocation`, and `SkillChannel` types. Antigravity is the exception for global skills: agy reads `~/.gemini/config/skills` (`resolveNativeSkillsHome("antigravity")`), not `~/.agents/skills`. It lists a linked skill there, but headless agy that doesn't skip permissions can't read one whose real folder is outside the chat's workspace, so headless chats elsewhere see the skill and can't use it. For those, put a real folder there instead of a link (these functions only link).
+
+To install into exactly the folders you choose, pass `folders`. It replaces `location` and `includeNativeDirs`, works the same for `removeSkills` and `listInstalledSkills` (keyed by folder), and reports each entry with the folder as its `target`. `replaceDeadLinks` replaces a link at a skill's name whose target is gone, which no runtime can read, instead of reporting a conflict. Live links and real folders are always left alone.
+
+```typescript
+import { installSkills, removeSkills, resolveNativeSkillsHome, resolveSkillsHome } from "@agentex/agent";
+
+const folders = [resolveSkillsHome("agents"), resolveSkillsHome("claude"), resolveNativeSkillsHome("antigravity")!];
+await installSkills(skillDirs, { folders, replaceDeadLinks: true });
+await removeSkills(skillDirs, { folders }); // only links to these skillDirs
+```
 
 ### Install Instruction Files
 
@@ -1364,7 +1375,7 @@ registerProvider(myProvider);
 - `prepareWorkspace({ strategy, baseBranch?, branchName?, targetDir? })` → `PreparedWorkspace` with `cwd`, `diff()`, `cleanup()`.
 
 ### Skills
-- `installSkills(skillDirs, opts?)` / `removeSkills(skillDirs, opts?)` / `listInstalledSkills(opts?)`
+- `installSkills(skillDirs, opts?)` / `removeSkills(skillDirs, opts?)` / `listInstalledSkills(opts?)` — standard channels by `location`, plus native folders with `includeNativeDirs`, or exactly the `folders` named. `installSkills` takes `replaceDeadLinks`.
 - `resolveSkillsHome(channel)` / `resolveSkillsWorkspace(channel, cwd)`
 - `resolveNativeSkillsHome(runtime)` / `resolveNativeSkillsWorkspace(runtime, cwd)`
 - `ensureSkillSymlink(...)`

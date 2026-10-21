@@ -1,7 +1,7 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createAntigravitySession } from "../../../src/providers/antigravity/session.js";
 import type { AgentSession, SessionContext, StreamEvent } from "../../../src/types.js";
 
@@ -356,6 +356,87 @@ describe("Antigravity session", () => {
     }
     expect(session.getGoal()).toMatchObject({ status: "met", enforced: true });
     expect(events.some((e) => e.type === "goal_status")).toBe(true);
+    await session.close();
+  });
+});
+
+describe("Antigravity session skills", () => {
+  const originalHome = process.env.HOME;
+  let home: string;
+
+  beforeEach(async () => {
+    // The legacy-link cleanup reads the home folder; keep it off the real one.
+    home = await tempDir();
+    process.env.HOME = home;
+  });
+
+  afterEach(() => {
+    process.env.HOME = originalHome;
+  });
+
+  async function skill(parent: string, name: string): Promise<string> {
+    const dir = path.join(parent, name);
+    await mkdir(dir, { recursive: true });
+    await writeFile(path.join(dir, "SKILL.md"), `---\nname: ${name}\ndescription: ${name} skill\n---\n`);
+    return dir;
+  }
+
+  const exists = (p: string) => access(p).then(() => true, () => false);
+
+  it("adds the same skills folder to every agy process and removes it on close", async () => {
+    const dir = await tempDir();
+    const alpha = await skill(await tempDir(), "alpha");
+    const argsFile = path.join(dir, "args.jsonl");
+    const skillsFile = path.join(dir, "skills.jsonl");
+    const { session } = await open(
+      { MOCK_AGY_BEHAVIOR: "crash", MOCK_DUMP_ARGS_TO: argsFile, MOCK_DUMP_SKILLS_TO: skillsFile },
+      { cwd: dir, config: { skillDirs: [alpha] } },
+    );
+    // Each crash ends the process; the next send starts another one.
+    await sendAndWait(session, "one");
+    await sendAndWait(session, "two");
+
+    const spawns = await readJsonLines<string[]>(argsFile);
+    expect(spawns).toHaveLength(2);
+    const skillsDir = spawns[0]![spawns[0]!.indexOf("--add-dir") + 1]!;
+    const expected = ["--add-dir", skillsDir, "--add-dir", await realpath(alpha)];
+    for (const args of spawns) expect(args.slice(-4)).toEqual(expected);
+    for (const folders of await readJsonLines<Array<{ dir: string; skills: unknown[] | null }>>(skillsFile)) {
+      expect(folders[0]).toEqual({ dir: skillsDir, skills: [{ name: "alpha", link: alpha, skill: expect.stringContaining("name: alpha") }] });
+    }
+
+    expect(await exists(skillsDir)).toBe(true);
+    await session.close();
+    expect(await exists(skillsDir)).toBe(false);
+    await session.close();
+    expect(await exists(path.join(home, ".gemini"))).toBe(false);
+  });
+
+  it("removes the skills folder when the session closes before any send", async () => {
+    const alpha = await skill(await tempDir(), "alpha");
+    const cwd = await tempDir();
+    const scratch = await tempDir();
+    const originalTmp = process.env.TMPDIR;
+    // os.tmpdir() follows TMPDIR, so the skills folder lands where only this test looks.
+    process.env.TMPDIR = scratch;
+    try {
+      const { session } = await open({}, { cwd, config: { skillDirs: [alpha] } });
+      expect(await readdir(scratch)).toEqual([expect.stringMatching(/^agentex-skills-/)]);
+      await session.close();
+      expect(await readdir(scratch)).toEqual([]);
+    } finally {
+      if (originalTmp === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = originalTmp;
+    }
+  });
+
+  it("removes the links older versions left in agy's legacy folder", async () => {
+    const alpha = await skill(await tempDir(), "alpha");
+    const legacy = path.join(home, ".gemini", "antigravity-cli", "skills");
+    await mkdir(legacy, { recursive: true });
+    await symlink(alpha, path.join(legacy, "alpha"), "dir");
+    const { session } = await open({}, { config: { skillDirs: [alpha] } });
+    expect(await readdir(legacy)).toEqual([]);
     await session.close();
   });
 });

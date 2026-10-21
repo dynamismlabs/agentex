@@ -23,8 +23,9 @@ const HOME_SUBPATH_MAP: Record<SkillRuntime, string[]> = {
   claude: [".claude"],
   codex: [".codex"],
   gemini: [".gemini"],
-  // Shared with Gemini CLI: agy reads its global GEMINI.md from ~/.gemini and
-  // keeps its own settings and skills in ~/.gemini/antigravity-cli.
+  // Shared with Gemini CLI: agy reads its global GEMINI.md from ~/.gemini,
+  // its settings from ~/.gemini/antigravity-cli, and its global skills from
+  // ~/.gemini/config/skills.
   antigravity: [".gemini"],
   cursor: [".cursor"],
   opencode: [".config", "opencode"],

@@ -1,3 +1,14 @@
+## 0.0.46 — Antigravity chats get their skills
+
+- **Antigravity `skillDirs` reach the agent.** agentex linked a run's or session's `skillDirs` into `~/.gemini/antigravity-cli/skills`. agy 1.4.3 never gives the agent skills from that folder (its `/skills` menu lists them and a typed `/<name>` expands, nothing more), so Antigravity chats had none of their skills. They now go in a temporary folder of links, `.agents/skills/<name>`, added with `--add-dir` to every agy process the run or session starts and removed when the run ends or the session closes. Nothing global changes, so a chat's skills no longer reach every agy session on the machine. Verified live against agy 1.4.3, including a resumed conversation given a new folder.
+- **Linked skills are readable without `skipPermissions`.** Headless agy refuses to read a file whose real path is outside its workspace, linked or not, so the agent would see a linked skill and be denied its `SKILL.md`. Each skill's own folder is added with `--add-dir` too, unless it is already under `cwd`. When agy skips permissions (outside plan mode) nothing is denied, so only the skills folder is added.
+- **Old links are cleaned up.** A run or session removes the links earlier versions left in `~/.gemini/antigravity-cli/skills` for its `skillDirs`, and any link there whose target is gone (left for a skill since renamed or deleted). Live links to anything else, and real folders, stay.
+- **Antigravity's global skills folder is `~/.gemini/config/skills`.** `resolveNativeSkillsHome("antigravity")` and `includeNativeDirs` used `~/.gemini/antigravity-cli/skills`. agy reads `.agents/skills` in a project, but not `~/.agents/skills`, as the `SkillChannel` docs claimed. A link installed there is listed but unreadable to headless agy that doesn't skip permissions, when its real folder is outside the chat's workspace; the README says so.
+- **`installSkills`, `removeSkills` and `listInstalledSkills` take `folders`**, to work in exactly the skills folders named instead of the ones `location` and `includeNativeDirs` pick. Entries report the folder as their `target`, and `listInstalledSkills` keys its result by folder. New `ListInstalledSkillsOptions` type.
+- **`installSkills` takes `replaceDeadLinks`.** A link at a skill's name whose target is gone is replaced instead of reported as a conflict. Live links and real folders are always left alone.
+- `installSkills` reports a folder it can't create as `error` entries for that folder and installs the rest, instead of throwing.
+- `buildSkillsDir` links a relative skill dir by its absolute path.
+
 ## 0.0.45
 
 - Add native session title reads and writes for Claude and Codex, plus native
