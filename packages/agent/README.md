@@ -1122,6 +1122,23 @@ AgentEx supports both skill installation and the higher-level slash-command UI f
 3. Reconcile that metadata with the provider runtime inventory when one exists.
 4. Invoke the selected skill using provider-appropriate semantics.
 
+### How `config.skillDirs` reaches each provider
+
+`skillDirs` are exact skill folders for one run or session. No provider puts them in a global skills folder, so they don't reach other sessions on the machine. Codex is the one that leaves them behind, in the chat's own folder.
+
+| Provider | How the chat gets them | Removed |
+| --- | --- | --- |
+| Claude | A temporary folder of links at `.claude/skills`, added with `--add-dir` | When the run ends or the session closes |
+| Antigravity | A temporary folder of links at `.agents/skills`, added with `--add-dir`. Each skill's real folder is added too unless agy skips permissions, because headless agy won't read a linked file outside its workspace | When the run ends or the session closes |
+| Cursor | A temporary plugin of copies (`.cursor-plugin/plugin.json` plus `skills/<name>`), passed with `--plugin-dir` and copied in fresh before every run | When the run ends or the session closes |
+| Pi | Each skill folder with its own `--skill <path>`. Nothing is written | Nothing to remove |
+| OpenCode | A temporary OpenCode config folder with the skills linked into `skills/` | When the run ends or the session closes |
+| Codex | Links in the chat's own `{cwd}/.agents/skills` | Not removed |
+
+Cursor gets copies because two things rule out links, checked against Cursor CLI 2026.10.19: a new `--add-dir` folder must be trusted, so a run without `--trust` or `--force` fails even in a trusted folder (and `--trust` would also trust the chat's folder), and `--plugin-dir` loads a skill only from a real folder with a real `SKILL.md`. A skill edited during a Cursor session is current from the next turn, and its path stays the same for the whole session. Plugin skills keep their own names: `/<name>` invokes one, with no plugin prefix.
+
+Antigravity, Cursor and Pi also remove the links agentex 0.0.46 and earlier left for these skills in `~/.gemini/antigravity-cli/skills`, `~/.cursor/skills` and `~/.pi/agent/skills`, and the dead links agentex could have left there for a skill since renamed or deleted: those at one of the chat's skill names, or pointing into a folder one of its skills comes from. Any other dead link in Cursor's or Pi's folder stays, since it can be someone's own skill that is gone only for a while, like one on an unmounted drive. Only agentex ever wrote to Antigravity's old folder, so every dead link there goes. Live links to anything else, and real folders, always stay. A host that installed one of the same skills into `~/.cursor/skills` or `~/.pi/agent/skills` itself (`installSkills` with `includeNativeDirs`) loses that link when a chat runs with it, so install global skills into `~/.agents/skills`, which Cursor and Pi also read.
+
 ### Install Or List Skills
 
 Install and remove reusable agent skills across multiple runtimes at once, into either the user's home or a workspace directory.

@@ -1,6 +1,6 @@
-import { describe, it, expect } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, it, expect } from "vitest";
 import * as path from "node:path";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { access, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { executeCursorProvider } from "../../../src/providers/cursor/execute.js";
 import type { ExecutionContext, StreamEvent } from "../../../src/types.js";
@@ -155,5 +155,133 @@ describe("executeCursorProvider", () => {
     expect(result.status).toBe("failed");
     expect(result.errorCode).toBe("protocol_degraded");
     expect(events).toEqual([]);
+  });
+});
+
+describe("executeCursorProvider skills", () => {
+  const originalHome = process.env.HOME;
+  const tempDirs: string[] = [];
+  let home: string;
+
+  const tempDir = async (): Promise<string> => {
+    const dir = await mkdtemp(path.join(tmpdir(), "agentex-cursor-skills-"));
+    tempDirs.push(dir);
+    return dir;
+  };
+
+  beforeEach(async () => {
+    // The legacy-link cleanup reads the home folder; keep it off the real one.
+    home = await tempDir();
+    process.env.HOME = home;
+  });
+
+  afterEach(() => {
+    process.env.HOME = originalHome;
+  });
+
+  afterAll(async () => {
+    await Promise.all(tempDirs.map((dir) => rm(dir, { recursive: true, force: true })));
+  });
+
+  async function skill(parent: string, name: string): Promise<string> {
+    const dir = path.join(parent, name);
+    await mkdir(dir, { recursive: true });
+    await writeFile(path.join(dir, "SKILL.md"), `---\nname: ${name}\ndescription: ${name} skill\n---\n`);
+    return dir;
+  }
+
+  const exists = (p: string) => access(p).then(() => true, () => false);
+  const lines = async <T,>(file: string): Promise<T[]> =>
+    (await readFile(file, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as T);
+
+  interface Plugin {
+    dir: string;
+    manifest: { name: string } | null;
+    skills: Array<{ name: string; realFolder: boolean; realSkillFile: boolean; skill: string | null }> | null;
+  }
+
+  it("stages real copies of the skills as a temporary plugin, removed after the run", async () => {
+    const parent = await tempDir();
+    const real = await skill(parent, "alpha");
+    // A linked skill folder, and a skill whose SKILL.md is itself a link:
+    // Cursor loads neither from a plugin, so both must arrive as real copies.
+    const linked = path.join(await tempDir(), "beta");
+    await symlink(await skill(parent, "beta-source"), linked, "dir");
+    const gamma = path.join(parent, "gamma");
+    await mkdir(gamma);
+    await symlink(path.join(await skill(parent, "gamma-source"), "SKILL.md"), path.join(gamma, "SKILL.md"));
+    const argsFile = path.join(parent, "args.jsonl");
+    const pluginsFile = path.join(parent, "plugins.jsonl");
+
+    const result = await executeCursorProvider(makeCtx({
+      cwd: parent,
+      config: { command: MOCK_CURSOR, skillDirs: [real, linked, gamma], extraArgs: ["--host-flag"] },
+      env: { MOCK_BEHAVIOR: "success", MOCK_DUMP_ARGS_TO: argsFile, MOCK_DUMP_PLUGIN_SKILLS_TO: pluginsFile },
+    }));
+    expect(result.status).toBe("completed");
+
+    const [args] = await lines<string[]>(argsFile);
+    const pluginDir = args![args!.indexOf("--plugin-dir") + 1]!;
+    expect(path.basename(pluginDir)).toMatch(/^agentex-skills-/);
+    expect(args!.slice(-3)).toEqual(["--plugin-dir", pluginDir, "--host-flag"]);
+    expect(args).not.toContain("--add-dir");
+
+    const [[plugin]] = await lines<Plugin[]>(pluginsFile);
+    expect(plugin!.manifest).toEqual({ name: "agentex-skills" });
+    expect(plugin!.skills!.map(({ name, realFolder, realSkillFile }) => ({ name, realFolder, realSkillFile }))).toEqual([
+      { name: "alpha", realFolder: true, realSkillFile: true },
+      { name: "beta", realFolder: true, realSkillFile: true },
+      { name: "gamma", realFolder: true, realSkillFile: true },
+    ]);
+    expect(plugin!.skills![1]!.skill).toContain("name: beta-source");
+
+    expect(await exists(pluginDir)).toBe(false);
+    // Nothing global, and nothing in the chat's folder.
+    expect(await exists(path.join(home, ".cursor"))).toBe(false);
+    expect(await exists(path.join(parent, ".cursor"))).toBe(false);
+  });
+
+  it("removes the plugin folder when the run fails", async () => {
+    const parent = await tempDir();
+    const argsFile = path.join(parent, "args.jsonl");
+    const result = await executeCursorProvider(makeCtx({
+      config: { command: MOCK_CURSOR, skillDirs: [await skill(parent, "alpha")] },
+      env: { MOCK_BEHAVIOR: "error", MOCK_DUMP_ARGS_TO: argsFile },
+    }));
+    expect(result.status).toBe("failed");
+    const [args] = await lines<string[]>(argsFile);
+    expect(await exists(args![args!.indexOf("--plugin-dir") + 1]!)).toBe(false);
+  });
+
+  it("removes the links older versions left in ~/.cursor/skills, and none of the user's", async () => {
+    const parent = await tempDir();
+    const alpha = await skill(parent, "alpha");
+    const other = await skill(parent, "other");
+    const legacy = path.join(home, ".cursor", "skills");
+    await mkdir(legacy, { recursive: true });
+    await symlink(alpha, path.join(legacy, "alpha"), "dir");
+    await symlink(other, path.join(legacy, "other"), "dir");
+    await symlink(path.join(parent, "renamed-away"), path.join(legacy, "renamed"), "dir");
+    // Someone's own skill on a drive that isn't mounted right now: not agentex's to remove.
+    await symlink(path.join(home, "Volumes", "external", "theirs"), path.join(legacy, "theirs"), "dir");
+    await skill(legacy, "mine");
+
+    await executeCursorProvider(makeCtx({
+      config: { command: MOCK_CURSOR, skillDirs: [alpha] },
+      env: { MOCK_BEHAVIOR: "success" },
+    }));
+
+    expect((await readdir(legacy)).sort()).toEqual(["mine", "other", "theirs"]);
+    expect((await lstat(path.join(legacy, "other"))).isSymbolicLink()).toBe(true);
+  });
+
+  it("passes no plugin without skills", async () => {
+    const argsFile = path.join(await tempDir(), "args.jsonl");
+    await executeCursorProvider(makeCtx({
+      config: { command: MOCK_CURSOR, skillDirs: [] },
+      env: { MOCK_BEHAVIOR: "success", MOCK_DUMP_ARGS_TO: argsFile },
+    }));
+    const [args] = await lines<string[]>(argsFile);
+    expect(args).not.toContain("--plugin-dir");
   });
 });

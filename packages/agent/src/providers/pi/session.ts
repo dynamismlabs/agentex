@@ -22,9 +22,9 @@ import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { uuidv7 } from "../../utils/uuid.js";
 import { resolveInstructions } from "../../utils/instructions.js";
-import { injectHomeSkills } from "../../utils/skills.js";
 import { parsePiStreamLine } from "./parse.js";
 import { piSessionCodec } from "./codec.js";
+import { preparePiSkills } from "./skills.js";
 
 const PI_SESSIONS_DIR = path.join(os.homedir(), ".pi", "sessions");
 
@@ -108,14 +108,7 @@ export class PiSession implements AgentSession {
     const cwd = this.ctx.cwd ?? process.cwd();
 
     if (config.instructionsFile) await resolveInstructions(config.instructionsFile);
-    let skillsDir: string | null = null;
-    if (config.skillDirs && config.skillDirs.length > 0) {
-      try {
-        skillsDir = await injectHomeSkills(config.skillDirs, "pi");
-      } catch {
-        /* non-fatal */
-      }
-    }
+    const skillArgs = await preparePiSkills(config.skillDirs);
     await fs.mkdir(PI_SESSIONS_DIR, { recursive: true });
 
     // Resume an existing session file, or start a new one. Pi keys sessions by
@@ -131,7 +124,7 @@ export class PiSession implements AgentSession {
     if (config.thinking) args.push("--thinking", config.thinking);
     args.push("--tools", "read,bash,edit,write,grep,find,ls");
     args.push("--session", this._sessionPath);
-    if (skillsDir) args.push("--skill", skillsDir);
+    args.push(...skillArgs);
     if (config.instructionsFile) args.push("--append-system-prompt", config.instructionsFile);
     if (config.extraArgs) args.push(...config.extraArgs);
 

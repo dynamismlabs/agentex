@@ -51,4 +51,25 @@ describe("createExecBackedSession", () => {
     await expect(first.result).resolves.toMatchObject({ status: "aborted" });
     release();
   });
+
+  it("runs onClose once, after an in-flight turn settles", async () => {
+    const order: string[] = [];
+    let release!: () => void;
+    const execute = vi.fn(async () => {
+      await new Promise<void>((resolve) => { release = resolve; });
+      order.push("turn");
+      return result("cursor-1");
+    });
+    const onClose = vi.fn(async () => { order.push("close"); });
+    const session = createExecBackedSession({
+      providerType: "cursor", execute, sessionCodec: cursorSessionCodec, ctx: { cwd: "/tmp" }, onClose,
+    });
+    await session.send("first");
+    const closing = session.close();
+    release();
+    await closing;
+    await session.close();
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(order).toEqual(["turn", "close"]);
+  });
 });

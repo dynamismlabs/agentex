@@ -26,6 +26,8 @@ export interface ExecBackedSessionOptions {
   sessionCodec: SessionCodec;
   ctx: SessionContext;
   capabilities?: Pick<ProviderCapabilities, "goals">;
+  /** Runs once, after close() has let an in-flight turn settle: release what the session holds. */
+  onClose?: () => Promise<void>;
 }
 
 function turnResult(result: ExecutionResult): TurnResult {
@@ -49,6 +51,7 @@ class ExecBackedSession implements AgentSession {
   private active: AbortController | null = null;
   private inFlight: Promise<TurnResult> | null = null;
   private draining = false;
+  private closing: Promise<void> | null = null;
   private readonly goals: GoalController;
 
   constructor(private readonly options: ExecBackedSessionOptions) {
@@ -165,5 +168,7 @@ class ExecBackedSession implements AgentSession {
     this._state = "closed";
     this.active?.abort();
     if (this.inFlight) await this.inFlight.catch(() => undefined);
+    this.closing ??= (this.options.onClose?.() ?? Promise.resolve()).catch(() => undefined);
+    await this.closing;
   }
 }

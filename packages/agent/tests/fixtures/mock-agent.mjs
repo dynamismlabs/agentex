@@ -4,6 +4,9 @@
 // Format controlled by MOCK_FORMAT env var: "claude" (default), "codex", "gemini", "cursor", "opencode", "pi"
 // When MOCK_DUMP_STDIN_TO is set, received stdin is written to that path before
 // emitting — lets tests assert on the prompt.
+// MOCK_DUMP_PLUGIN_SKILLS_TO: append, per spawn, what each --plugin-dir holds
+// (JSON): its manifest, and whether each skills/<name> is a real folder with a
+// real SKILL.md, which is all Cursor loads a plugin skill from.
 
 import * as fs from "node:fs";
 
@@ -17,6 +20,29 @@ if (dumpArgsTo) {
 }
 
 const cliArgs = process.argv.slice(2);
+if (process.env.MOCK_DUMP_PLUGIN_SKILLS_TO) {
+  const plugins = cliArgs.flatMap((arg, i) => (arg === "--plugin-dir" && cliArgs[i + 1] ? [cliArgs[i + 1]] : [])).map((dir) => {
+    let manifest = null;
+    try { manifest = JSON.parse(fs.readFileSync(`${dir}/.cursor-plugin/plugin.json`, "utf8")); } catch { /* none */ }
+    const root = `${dir}/skills`;
+    const skills = fs.existsSync(root)
+      ? fs.readdirSync(root).sort().map((name) => {
+          const entry = `${root}/${name}`;
+          const file = `${entry}/SKILL.md`;
+          let skill = null;
+          try { skill = fs.readFileSync(file, "utf8"); } catch { /* unreadable */ }
+          return {
+            name,
+            realFolder: !fs.lstatSync(entry).isSymbolicLink() && fs.statSync(entry).isDirectory(),
+            realSkillFile: fs.existsSync(file) && !fs.lstatSync(file).isSymbolicLink(),
+            skill,
+          };
+        })
+      : null;
+    return { dir, manifest, skills };
+  });
+  fs.appendFileSync(process.env.MOCK_DUMP_PLUGIN_SKILLS_TO, `${JSON.stringify(plugins)}\n`);
+}
 if (format === "cursor" && ["supported", "models_only", "no_stream_json"].includes(process.env.MOCK_CURSOR_PROFILE)) {
   if (cliArgs.includes("--version")) {
     console.log("cursor-agent 2.0.0");

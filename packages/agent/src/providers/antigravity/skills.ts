@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ProviderConfig } from "../../types.js";
-import { buildSkillsDir, cleanupSkillsDir, removeSkills } from "../../utils/skills.js";
+import { buildSkillsDir, cleanupSkillsDir, removeLegacySkillLinks } from "../../utils/skills.js";
 import { agySkipsPermissions } from "./runtime.js";
 
 /** A chat's `skillDirs`, staged for agy. */
@@ -43,7 +43,8 @@ export async function prepareAgySkills(
   config: ProviderConfig,
 ): Promise<AgySkills | null> {
   if (!skillDirs || skillDirs.length === 0) return null;
-  await removeLegacyAgySkillLinks(skillDirs);
+  // Only agentex ever wrote to agy's legacy folder, so every dead link there goes.
+  await removeLegacySkillLinks(legacyAgySkillsHome(), skillDirs, { anyDeadLink: true });
 
   const dir = await buildSkillsDir(skillDirs, "antigravity");
   const args = ["--add-dir", dir];
@@ -66,29 +67,6 @@ export async function prepareAgySkills(
 
 export async function cleanupAgySkills(skills: AgySkills | null): Promise<void> {
   if (skills) await cleanupSkillsDir(skills.dir);
-}
-
-/**
- * Remove links to these skills, and links that lead nowhere (left for a skill
- * since renamed or deleted). Live links to anything else, and real folders,
- * stay.
- */
-async function removeLegacyAgySkillLinks(skillDirs: string[]): Promise<void> {
-  const folder = legacyAgySkillsHome();
-  try {
-    await removeSkills(skillDirs, { folders: [folder] });
-    for (const name of await fs.readdir(folder)) {
-      const entry = path.join(folder, name);
-      try {
-        if ((await fs.lstat(entry)).isSymbolicLink()) await fs.stat(entry);
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code === "ENOENT") await fs.unlink(entry).catch(() => undefined);
-      }
-    }
-  } catch {
-    // Best effort: a link left behind does no more than before. A missing
-    // folder lands here too.
-  }
 }
 
 async function realpathOrResolve(dir: string): Promise<string> {

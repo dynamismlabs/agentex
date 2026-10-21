@@ -1,8 +1,10 @@
-import { describe, it, expect } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, it, expect } from "vitest";
 import { EventEmitter } from "node:events";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { PiSession } from "../../../src/providers/pi/session.js";
+import { createPiSession, PiSession } from "../../../src/providers/pi/session.js";
 import { getProvider } from "../../../src/index.js";
 import type { SessionContext, StreamEvent } from "../../../src/types.js";
 
@@ -167,4 +169,58 @@ describe("pi provider — capabilities", () => {
     },
     90_000,
   );
+});
+
+describe("PiSession skills", () => {
+  const MOCK_PI = path.resolve(__dirname, "../../fixtures/mock-pi.sh");
+  const originalHome = process.env.HOME;
+  const tempDirs: string[] = [];
+  let home: string;
+
+  const tempDir = async (): Promise<string> => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agentex-pi-session-skills-"));
+    tempDirs.push(dir);
+    return dir;
+  };
+
+  beforeEach(async () => {
+    home = await tempDir();
+    process.env.HOME = home;
+  });
+
+  afterEach(() => {
+    process.env.HOME = originalHome;
+  });
+
+  afterAll(async () => {
+    await Promise.all(tempDirs.map((dir) => fs.rm(dir, { recursive: true, force: true })));
+  });
+
+  it("starts pi with each skill folder as its own --skill and clears legacy links", async () => {
+    const parent = await tempDir();
+    const alpha = path.join(parent, "alpha");
+    await fs.mkdir(alpha);
+    await fs.writeFile(path.join(alpha, "SKILL.md"), "---\nname: alpha\ndescription: alpha skill\n---\n");
+    const legacy = path.join(home, ".pi", "agent", "skills");
+    await fs.mkdir(legacy, { recursive: true });
+    await fs.symlink(alpha, path.join(legacy, "alpha"), "dir");
+    const argsFile = path.join(parent, "args.jsonl");
+
+    const session = await createPiSession({
+      cwd: parent,
+      env: { MOCK_DUMP_ARGS_TO: argsFile },
+      config: { command: MOCK_PI, skillDirs: [alpha] },
+    });
+    let args: string[] | null = null;
+    for (let i = 0; i < 100 && !args; i++) {
+      const text = await fs.readFile(argsFile, "utf8").catch(() => "");
+      if (text.trim()) args = JSON.parse(text.trim().split("\n")[0]!) as string[];
+      else await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    await session.close();
+
+    expect(args).not.toBeNull();
+    expect(args!.flatMap((arg, i) => (args![i - 1] === "--skill" ? [arg] : []))).toEqual([alpha]);
+    expect(await fs.readdir(legacy)).toEqual([]);
+  });
 });

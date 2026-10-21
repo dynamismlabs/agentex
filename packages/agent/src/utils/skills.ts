@@ -489,37 +489,6 @@ export async function ensureSkillSymlink(
 // ---------------------------------------------------------------------------
 
 /**
- * Place skills into a home-directory-based skills folder via idempotent symlinks.
- * Used internally by provider execute functions for native runtime injection.
- *
- * Returns the skills home path, or null if no skills were provided.
- */
-export async function injectHomeSkills(
-  skillDirs: string[],
-  runtime: SkillRuntime,
-): Promise<string | null> {
-  if (skillDirs.length === 0) return null;
-
-  const entry = NATIVE_DIRS[runtime];
-  const skillsHome = entry?.global ?? null;
-  if (!skillsHome) return null;
-
-  await fs.mkdir(skillsHome, { recursive: true });
-
-  for (const dir of skillDirs) {
-    const name = path.basename(dir);
-    const target = path.join(skillsHome, name);
-    try {
-      await ensureSkillSymlink(dir, target);
-    } catch (err) {
-      console.warn(`Failed to inject skill "${name}" into ${skillsHome}: ${err}`);
-    }
-  }
-
-  return skillsHome;
-}
-
-/**
  * Place skills into {cwd}/.agents/skills/ via idempotent symlinks.
  * Used internally by codex provider.
  *
@@ -578,6 +547,52 @@ export async function buildSkillsDir(skillDirs: string[], runtime: SkillRuntime)
   }
 
   return tmpDir;
+}
+
+/**
+ * Clear what agentex 0.0.46 and earlier left in a runtime's global skills
+ * folder, where providers linked a chat's `skillDirs` and never removed them:
+ * links to these skills, and links that lead nowhere that agentex could have
+ * made for this chat's skills (left for a skill since renamed or deleted).
+ * Those are dead links at one of these skills' names, or pointing into a
+ * folder one of them comes from. A user's own folder can hold a link that is
+ * dead only for a while (an unmounted drive, a repo not checked out yet), so
+ * any other dead link stays, unless `anyDeadLink` says only agentex ever
+ * wrote to the folder. Live links to anything else, and real folders, always
+ * stay. Best effort: a link left behind does no more than before.
+ */
+export async function removeLegacySkillLinks(
+  folder: string,
+  skillDirs: string[],
+  options: { anyDeadLink?: boolean } = {},
+): Promise<void> {
+  try {
+    await removeSkills(skillDirs, { folders: [folder] });
+    const names = new Set(skillDirs.map((dir) => path.basename(path.resolve(dir))));
+    const sources = new Set<string>();
+    for (const dir of skillDirs) {
+      sources.add(path.dirname(path.resolve(dir)));
+      sources.add(path.dirname(await fs.realpath(dir).catch(() => path.resolve(dir))));
+    }
+    const ours = async (name: string, target: string): Promise<boolean> => {
+      if (options.anyDeadLink || names.has(name)) return true;
+      const parent = path.dirname(target);
+      return sources.has(parent) || sources.has(await fs.realpath(parent).catch(() => parent));
+    };
+    for (const name of await fs.readdir(folder)) {
+      const entry = path.join(folder, name);
+      try {
+        if (!(await fs.lstat(entry)).isSymbolicLink()) continue;
+        if (await fs.stat(entry).then(() => true, (err: NodeJS.ErrnoException) => err.code !== "ENOENT")) continue;
+        const target = path.resolve(folder, await fs.readlink(entry));
+        if (await ours(name, target)) await fs.unlink(entry);
+      } catch {
+        // Leave anything that can't be read or removed.
+      }
+    }
+  } catch {
+    // A missing folder lands here too.
+  }
 }
 
 export async function cleanupSkillsDir(tmpDir: string): Promise<void> {

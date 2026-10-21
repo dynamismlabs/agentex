@@ -10,11 +10,11 @@ import {
   resolveNativeSkillsHome,
   resolveNativeSkillsWorkspace,
   ensureSkillSymlink,
-  injectHomeSkills,
   injectWorkspaceSkills,
   installSkills,
   removeSkills,
   listInstalledSkills,
+  removeLegacySkillLinks,
 } from "../../src/utils/skills.js";
 
 // ---------------------------------------------------------------------------
@@ -262,25 +262,8 @@ describe("ensureSkillSymlink", () => {
 });
 
 // ---------------------------------------------------------------------------
-// injectHomeSkills / injectWorkspaceSkills (internal, used by providers)
+// injectWorkspaceSkills (internal, used by the Codex provider)
 // ---------------------------------------------------------------------------
-
-describe("injectHomeSkills", () => {
-  it("returns null for empty skillDirs", async () => {
-    const result = await injectHomeSkills([], "gemini");
-    expect(result).toBeNull();
-  });
-
-  it("returns null for runtimes without native dirs (claude)", async () => {
-    const result = await injectHomeSkills(["/some/skill/dir"], "claude");
-    expect(result).toBeNull();
-  });
-
-  it("returns null for runtimes without native dirs (codex)", async () => {
-    const result = await injectHomeSkills(["/some/skill/dir"], "codex");
-    expect(result).toBeNull();
-  });
-});
 
 describe("injectWorkspaceSkills", () => {
   const tmpDirs: string[] = [];
@@ -884,5 +867,60 @@ describe("install → list → remove round-trip", () => {
     const after = await listInstalledSkills(opts);
     expect(after[a]).toEqual([]);
     expect(after[b]!.map((s) => s.name)).toEqual(["folder-other"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// removeLegacySkillLinks (internal, used by the Antigravity, Cursor and Pi providers)
+// ---------------------------------------------------------------------------
+
+describe("removeLegacySkillLinks", () => {
+  const tmpDirs: string[] = [];
+
+  afterEach(async () => {
+    for (const dir of tmpDirs) {
+      try { await fs.rm(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+    tmpDirs.length = 0;
+  });
+
+  async function setup() {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "legacy-links-"));
+    tmpDirs.push(root);
+    const sources = path.join(root, "host", "skills");
+    const alpha = path.join(sources, "alpha");
+    const other = path.join(root, "elsewhere", "other");
+    for (const dir of [alpha, other]) {
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(path.join(dir, "SKILL.md"), "# skill");
+    }
+    const folder = path.join(root, "global");
+    await fs.mkdir(path.join(folder, "mine"), { recursive: true });
+    await fs.symlink(alpha, path.join(folder, "alpha"), "dir");
+    await fs.symlink(other, path.join(folder, "other"), "dir");
+    // Left for a host skill since renamed: dead, and pointing where the host keeps its skills.
+    await fs.symlink(path.join(sources, "old-name"), path.join(folder, "old-name"), "dir");
+    // Dead at a name this chat uses, pointing anywhere.
+    await fs.symlink(path.join(root, "gone", "beta"), path.join(folder, "beta"), "dir");
+    // Someone's own skill on a drive that isn't mounted right now.
+    await fs.symlink(path.join(root, "Volumes", "external", "theirs"), path.join(folder, "theirs"), "dir");
+    const beta = path.join(sources, "beta");
+    return { folder, skillDirs: [alpha, beta] };
+  }
+
+  it("removes this chat's links and dead links agentex could have made, and leaves other dead links", async () => {
+    const { folder, skillDirs } = await setup();
+    await removeLegacySkillLinks(folder, skillDirs);
+    expect((await fs.readdir(folder)).sort()).toEqual(["mine", "other", "theirs"]);
+  });
+
+  it("removes every dead link with anyDeadLink, for a folder only agentex wrote", async () => {
+    const { folder, skillDirs } = await setup();
+    await removeLegacySkillLinks(folder, skillDirs, { anyDeadLink: true });
+    expect((await fs.readdir(folder)).sort()).toEqual(["mine", "other"]);
+  });
+
+  it("does nothing when the folder doesn't exist", async () => {
+    await expect(removeLegacySkillLinks("/nonexistent/legacy/skills", ["/x/alpha"])).resolves.toBeUndefined();
   });
 });

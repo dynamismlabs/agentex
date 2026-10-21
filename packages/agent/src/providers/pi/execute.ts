@@ -6,12 +6,12 @@ import type { ExecutionContext, ExecutionResult } from "../../types.js";
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { runChildProcess, deriveErrorCode } from "../../utils/process.js";
-import { injectHomeSkills } from "../../utils/skills.js";
 import { resolveInstructions } from "../../utils/instructions.js";
 import { prepareWorkspace } from "../../utils/workspace.js";
 import type { PreparedWorkspace } from "../../utils/workspace.js";
 import { uuidv7 } from "../../utils/uuid.js";
 import { parsePiJsonl, parsePiStreamLine, isPiUnknownSessionError } from "./parse.js";
+import { preparePiSkills } from "./skills.js";
 
 const PI_SESSIONS_DIR = path.join(os.homedir(), ".pi", "sessions");
 
@@ -90,16 +90,9 @@ async function executePiProviderInner(ctx: ExecutionContext): Promise<ExecutionR
   ctx.onLifecycle?.({ phase: "preparing", step: "instructions" });
   if (config.instructionsFile) await resolveInstructions(config.instructionsFile);
 
-  // 4. Inject skills into ~/.pi/agent/skills/
+  // 4. Skills: each skill folder is passed with its own --skill
   ctx.onLifecycle?.({ phase: "preparing", step: "skills" });
-  let piSkillsDir: string | null = null;
-  if (config.skillDirs && config.skillDirs.length > 0) {
-    try {
-      piSkillsDir = await injectHomeSkills(config.skillDirs, "pi");
-    } catch {
-      // Non-fatal
-    }
-  }
+  const skillArgs = await preparePiSkills(config.skillDirs);
 
   // 4. Ensure sessions directory exists
   await fs.mkdir(PI_SESSIONS_DIR, { recursive: true });
@@ -142,7 +135,7 @@ async function executePiProviderInner(ctx: ExecutionContext): Promise<ExecutionR
     if (config.thinking) args.push("--thinking", config.thinking);
     args.push("--tools", "read,bash,edit,write,grep,find,ls");
     args.push("--session", sessionFile);
-    if (piSkillsDir) args.push("--skill", piSkillsDir);
+    args.push(...skillArgs);
     if (config.instructionsFile) args.push("--append-system-prompt", config.instructionsFile);
     if (config.extraArgs) args.push(...config.extraArgs);
     return args;
