@@ -22,6 +22,7 @@ describe("telemetry-only runtime capability diagnostics", () => {
     expect(a).toEqual(b); expect(a).not.toBe(b); expect(a.binary.status).toBe("supported");
     expect(a.capabilities.contextUsage?.supported).toBe(true); expect(a.capabilities.rateLimits?.supported).toBe(true);
     expect(a.capabilities.sessions).toBeUndefined(); expect(a.binary.version).toBe(protocol === "claude" ? "2.1.295" : "0.160.0");
+    expect(a.capabilities.serviceTiers?.supported).toBe(protocol === "claude");
     expect((await f.logs()).filter((x) => x.event === "start" && x.mode === "control")).toHaveLength(1);
     await f.probe(f.ctx); expect((await f.logs()).filter((x) => x.event === "start" && x.mode === "control")).toHaveLength(2); await f.closed();
   });

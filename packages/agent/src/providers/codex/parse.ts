@@ -678,8 +678,23 @@ export function parseCodexStreamLines(
 /** @internal Normalize an already-decoded native payload without reparsing JSON. */
 export function parseCodexStreamEvent(event: Record<string, unknown>, sessionId: string | null = null): StreamEvent[] {
   const parsed = parseCodexStreamLineRaw(event, sessionId);
-  if (parsed === null) return [];
-  return Array.isArray(parsed) ? parsed : [parsed];
+  const events = parsed === null ? [] : Array.isArray(parsed) ? parsed : [parsed];
+  if (event["method"] === "thread/settings/updated") {
+    const params = parseObject(event["params"]);
+    const settings = parseObject(params["threadSettings"]);
+    if (Object.hasOwn(settings, "serviceTier")) {
+      const selected = typeof settings["serviceTier"] === "string" ? settings["serviceTier"] : "default";
+      events.push({ type: "service_tier", update: { selected: selected === "fast" ? "priority" : selected },
+        ...baseFields(event, asNullableString(params["threadId"]), null, null) });
+    }
+  }
+  // Only an actual Responses response proves processing tier. Thread settings
+  // are reported separately by the session handshake as selected, not effective.
+  if (event["type"] === "response.completed") {
+    const tier = parseObject(event["response"])["service_tier"];
+    if (typeof tier === "string" && tier) events.push({ type: "service_tier", update: { effective: tier === "fast" ? "priority" : tier, reason: null }, ...baseFields(event, sessionId, null, null) });
+  }
+  return events;
 }
 
 /**

@@ -73,6 +73,7 @@ describe("gatewayConfigSchema", () => {
           provider: "codex",
           cwd: "/home/user/project",
           model: "gpt-4",
+          serviceTier: "ultrafast",
           maxTurns: 5,
           timeoutSec: 120,
           skipPermissions: true,
@@ -96,7 +97,7 @@ describe("gatewayConfigSchema", () => {
           telegram: { token: "abc", chatId: 123 },
         },
         agents: {
-          coder: { provider: "claude", cwd: "/code" },
+          coder: { provider: "claude", cwd: "/code", model: "opus", serviceTier: "fast" },
         },
         routing: {
           rules: [
@@ -115,6 +116,8 @@ describe("gatewayConfigSchema", () => {
       expect(cfg.gateway.port).toBe(9999);
       expect(cfg.gateway.auth.mode).toBe("none");
       expect(cfg.agent.model).toBe("gpt-4");
+      expect(cfg.agent.serviceTier).toBe("ultrafast");
+      expect(cfg.agents?.coder?.serviceTier).toBe("fast");
       expect(cfg.sessions.dmScope).toBe("per-peer");
       expect(cfg.queue.mode).toBe("collect");
       expect(cfg.queue.collectDebounceMs).toBe(500);
@@ -172,6 +175,10 @@ describe("gatewayConfigSchema", () => {
   // -----------------------------------------------------------------------
 
   describe("invalid configurations", () => {
+    it.each(["", "Fast", "fast\n", true])("rejects malformed serviceTier %j", (serviceTier) => {
+      expect(() => validateConfig({ agent: { ...minimalRaw().agent, serviceTier } })).toThrow(ZodError);
+    });
+
     it("rejects missing agent", () => {
       expect(() => validateConfig({})).toThrow(ZodError);
     });

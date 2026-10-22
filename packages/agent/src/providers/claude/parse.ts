@@ -395,6 +395,18 @@ export function parseStreamLine(line: string, partial?: PartialStreamContext): S
 export function parseClaudeStreamEvent(event: Record<string, unknown>, partial?: PartialStreamContext): StreamEvent[] {
   const parsed = parseStreamLineContent(event, partial);
   const base = baseFieldsFromEvent(event, null);
+  // usage.speed describes actual processing; fastMode settings do not.
+  const message = parseObject(event["message"]);
+  const stream = parseObject(event["event"]);
+  const nativeUsage = parseObject(event["type"] === "stream_event"
+    ? (stream["usage"] ?? parseObject(stream["message"])["usage"])
+    : event["type"] === "assistant" ? message["usage"] : event["type"] === "result" ? event["usage"] : undefined);
+  const speed = nativeUsage["speed"];
+  if (speed === "fast" || speed === "standard") parsed.push({ type: "service_tier", update: { effective: speed === "standard" ? "default" : "fast", reason: null }, ...base });
+  if (event["type"] === "system" && event["subtype"] === "notification") {
+    const notice = typeof event["message"] === "string" ? event["message"] : typeof event["text"] === "string" ? event["text"] : null;
+    if (notice && /fast mode/i.test(notice)) parsed.push({ type: "service_tier", update: { effective: null, reason: notice }, ...base });
+  }
   const usage = claudeContextUsage(event["context_usage"], base.timestamp);
   if (usage) parsed.push({ type: "context_usage", usage, ...base });
   const update = event["type"] === "rate_limit_event"

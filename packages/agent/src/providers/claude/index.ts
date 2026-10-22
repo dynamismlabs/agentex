@@ -47,6 +47,7 @@ export const claudeProvider: ProviderModule = {
     localHistory: true,
     resume: true,
     modelVariants: false,
+    serviceTiers: true,
     permissionRequests: true,
     questionRequests: true,
     strictMcpIsolation: true,

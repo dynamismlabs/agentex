@@ -34,6 +34,7 @@ function buildProviderConfig(opts: DispatchOptions): ProviderConfig {
   const { agentConfig } = opts;
   const config: ProviderConfig = {};
 
+  if (agentConfig.serviceTier != null) config.serviceTier = agentConfig.serviceTier;
   if (agentConfig.maxTurns != null) config.maxTurns = agentConfig.maxTurns;
   if (agentConfig.timeoutSec != null) config.timeoutSec = agentConfig.timeoutSec;
   if (agentConfig.skipPermissions != null) config.skipPermissions = agentConfig.skipPermissions;

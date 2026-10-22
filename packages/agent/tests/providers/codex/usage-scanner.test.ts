@@ -113,6 +113,14 @@ describe("scanCodexSessionUsage", () => {
     expect(result!["gpt-4o"]!.outputTokens).toBe(25);
   });
 
+  it("uses the child's explicit CODEX_HOME instead of the host environment", async () => {
+    const now = new Date();
+    await writeLogFile(now, "custom-home.jsonl", [JSON.stringify({ type: "token_count", timestamp: now.toISOString(), model: "gpt-test", InputTokens: 10, OutputTokens: 2 })]);
+    process.env["CODEX_HOME"] = path.join(tmpDir, "different-home");
+    expect(await scanCodexSessionUsage({ startedAfter: new Date(now.getTime() - 1000), codexHome: tmpDir }))
+      .toEqual({ "gpt-test": { inputTokens: 10, outputTokens: 2 } });
+  });
+
   it("filters by threadId correctly", async () => {
     const now = new Date();
 

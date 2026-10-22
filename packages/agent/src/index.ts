@@ -142,6 +142,8 @@ export {
 } from "./utils/skill-commands.js";
 
 // Types
+export { ServiceTierConfigurationError } from "./types.js";
+
 export type {
   ProviderModule,
   ProviderCapabilities,
@@ -155,6 +157,8 @@ export type {
   ExecutionResult,
   ExecutionStatus,
   ProviderConfig,
+  ProviderServiceTier,
+  ServiceTierState,
   ProviderEndpointConfig,
   McpServerConfig,
   StreamEvent,

@@ -46,6 +46,7 @@
     "smoke": "tsx scripts/smoke.ts",
     "smoke:mock": "tsx scripts/smoke.ts --mock",
     "smoke:concurrent": "tsx scripts/concurrent-smoke.ts",
+    "smoke:service-tiers": "tsx scripts/smoke-service-tiers.ts",
     "demo:durable": "tsx scripts/durable-session-demo.ts",
     "diagnose:history": "tsx scripts/local-history-diagnostic.ts",
     "list-models": "tsx scripts/list-models.ts"

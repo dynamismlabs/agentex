@@ -57,6 +57,8 @@ export interface AgentConfig {
   provider: string;
   cwd: string;
   model?: string;
+  /** Native inference speed; omit to inherit, "default" for Standard. */
+  serviceTier?: string;
   maxTurns?: number;
   timeoutSec?: number;
   skipPermissions?: boolean;

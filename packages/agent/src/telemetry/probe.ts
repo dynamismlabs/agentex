@@ -40,6 +40,8 @@ async function probeRuntime(runtime: TelemetryRuntime, signal: AbortSignal): Pro
     (parts[0]! > major || (parts[0] === major && (parts[1]! > minor || (parts[1] === minor && parts[2]! >= patch))));
 
   const titleControls = runtime.provider === "claude" ? atLeast(2, 1, 295) : atLeast(0, 160, 0);
+  const serviceTiers = runtime.provider === "claude" ? atLeast(2, 1, 205) : atLeast(0, 163, 0);
+  report.capabilities.serviceTiers = capability(serviceTiers, serviceTiers ? "Transport supported; model and account availability must be checked separately" : "Service tiers require Codex 0.163.0+ or Claude Code 2.1.205+");
   report.capabilities.sessionTitleRead = capability(runtime.provider === "claude" || titleControls);
   report.capabilities.sessionTitleWrite = capability(titleControls, titleControls ? undefined : "Native title controls were not verified for this runtime version");
   report.capabilities.nativeTitleGeneration = capability(runtime.provider === "claude" && titleControls,

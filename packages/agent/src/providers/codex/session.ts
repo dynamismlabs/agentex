@@ -1,10 +1,15 @@
 import { normalizeTitle, throwIfTitleAborted, type NativeTitleOptions } from "../../titles.js";
 import { readLatestCodexTelemetry } from "../../telemetry/codex-durable.js";
+import { assertCodexModelTier, codexServiceTierArgs, codexTierId, validateCodexServiceTier } from "./service-tier.js";
+import { ServiceTierObserver, serviceTierEvent, ServiceTierConfigurationError } from "../../utils/service-tier.js";
 import { TelemetryStore } from "../../telemetry/store.js";
 import { codexRateLimits } from "./transcript-normalize.js";
 import type { ChildProcess } from "node:child_process";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { realpath } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import { homedir } from "node:os";
 import type {
   BackgroundTaskReport,
   AgentSession,
@@ -22,6 +27,7 @@ import type {
   SetGoalResult,
   StreamEvent,
   TurnResult,
+  TokenUsage,
   UserInputResponse,
 } from "../../types.js";
 import { GoalController, normalizeCodexGoalRecord, isTerminalGoalStatus } from "../../goals/index.js";
@@ -32,7 +38,7 @@ import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { translateEndpoint } from "../../utils/endpoint.js";
 import { resolveInstructions } from "../../utils/instructions.js";
 import { createToolNameTracker } from "../../utils/tool-names.js";
-import { parseCodexStreamLines, parseCodexStreamEvent, codexBackgroundTaskReport, codexMcpToolName } from "./parse.js";
+import { parseCodexStreamLines, parseCodexStreamEvent, codexBackgroundTaskReport, codexMcpToolName, isCodexUnknownSessionError } from "./parse.js";
 import { withPlanModePreamble } from "./plan-mode.js";
 import { scanCodexSessionUsage } from "./usage-scanner.js";
 import { codexSessionCodec } from "./codec.js";
@@ -226,6 +232,7 @@ const BACKGROUND_TASK_READ_TIMEOUT_MS = 5_000;
  * accumulators reset immediately and belong to the next turn from that moment.
  */
 interface TurnOutcome {
+  serviceTier?: import("../../types.js").ServiceTierState;
   summary: string | null;
   isError: boolean;
   errorMessage: string | null;
@@ -382,6 +389,8 @@ export async function startCodexSession(
   ctx: SessionContext,
   options: CodexSessionStartOptions = {},
 ): Promise<CodexSessionImpl> {
+  ctx.signal?.throwIfAborted();
+  options.startupSignal?.throwIfAborted();
   const config = ctx.config ?? {};
   const permissions: CodexThreadPermissions = {
     ...codexThreadPermissions(config),
@@ -389,7 +398,7 @@ export async function startCodexSession(
     ...(options.sandbox ? { sandbox: options.sandbox } : {}),
   };
   const hasMcpConfig = config.mcpServers !== undefined || config.strictMcpConfig === true;
-  const restoredCwd = hasMcpConfig ? codexSessionCodec.deserialize(ctx.sessionParams)?.["cwd"] : undefined;
+  const restoredCwd = hasMcpConfig || config.serviceTier !== undefined ? codexSessionCodec.deserialize(ctx.sessionParams)?.["cwd"] : undefined;
   const cwd = ctx.cwd ?? (typeof restoredCwd === "string" ? restoredCwd : process.cwd());
 
   // Resolve binary
@@ -405,14 +414,10 @@ export async function startCodexSession(
   Object.assign(env, endpointTx.env);
   for (const key of endpointTx.unset) delete env[key];
   const extra = splitCodexExtraArgs(config.extraArgs);
+  extra.configArgs.push(...codexServiceTierArgs(config, extra.configArgs));
   const mcp = await prepareCodexMcp(config, resolved, [...endpointTx.args, ...extra.configArgs], cwd, env);
   Object.assign(env, mcp.env);
-
-  // Skills: a temporary root this app-server process takes in the handshake.
-  let skills: CodexSkills | null = null;
-  try {
-    skills = await prepareCodexSkills(config.skillDirs, cwd);
-  } catch { /* non-fatal */ }
+  await validateCodexServiceTier(config, resolved, [...endpointTx.args, ...extra.configArgs], cwd, env, ctx.signal);
 
   // Resolve instructions. In plan mode, prepend a preamble so the agent
   // investigates-and-proposes rather than attempting writes that the sandbox
@@ -440,11 +445,26 @@ export async function startCodexSession(
   args.push("app-server");
   args.push(...extra.runtimeArgs);
 
+  // Stage only after other preparation succeeds; cancellation before spawn
+  // still owns cleanup even though no session exists yet.
+  let skills: CodexSkills | null = null;
+  try {
+    skills = await prepareCodexSkills(config.skillDirs, cwd);
+  } catch { /* non-fatal */ }
+  try {
+    ctx.signal?.throwIfAborted();
+    options.startupSignal?.throwIfAborted();
+  } catch (error) {
+    await cleanupCodexSkills(skills);
+    throw error;
+  }
+  ctx.onLifecycle?.({ phase: "spawning" });
   const proc = spawn(resolved.bin, args, {
     cwd,
     env,
     stdio: ["pipe", "pipe", "pipe"],
   });
+  if (proc.pid !== undefined) ctx.onLifecycle?.({ phase: "running", pid: proc.pid });
 
   if (!proc.stdin || !proc.stdout || !proc.stderr) {
     await cleanupCodexSkills(skills);
@@ -452,6 +472,14 @@ export async function startCodexSession(
   }
 
   const session = new CodexSessionImpl(proc, ctx, cwd, config.model ?? null, instructions, skills, permissions, options.ephemeral ?? false);
+
+  // Cancellation must own the process before any startup RPC can block.
+  const onAbort = () => { void session.close(); };
+  const detachAbort = () => ctx.signal?.removeEventListener("abort", onAbort);
+  proc.once("exit", detachAbort);
+  proc.once("error", detachAbort);
+  ctx.signal?.addEventListener("abort", onAbort, { once: true });
+  if (ctx.signal?.aborted) onAbort();
 
   // Perform JSON-RPC initialize handshake + thread/start
   // Closing rejects every pending request, so a stopped startup throws out of
@@ -469,15 +497,6 @@ export async function startCodexSession(
     startupSignal?.removeEventListener("abort", stopStartup);
   }
 
-  // Wire up AbortSignal
-  if (ctx.signal) {
-    if (ctx.signal.aborted) {
-      void session.close();
-    } else {
-      ctx.signal.addEventListener("abort", () => void session.close(), { once: true });
-    }
-  }
-
   return session;
 }
 
@@ -493,6 +512,8 @@ export async function startCodexSession(
 export { codexGoalCapability } from "./goal-capability.js";
 
 export class CodexSessionImpl implements AgentSession {
+  private readonly speed: ServiceTierObserver;
+  get serviceTier() { return this.speed.snapshot(); }
   private _state: SessionState = "idle";
   /**
    * The root thread represented by this AgentSession. Codex app-server also
@@ -555,7 +576,9 @@ export class CodexSessionImpl implements AgentSession {
   // Per-turn accumulators. Cleared after each result delivery so a subsequent
   // turn's events don't inherit stale values.
   private _turnSummary: string | null = null;
-  private _turnUsage: { inputTokens: number; outputTokens: number } | null = null;
+  private _turnUsage: TokenUsage | null = null;
+  private _totalUsage: TokenUsage | null = null;
+  private _selectedModel: string | null = null;
   private _turnModel: string | null = null;
   private _turnIsError = false;
   private _turnWasInterrupted = false;
@@ -604,6 +627,7 @@ export class CodexSessionImpl implements AgentSession {
     /** Start the root thread ephemeral. */
     private readonly ephemeral: boolean = false,
   ) {
+    this.speed = new ServiceTierObserver(ctx.config?.serviceTier);
     this._resumeThreadId = readCodexResumeId(ctx.sessionParams);
     this._expectedThreadId = this._resumeThreadId;
 
@@ -782,6 +806,7 @@ export class CodexSessionImpl implements AgentSession {
 
   /** Start the identity latch before writing the leader `turn/start` request. */
   private beginActiveTurn(): ActiveTurnReady {
+    this.speed.reset();
     let resolveFn!: (turnId: string | null) => void;
     let rejectFn!: (err: Error) => void;
     const promise = new Promise<string | null>((resolve, reject) => {
@@ -876,6 +901,7 @@ export class CodexSessionImpl implements AgentSession {
   // -------------------------------------------------------------------------
 
   private rpcRequest(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (this._state === "closed") return Promise.reject(new Error("Codex session closed"));
     const id = this._nextId++;
     const msg: Record<string, unknown> = { jsonrpc: "2.0", id, method };
     if (params) msg["params"] = params;
@@ -908,6 +934,7 @@ export class CodexSessionImpl implements AgentSession {
     signal?: AbortSignal,
   ): Promise<Record<string, unknown>> {
     throwIfTitleAborted(signal);
+    if (this._state === "closed") return Promise.reject(new Error("Codex session closed"));
     const id = this._nextId++;
     return new Promise((resolve, reject) => {
       const cleanup = () => {
@@ -986,7 +1013,7 @@ export class CodexSessionImpl implements AgentSession {
     // (verified against codex 0.130.0 app-server). This is the same capability
     // the official VS Code client declares; it gates access to experimental RPC
     // methods, not turn semantics.
-    await this.rpcRequest("initialize", {
+    await this.startupRpc("initialize", {
       clientInfo: { name: "agentex", version: "1.0.0" },
       capabilities: { experimentalApi: true },
     });
@@ -1001,16 +1028,22 @@ export class CodexSessionImpl implements AgentSession {
     //    a divergent rewind copy. The thread keeps its original cwd/model, so we
     //    pass only the thread id (+ refreshed developer instructions, and the
     //    approval policy and sandbox this session runs with, which may differ
-    //    from the ones the thread was created under). MCP-configured resumes
-    //    explicitly select the cwd used by discovery, so an old thread cannot
-    //    load unverified project servers. Restored sessionParams carry that cwd.
+    //    from the ones the thread was created under). MCP-configured and
+    //    typed-tier resumes explicitly select cwd; typed tiers also verify the
+    //    native response before inference. Restored sessionParams carry cwd.
     const permissionParams = codexPermissionThreadParams(this.permissions);
     if (this._resumeThreadId) {
       const resumeParams: Record<string, unknown> = { threadId: this._resumeThreadId, ...permissionParams };
-      if (this.ctx.config?.mcpServers !== undefined || this.ctx.config?.strictMcpConfig === true) resumeParams["cwd"] = this.cwd;
+      if (this.ctx.config?.serviceTier !== undefined) {
+        resumeParams["serviceTier"] = codexTierId(this.ctx.config.serviceTier);
+        if (this.model) resumeParams["model"] = this.model;
+      }
+      if (this.ctx.config?.serviceTier !== undefined || this.ctx.config?.mcpServers !== undefined || this.ctx.config?.strictMcpConfig === true) resumeParams["cwd"] = this.cwd;
       if (this.instructions) resumeParams["developerInstructions"] = this.instructions;
       try {
-        const res = await this.rpcRequest("thread/resume", resumeParams);
+        const res = await this.startupRpc("thread/resume", resumeParams);
+        await this.verifyWorkingDirectory(res);
+        await this.observeSelectedServiceTier(res);
         const thread = asObj(res, "thread");
         // thread/resume may echo the thread back or return {}; fall back to the
         // id we resumed with so `sessionId` is always populated.
@@ -1029,6 +1062,9 @@ export class CodexSessionImpl implements AgentSession {
         } catch { /* A missing/pruned native transcript is unavailable telemetry. */ }
         return;
       } catch (err) {
+        if (this.ctx.signal?.aborted || this._state === "closed") throw err;
+        if (err instanceof ServiceTierConfigurationError) throw err;
+        if (this.ctx.config?.serviceTier !== undefined && !isCodexUnknownSessionError("", err instanceof Error ? err.message : String(err))) throw err;
         // A failed resume can emit thread/started before its error response.
         // Clear that provisional identity so the fresh thread's init event is
         // accepted instead of being mistaken for a foreign child thread.
@@ -1053,6 +1089,7 @@ export class CodexSessionImpl implements AgentSession {
     // thread/start (fresh)
     const threadParams: Record<string, unknown> = { cwd: this.cwd, ...permissionParams };
     if (this.ephemeral) threadParams["ephemeral"] = true;
+    if (this.ctx.config?.serviceTier !== undefined) threadParams["serviceTier"] = codexTierId(this.ctx.config.serviceTier);
     if (this.model) threadParams["model"] = this.model;
     if (this.instructions) threadParams["developerInstructions"] = this.instructions;
 
@@ -1065,12 +1102,7 @@ export class CodexSessionImpl implements AgentSession {
       try {
         // Bound the discovery RPC: an older app-server that ignores
         // `collaborationMode/list` would otherwise hang the whole handshake.
-        const modesResponse = await Promise.race([
-          this.rpcRequest("collaborationMode/list", {}),
-          new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error("collaborationMode/list timed out")), 10_000),
-          ),
-        ]);
+        const modesResponse = await this.boundedRpcRequest("collaborationMode/list", {}, 10_000, this.ctx.signal);
         const collaborationMode = resolveCollaborationModeParam(
           parseCollaborationModes(modesResponse),
           modeId,
@@ -1084,11 +1116,54 @@ export class CodexSessionImpl implements AgentSession {
       } catch { /* modes are advisory — ignore discovery failures */ }
     }
 
-    const res = await this.rpcRequest("thread/start", threadParams);
+    const res = await this.startupRpc("thread/start", threadParams);
+    await this.verifyWorkingDirectory(res);
+    await this.observeSelectedServiceTier(res);
     // codex-cli 0.130.0+ shape: { thread: { id, sessionId, ... }, model, ... }
     const thread = asObj(res, "thread");
     this._threadId = str(thread, "id") || str(thread, "sessionId") || null;
     this._expectedThreadId = this._threadId;
+  }
+
+  private startupRpc(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    return this.boundedRpcRequest(method, params, 30_000, this.ctx.signal);
+  }
+
+  private async verifyWorkingDirectory(response: Record<string, unknown>): Promise<void> {
+    if (this.ctx.config?.serviceTier === undefined) return;
+    const cwd = str(response, "cwd");
+    // Native paths may be canonicalized (for example /var -> /private/var).
+    const canonical = (value: string) => realpath(value).catch(() => resolve(value));
+    if (!cwd || await canonical(cwd) !== await canonical(this.cwd)) {
+      throw new ServiceTierConfigurationError("unavailable", "Codex did not select the requested working directory; no inference was started");
+    }
+  }
+
+  private async observeSelectedServiceTier(response: Record<string, unknown>): Promise<void> {
+    this._selectedModel = str(response, "model") || this.model;
+    const tier = this.ctx.config?.serviceTier;
+    if (tier !== undefined && tier !== "default") {
+      const entries: unknown[] = [];
+      let cursor: string | undefined;
+      const cursors = new Set<string>();
+      do {
+        const page = await this.startupRpc("model/list", { includeHidden: true, ...(cursor ? { cursor } : {}) });
+        if (Array.isArray(page["data"])) entries.push(...page["data"]);
+        cursor = typeof page["nextCursor"] === "string" && page["nextCursor"] ? page["nextCursor"] : undefined;
+        if (cursor && cursors.has(cursor)) throw new ServiceTierConfigurationError("discovery_failed", "Codex returned a repeated model catalog cursor");
+        if (cursor) cursors.add(cursor);
+      } while (cursor);
+      assertCodexModelTier(tier, str(response, "model") || this.model || "", entries);
+    }
+    if (Object.hasOwn(response, "serviceTier")) {
+      const selected = typeof response["serviceTier"] === "string" ? codexTierId(response["serviceTier"]) : "default";
+      if (tier !== undefined && selected !== codexTierId(tier)) {
+        throw new ServiceTierConfigurationError("unavailable", "Codex did not select the requested service tier; no inference was started");
+      }
+      this.dispatchEvent(serviceTierEvent("codex", { selected }, str(asObj(response, "thread"), "id") || this._threadId));
+    } else if (tier !== undefined) {
+      throw new ServiceTierConfigurationError("unsupported_runtime", "Codex did not report its selected service tier; update the CLI");
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -1157,6 +1232,7 @@ export class CodexSessionImpl implements AgentSession {
     // resumed sessions without mutating the user's global config.toml.
     if (this.model) turnParams["model"] = this.model;
     if (this.ctx.config?.effort) turnParams["effort"] = this.ctx.config.effort;
+    if (this.ctx.config?.serviceTier !== undefined) turnParams["serviceTier"] = codexTierId(this.ctx.config.serviceTier);
 
     let resolveFn!: (r: TurnResult) => void;
     let rejectFn!: (e: Error) => void;
@@ -2472,6 +2548,12 @@ export class CodexSessionImpl implements AgentSession {
       return;
     }
 
+    if (method === "thread/tokenUsage/updated") {
+      this.observeTokenUsage(params);
+      this.emitStreamEvent(rawLine, raw);
+      return;
+    }
+
     if (method === "item/started") {
       this._state = "tool_executing";
       this.emitStreamEvent(rawLine, raw);
@@ -2617,18 +2699,49 @@ export class CodexSessionImpl implements AgentSession {
     }
   }
 
+  /** Native totals are cumulative across the thread; charge only this turn's
+   * increments. Resume replays establish a baseline, and repeated notifications
+   * do not charge the same request twice. Foreign threads were filtered above. */
+  private observeTokenUsage(params: Record<string, unknown>): void {
+    const native = asObj(params, "tokenUsage");
+    const total = this.readTokenUsage(asObj(native, "total"));
+    if (!total) return;
+    const active = this._activeTurnId === str(params, "turnId") && this._activeTurnReady && !this._turnTerminalObserved;
+    if (!active && this._activeTurnId && !this._turnTerminalObserved) return;
+    if (active) {
+      const previous = this._totalUsage;
+      const last = this.readTokenUsage(asObj(native, "last"));
+      const reset = previous && (total.inputTokens < previous.inputTokens || total.outputTokens < previous.outputTokens);
+      const delta = !previous || reset
+        ? (this._resumeThreadId || reset ? last : total)
+        : { inputTokens: total.inputTokens - previous.inputTokens, outputTokens: total.outputTokens - previous.outputTokens,
+          ...(total.cachedInputTokens !== undefined ? { cachedInputTokens: Math.max(0, total.cachedInputTokens - (previous.cachedInputTokens ?? 0)) } : {}) };
+      if (delta) {
+        const current = this._turnUsage;
+        this._turnUsage = { inputTokens: (current?.inputTokens ?? 0) + delta.inputTokens,
+          outputTokens: (current?.outputTokens ?? 0) + delta.outputTokens,
+          ...(delta.cachedInputTokens !== undefined || current?.cachedInputTokens !== undefined
+            ? { cachedInputTokens: (current?.cachedInputTokens ?? 0) + (delta.cachedInputTokens ?? 0) } : {}) };
+      }
+    }
+    this._totalUsage = total;
+  }
+
+  private readTokenUsage(usage: Record<string, unknown>): TokenUsage | null {
+    const input = usage["inputTokens"] ?? usage["input_tokens"];
+    const output = usage["outputTokens"] ?? usage["output_tokens"];
+    const cached = usage["cachedInputTokens"] ?? usage["cached_input_tokens"];
+    const valid = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0;
+    if (!valid(input) || !valid(output)) return null;
+    return { inputTokens: input, outputTokens: output, ...(valid(cached) ? { cachedInputTokens: cached } : {}) };
+  }
+
   private handleTurnCompleted(params: Record<string, unknown>): void {
     this.markTurnTerminalObserved();
     const usage = typeof params["usage"] === "object" && params["usage"] !== null
       ? (params["usage"] as Record<string, unknown>)
       : null;
-    if (usage) {
-      const inputTokens = num(usage, "input_tokens");
-      const outputTokens = num(usage, "output_tokens");
-      if (inputTokens > 0 || outputTokens > 0) {
-        this._turnUsage = { inputTokens, outputTokens };
-      }
-    }
+    if (usage) this._turnUsage = this.readTokenUsage(usage) ?? this._turnUsage;
     const model = str(params, "model");
     if (model) this._turnModel = model;
 
@@ -2680,9 +2793,9 @@ export class CodexSessionImpl implements AgentSession {
     // point can yield (usage scan, event chain), and a send() arriving in the
     // meantime starts a new turn that must not be settled by this result.
     const delivering = this._activeTurnReady;
-    const resolvedModel = this._turnModel ?? this.model;
+    const resolvedModel = this._turnModel ?? this._selectedModel ?? this.model;
     let usage = this._turnUsage && resolvedModel
-      ? { [resolvedModel]: { inputTokens: this._turnUsage.inputTokens, outputTokens: this._turnUsage.outputTokens } }
+      ? { [resolvedModel]: { ...this._turnUsage } }
       : undefined;
 
     // Freeze this turn's outcome and clear the accumulators NOW, while we are
@@ -2692,6 +2805,7 @@ export class CodexSessionImpl implements AgentSession {
     // instead would not work: the usage-scan path re-reads state after an
     // await, so the new turn's reset would eat the old turn's summary.
     const outcome: TurnOutcome = {
+      serviceTier: this.serviceTier,
       summary: this._turnSummary,
       isError: this._turnIsError,
       errorMessage: this._turnErrorMessage,
@@ -2720,7 +2834,9 @@ export class CodexSessionImpl implements AgentSession {
       const startedAt = turnStartedAt;
       const threadId = this._threadId ?? undefined;
       // Fire-and-forget: scan logs then deliver result
-      void scanCodexSessionUsage({ startedAfter: startedAt, threadId }).then((scanned) => {
+      const env = buildEnv(this.ctx.env);
+      const codexHome = resolve(this.cwd, env["CODEX_HOME"] ?? join(env["HOME"] ?? env["USERPROFILE"] ?? homedir(), ".codex"));
+      void scanCodexSessionUsage({ startedAfter: startedAt, threadId, codexHome }).then((scanned) => {
         usage = scanned;
       }).catch(() => {
         // Non-fatal — usage stays undefined
@@ -2739,6 +2855,7 @@ export class CodexSessionImpl implements AgentSession {
     outcome: TurnOutcome,
   ): Promise<void> {
     const result: TurnResult = {
+      ...(outcome.serviceTier ? { serviceTier: outcome.serviceTier } : {}),
       summary: outcome.summary,
       usage,
       costUsd: null,
@@ -2814,6 +2931,7 @@ export class CodexSessionImpl implements AgentSession {
    * throwing handler does not break delivery of subsequent events.
    */
   private dispatchEvent(event: StreamEvent): void {
+    this.speed.observe(event);
     this.telemetry.observe(event);
     if (event.type === "background_task" && !this.observeBackgroundTask(event)) return;
     // Track native goal_status transitions (keeps getGoal() accurate).

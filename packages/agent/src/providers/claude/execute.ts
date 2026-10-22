@@ -1,4 +1,6 @@
 import { observeExecution } from "../../telemetry/integration.js";
+import { observeServiceTierExecution } from "../../utils/service-tier.js";
+import { prepareClaudeServiceTier } from "./service-tier.js";
 import * as path from "node:path";
 import type { ExecutionContext, ExecutionResult } from "../../types.js";
 import { findBinary } from "../../utils/binary.js";
@@ -16,7 +18,29 @@ import type { PreparedWorkspace } from "../../utils/workspace.js";
 import { parseClaudeStreamJson, parseStreamLine, isClaudeUnknownSessionError, isClaudeAuthRequired, CLAUDE_LOGIN_COMMAND, type PartialStreamContext } from "./parse.js";
 
 export function executeClaudeProvider(ctx: ExecutionContext): Promise<ExecutionResult> {
-  return observeExecution(ctx, { context: true, rates: true }, executeClaudeProviderInner);
+  return observeServiceTierExecution(ctx, async (observed) => {
+    const run = (context: ExecutionContext) => observeExecution(context, { context: true, rates: true }, executeClaudeProviderInner);
+    if (observed.config?.serviceTier === undefined || observed.signal?.aborted) return run(observed);
+    let binary;
+    try { binary = await findBinary("claude", observed.config.command); }
+    catch { return run(observed); } // Preserve the normal binary_not_found result.
+    const env = buildEnv(observed.env);
+    ensurePathInEnv(env);
+    const endpoint = translateEndpoint("claude", observed.config.endpoint);
+    Object.assign(env, endpoint.env);
+    for (const key of endpoint.unset) delete env[key];
+    let prepared;
+    try {
+      prepared = await prepareClaudeServiceTier(observed.config, observed.model ?? observed.config.model,
+        binary, observed.cwd ?? process.cwd(), env, observed.signal);
+    } catch (error) {
+      if (observed.signal?.aborted) return run(observed);
+      throw error;
+    }
+    try {
+      return await run({ ...observed, config: { ...observed.config, extraArgs: prepared.args } });
+    } finally { await cleanupMcpConfig(prepared.path); }
+  });
 }
 
 async function executeClaudeProviderInner(ctx: ExecutionContext): Promise<ExecutionResult> {

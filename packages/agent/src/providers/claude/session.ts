@@ -1,6 +1,8 @@
 import { normalizeTitle, throwIfTitleAborted, type NativeTitleOptions } from "../../titles.js";
 import { readClaudeTitle } from "./titles.js";
 import { TelemetryStore } from "../../telemetry/store.js";
+import { ServiceTierObserver } from "../../utils/service-tier.js";
+import { prepareClaudeServiceTier } from "./service-tier.js";
 import type { ChildProcess } from "node:child_process";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -139,6 +141,19 @@ export function buildPermissionResponse(
  * which keeps stdin open for multi-turn messages instead of reading a single prompt.
  */
 export async function createClaudeSession(ctx: SessionContext): Promise<AgentSession> {
+  if (ctx.config?.serviceTier === undefined) return createClaudeSessionInner(ctx);
+  const env = buildEnv(ctx.env);
+  ensurePathInEnv(env);
+  const endpoint = translateEndpoint("claude", ctx.config.endpoint);
+  Object.assign(env, endpoint.env);
+  for (const key of endpoint.unset) delete env[key];
+  const prepared = await prepareClaudeServiceTier(ctx.config, ctx.config.model,
+    await findBinary("claude", ctx.config.command), ctx.cwd ?? process.cwd(), env, ctx.signal);
+  try { return await createClaudeSessionInner({ ...ctx, config: { ...ctx.config, extraArgs: prepared.args } }, prepared.path); }
+  catch (error) { await cleanupMcpConfig(prepared.path); throw error; }
+}
+
+async function createClaudeSessionInner(ctx: SessionContext, serviceTierConfigPath: string | null = null): Promise<AgentSession> {
   const cwd = ctx.cwd ?? process.cwd();
   const config = ctx.config ?? {};
 
@@ -229,7 +244,7 @@ export async function createClaudeSession(ctx: SessionContext): Promise<AgentSes
     throw new Error("Failed to open stdio on Claude process");
   }
 
-  const session = new ClaudeSessionImpl(proc, { ...ctx, cwd }, skillsDir, mcpConfigPath);
+  const session = new ClaudeSessionImpl(proc, { ...ctx, cwd }, skillsDir, mcpConfigPath, serviceTierConfigPath);
 
   // Wire up AbortSignal to close the session
   if (ctx.signal) {
@@ -269,6 +284,8 @@ const CLAUDE_PROVIDER_TYPE = "claude";
 const TERMINAL_COMMAND_STATES = new Set(["completed", "cancelled", "discarded", "refused"]);
 
 export class ClaudeSessionImpl implements AgentSession {
+  private readonly speed: ServiceTierObserver;
+  get serviceTier() { return this.speed.snapshot(); }
   private _state: SessionState = "idle";
   private _title: string | null = null;
   private _sessionId: string | null = null;
@@ -419,7 +436,9 @@ export class ClaudeSessionImpl implements AgentSession {
     private readonly ctx: SessionContext,
     private readonly skillsDir: string | null,
     private readonly mcpConfigPath: string | null = null,
+    private readonly serviceTierConfigPath: string | null = null,
   ) {
+    this.speed = new ServiceTierObserver(ctx.config?.serviceTier);
     this.cwd = ctx.cwd ?? process.cwd();
     this.telemetry.setContextRefresh(async () => {
       const contextRevision = this.telemetry.contextScopeVersion;
@@ -509,6 +528,7 @@ export class ClaudeSessionImpl implements AgentSession {
     });
 
     proc.on("exit", (code, signal) => {
+      void this.cleanupServiceTier();
       if (this._state !== "closed") {
         this.telemetry.close();
         this._state = "closed";
@@ -520,6 +540,7 @@ export class ClaudeSessionImpl implements AgentSession {
     });
 
     proc.on("error", (err) => {
+      void this.cleanupServiceTier();
       if (this._state !== "closed") {
         this.telemetry.close();
         this._state = "closed";
@@ -990,7 +1011,7 @@ export class ClaudeSessionImpl implements AgentSession {
 
   close(): Promise<void> {
     if (this._closePromise) return this._closePromise;
-    if (this._state === "closed") return Promise.resolve();
+    if (this._state === "closed") return this.cleanupServiceTier();
     return this._closePromise = this.closeTransport();
   }
 
@@ -1030,6 +1051,12 @@ export class ClaudeSessionImpl implements AgentSession {
       await cleanupSkillsDir(this.skillsDir);
     }
     await cleanupMcpConfig(this.mcpConfigPath);
+    await this.cleanupServiceTier();
+  }
+
+  private serviceTierCleanup?: Promise<void>;
+  private cleanupServiceTier(): Promise<void> {
+    return this.serviceTierCleanup ??= cleanupMcpConfig(this.serviceTierConfigPath);
   }
 
   // -------------------------------------------------------------------------
@@ -1484,6 +1511,7 @@ export class ClaudeSessionImpl implements AgentSession {
     })();
 
     const result: TurnResult = {
+      ...(this.serviceTier ? { serviceTier: this.serviceTier } : {}),
       summary,
       usage,
       costUsd,
@@ -1771,6 +1799,7 @@ export class ClaudeSessionImpl implements AgentSession {
   }
 
   private dispatchEvent(event: StreamEvent): void {
+    this.speed.observe(event);
     if (event.type === "title_changed" && !event.parentToolCallId) this._title = event.title;
     this.telemetry.observe(event);
     if (this.contextRefreshObserved && !event.parentToolCallId && (event.type === "result" || event.type === "context_usage_invalidated" || (event.type === "system" && Boolean(event.model)))) {

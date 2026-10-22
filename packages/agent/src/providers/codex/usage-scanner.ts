@@ -17,8 +17,8 @@ function getCodexHome(): string {
  * Find session log files that may contain usage data for a given time range.
  * Codex stores logs at: `CODEX_HOME/sessions/YYYY/MM/DD/*.jsonl`
  */
-async function findLogFiles(startedAfter: Date): Promise<string[]> {
-  const sessionsDir = path.join(getCodexHome(), "sessions");
+async function findLogFiles(startedAfter: Date, codexHome?: string): Promise<string[]> {
+  const sessionsDir = path.join(codexHome ?? getCodexHome(), "sessions");
   const files: string[] = [];
 
   // Walk date-partitioned directories starting from the startedAfter date
@@ -51,6 +51,8 @@ async function findLogFiles(startedAfter: Date): Promise<string[]> {
 // ---------------------------------------------------------------------------
 
 interface ScanOptions {
+  /** Effective child-process home, independent of the host process environment. */
+  codexHome?: string;
   /** Only include events after this timestamp */
   startedAfter: Date;
   /** Optional thread ID to filter by */
@@ -68,7 +70,7 @@ interface ScanOptions {
 export async function scanCodexSessionUsage(
   options: ScanOptions,
 ): Promise<Record<string, TokenUsage> | undefined> {
-  const logFiles = await findLogFiles(options.startedAfter);
+  const logFiles = await findLogFiles(options.startedAfter, options.codexHome);
   if (logFiles.length === 0) return undefined;
 
   const usageByModel = new Map<string, {

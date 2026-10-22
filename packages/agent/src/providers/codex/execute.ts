@@ -25,8 +25,13 @@ import { withPlanModePreamble } from "./plan-mode.js";
 import { scanCodexSessionUsage } from "./usage-scanner.js";
 import { prepareCodexMcp, splitCodexExtraArgs } from "./mcp.js";
 import { codexSessionCodec } from "./codec.js";
+import { observeServiceTierExecution } from "../../utils/service-tier.js";
 
 export function executeCodexProvider(ctx: ExecutionContext): Promise<ExecutionResult> {
+  return observeServiceTierExecution(ctx, executeCodexWithTelemetry);
+}
+
+function executeCodexWithTelemetry(ctx: ExecutionContext): Promise<ExecutionResult> {
   return observeExecution(ctx, { context: true, rates: true }, executeCodexProviderInner, async (result, store) => {
     if (result.sessionDisplayId) {
       for (const event of await readLatestCodexTelemetry(result.sessionDisplayId, ctx.env)) {
@@ -41,6 +46,7 @@ export function executeCodexProvider(ctx: ExecutionContext): Promise<ExecutionRe
 }
 
 async function executeCodexProviderInner(ctx: ExecutionContext): Promise<ExecutionResult> {
+  if (ctx.config?.serviceTier !== undefined) return (await import("./execute-session.js")).executeCodexSession(ctx);
   const runId = ctx.runId ?? uuidv7();
   const model = ctx.model ?? ctx.config?.model;
   const config = ctx.config ?? {};
@@ -373,6 +379,7 @@ async function executeCodexProviderInner(ctx: ExecutionContext): Promise<Executi
       : await scanCodexSessionUsage({
           startedAfter: new Date(startedAt),
           threadId: resolvedSessionId ?? undefined,
+          codexHome: path.resolve(cwd, env["CODEX_HOME"] ?? path.join(env["HOME"] ?? env["USERPROFILE"] ?? os.homedir(), ".codex")),
         }),
     costUsd: null,
     model: resolvedModel,

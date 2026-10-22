@@ -309,6 +309,7 @@ interface ProviderConfig {
   model?: string;
   modelVariant?: string;            // OpenCode provider-native variant, separate from effort
   effort?: string;                  // claude/antigravity: --effort; codex: turn effort override
+  serviceTier?: string;             // codex/claude: inference speed; omit to inherit, "default" for Standard
   unattendedPermissionPolicy?: "allow" | "deny";
   inputRequestTimeoutSec?: number;  // OpenCode permission/question response deadline, default 300
   maxTurns?: number;
@@ -322,7 +323,7 @@ interface ProviderConfig {
   allowedTools?: string[];          // claude: --allowed-tools (patterns verbatim; codex ignores)
   disallowedTools?: string[];       // claude: --disallowed-tools (deny wins; codex ignores)
   includePartialMessages?: boolean; // claude, antigravity: emit assistant_delta/thinking_delta typewriter events
-  extraArgs?: string[];             // always appended LAST — hosts can override any generated flag
+  extraArgs?: string[];             // native CLI flags; explicit service-tier settings must agree
   search?: boolean;
   sandbox?: boolean;                // antigravity: --sandbox (terminal sandbox)
   thinking?: string;
@@ -367,6 +368,7 @@ interface ExecutionResult {
   sessionDisplayId: string | null;
   clearSession: boolean;
   billingType: "api" | "subscription" | "metered_api" | null;
+  serviceTier?: ServiceTierState;   // requested, selected, effective, reason (null when unknown)
 
   // Provider-reported run metadata — populated when the provider emits it.
   // Claude populates all of these; Codex leaves them undefined/null.
@@ -1287,6 +1289,29 @@ await invokeSkill(codexSession, command, {
 ```
 
 AgentEx reads the skill body, substitutes supported argument placeholders, wraps it with skill metadata, and sends the expanded prompt as the turn input. If Codex later exposes native slash dispatch, AgentEx can switch that command's `execution.kind` to `provider-slash` without changing host UI code.
+
+## Inference Speed
+
+Codex and Claude support `config.serviceTier` independently of model and effort:
+
+```typescript
+await getProvider("codex").execute({
+  prompt: "Explain this project",
+  config: { serviceTier: "fast" }, // also "ultrafast" where advertised
+});
+await getProvider("claude").execute({
+  prompt: "Explain this project",
+  config: { model: "opus", serviceTier: "fast" },
+});
+```
+
+Omit the field to inherit native defaults; use `"default"` to explicitly select
+Standard, including when resuming. `listModels()` exposes tier choices and
+availability. Results, sessions, and `service_tier` events distinguish requested,
+selected, and provider-observed speed. Paid tiers require provider access; no
+effective observation means unknown. Requires Codex 0.163.0+ or Claude Code
+2.1.205+. See the [inference speed guide](docs/inference-speed.md) for validation,
+settings merging, resume behavior, and CLI verification.
 
 ## Temporary Config Override
 

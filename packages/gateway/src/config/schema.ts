@@ -21,6 +21,7 @@ const agentConfigSchema = z.object({
   provider: z.string(),
   cwd: z.string(),
   model: z.string().optional(),
+  serviceTier: z.string().refine(value => /^[a-z]/.test(value) && !/[^a-z0-9_-]/.test(value), "Invalid service tier id").optional(),
   maxTurns: z.number().int().positive().optional(),
   timeoutSec: z.number().positive().optional(),
   skipPermissions: z.boolean().optional(),

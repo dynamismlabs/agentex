@@ -135,6 +135,7 @@ describe("dispatchToAgent", () => {
       provider,
       agentConfig: makeAgentConfig({
         model: "claude-4",
+        serviceTier: "fast",
         maxTurns: 10,
         timeoutSec: 120,
         skipPermissions: true,
@@ -148,6 +149,7 @@ describe("dispatchToAgent", () => {
 
     expect(provider.lastCtx!.model).toBe("claude-4");
     const config = provider.lastCtx!.config!;
+    expect(config.serviceTier).toBe("fast");
     expect(config.maxTurns).toBe(10);
     expect(config.timeoutSec).toBe(120);
     expect(config.skipPermissions).toBe(true);

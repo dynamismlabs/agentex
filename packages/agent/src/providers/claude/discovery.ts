@@ -37,6 +37,9 @@ import { findBinary, type ResolvedBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { runChildProcess } from "../../utils/process.js";
 import { withModelCache } from "../../utils/model-cache.js";
+import { translateEndpoint } from "../../utils/endpoint.js";
+import { serviceTierRuntimeVersion } from "../../utils/service-tier.js";
+import { claudeServiceTiers, claudeSettingsEnv, readClaudeServiceTierSettings } from "./service-tier.js";
 import { CLAUDE_EFFORTS, claudeEffortFlagValue, claudeEffortFromFlagValue } from "./effort.js";
 
 /**
@@ -168,6 +171,9 @@ async function probeRuntime(options: ListModelsOptions): Promise<ProbeRuntime> {
   const resolved = await findBinary("claude", options.config?.command);
   const env = buildEnv(options.env);
   ensurePathInEnv(env);
+  const endpoint = translateEndpoint("claude", options.config?.endpoint);
+  Object.assign(env, endpoint.env);
+  for (const key of endpoint.unset) delete env[key];
   const base: ClaudeBinary = { resolved, env, cwd: options.cwd ?? process.cwd() };
   // One spawn answers two questions: which efforts the binary advertises, and
   // whether it understands `--bare` well enough to probe without side effects.
@@ -190,26 +196,33 @@ async function discoverEfforts(runtime: ProbeRuntime): Promise<string[]> {
 }
 
 export async function listClaudeModels(options: ListModelsOptions = {}): Promise<ProviderModel[]> {
-  return withModelCache("claude", options, options.cacheTtlMs, async () => {
+  const { settings } = await readClaudeServiceTierSettings(options.config ?? {}, options.cwd ?? process.cwd());
+  return withModelCache("claude", { ...options, env: claudeSettingsEnv(buildEnv(options.env), settings) }, options.cacheTtlMs, async () => {
     const runtime = await probeRuntime(options);
+    const tierEnv = claudeSettingsEnv(runtime.env, settings);
     // Throwing rather than returning [] keeps "no models" meaningful. Callers
     // already treat a discovery failure as "use your fallback catalog".
     if (!await probeMechanismWorks(runtime)) {
       throw new Error("Claude Code model discovery failed: the CLI did not respond as expected to a probe");
     }
-    const [supportedEfforts, recognized] = await Promise.all([
+    const [supportedEfforts, recognized, version] = await Promise.all([
       discoverEfforts(runtime),
       Promise.all(CLAUDE_MODEL_CANDIDATES.map(async (candidate) => (
         await probeFlag(runtime, "--model", candidate.id) ? candidate : null
       ))),
+      serviceTierRuntimeVersion(runtime.resolved, runtime.cwd, runtime.env),
     ]);
     return recognized
       .filter((candidate): candidate is (typeof CLAUDE_MODEL_CANDIDATES)[number] => candidate !== null)
-      .map((candidate) => ({
-        id: candidate.id,
-        name: candidate.name,
-        description: candidate.description,
-        ...(supportedEfforts.length > 0 ? { supportedEfforts } : {}),
-      }));
+      .map((candidate) => {
+        const serviceTiers = claudeServiceTiers(candidate.id, version, tierEnv);
+        return {
+          id: candidate.id,
+          name: candidate.name,
+          description: candidate.description,
+          ...(supportedEfforts.length > 0 ? { supportedEfforts } : {}),
+          ...(serviceTiers ? { serviceTiers } : {}),
+        };
+      });
   });
 }

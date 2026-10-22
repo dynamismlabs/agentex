@@ -125,6 +125,7 @@ agent:
   provider: claude              # claude | codex | openclaw | process
   cwd: /path/to/project       # working directory for the agent
   model: claude-sonnet-4-5-20250514           # optional model override
+  serviceTier: default        # optional: Standard; omit to inherit native speed
   maxTurns: 10                 # max tool-use turns
   timeoutSec: 300              # execution timeout
   skipPermissions: true        # skip interactive permission prompts
@@ -135,6 +136,11 @@ agent:
       command: mcp-fs
       args: ["--root", "/tmp"]
 ```
+
+`serviceTier: fast` enables Fast for supported Codex models or an explicitly
+selected Claude Opus model. Codex also accepts `ultrafast` when its model catalog
+advertises it. Availability and billing remain provider controlled. See the
+[inference speed guide](../agent/docs/inference-speed.md).
 
 ### Sessions
 

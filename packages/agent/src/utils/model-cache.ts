@@ -9,23 +9,32 @@
  * Entries are keyed on the runtime identity that can change the answer —
  * binary override, cwd, and any env the caller passed. Env is folded in
  * because a different credential can yield a different catalog; only the key
- * names and a hash-free ordering of values are used, and the key never leaves
- * this process.
+ * values participate in a hash along with endpoint/profile/config identity.
+ * Credentials are never retained in the cache key or emitted in diagnostics.
  */
+
+import { createHash } from "node:crypto";
+import type { ProviderConfig } from "../types.js";
+import { buildEnv } from "./env.js";
+import { nativeAuthFileIdentity } from "./native-auth-identity.js";
 
 const store = new Map<string, { expiresAt: number; value: unknown }>();
 
 export interface ModelCacheIdentity {
   cwd?: string | undefined;
   env?: Record<string, string | undefined> | undefined;
-  config?: { command?: string | undefined } | undefined;
+  config?: Pick<ProviderConfig, "command" | "endpoint" | "extraArgs"> | undefined;
 }
 
-function identityKey(provider: string, identity: ModelCacheIdentity): string {
-  const env = Object.entries(identity.env ?? {})
+async function identityKey(provider: string, identity: ModelCacheIdentity): Promise<string> {
+  const cwd = identity.cwd ?? process.cwd();
+  const effectiveEnv = { ...buildEnv(), ...identity.env };
+  const env = Object.entries(effectiveEnv)
     .filter(([, value]) => value !== undefined)
     .sort(([left], [right]) => left.localeCompare(right));
-  return JSON.stringify([provider, identity.cwd ?? "", identity.config?.command ?? "", env]);
+  const authFiles = await nativeAuthFileIdentity(provider, cwd, effectiveEnv);
+  const fingerprint = createHash("sha256").update(JSON.stringify([cwd, identity.config ?? {}, env, authFiles])).digest("hex");
+  return `["${provider}",${fingerprint}]`;
 }
 
 /**
@@ -42,7 +51,7 @@ export async function withModelCache<T>(
   cacheTtlMs: number | undefined,
   load: () => Promise<T>,
 ): Promise<T> {
-  const key = identityKey(provider, identity);
+  const key = await identityKey(provider, identity);
   const ttl = cacheTtlMs ?? 0;
   if (ttl > 0) {
     const hit = store.get(key);

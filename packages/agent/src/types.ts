@@ -123,6 +123,8 @@ export interface ProviderCapabilities {
   resume?: boolean;
   /** Models expose provider-native variants independently from effort. */
   modelVariants?: boolean;
+  /** Accepts config.serviceTier. Runtime/model/account availability is separate. */
+  serviceTiers?: boolean;
   /** The provider can surface interactive permission requests. */
   permissionRequests?: boolean;
   /** The provider can surface structured questions. */
@@ -710,6 +712,13 @@ export interface ProviderConfig {
   /** Provider reasoning effort. Claude and Antigravity map this to `--effort`;
    *  Codex sends it as the app-server `turn/start.effort` override. */
   effort?: string;
+  /** Provider-native inference speed, independent of model and effort.
+   * Codex: catalog ids ("priority", "ultrafast"), with "fast" as an alias.
+   * Claude: "fast" or "default". "default" explicitly requests Standard;
+   * omission preserves native defaults. Applied on exec/session start/resume,
+   * not to individual sends. Unsupported choices throw before inference.
+   * Raw speed settings in extraArgs must agree with this field. */
+  serviceTier?: string;
   /** Behavior when a host does not provide or loses its input callback. */
   unattendedPermissionPolicy?: "allow" | "deny";
   /** Deadline for a host to answer an observed permission or question. Default 300s. */
@@ -1048,6 +1057,8 @@ export interface TelemetrySurface<T> {
 
 // Execution output
 export interface ExecutionResult {
+  /** Latest speed observation; selection is not proof of billed inference speed. */
+  serviceTier?: ServiceTierState;
   runId: string;
   exitCode: number | null;
   signal: string | null;
@@ -1252,6 +1263,7 @@ export type AuthRequiredReason =
  */
 // Stream events — discriminated union
 export type StreamEvent =
+  | ({ type: "service_tier"; update: Partial<ServiceTierState> } & BaseStreamEventFields)
   | ({ type: "title_changed"; title: string | null } & BaseStreamEventFields)
   | ({ type: "context_usage"; usage: ContextUsage } & BaseStreamEventFields)
   | ({ type: "rate_limits"; update: RateLimitUpdate } & BaseStreamEventFields)
@@ -1644,7 +1656,39 @@ export interface AuthResolveContext {
 }
 
 // Models
+export interface ProviderServiceTier {
+  id: string;
+  name: string;
+  description?: string;
+  /** Availability of this choice in the inspected runtime. Account access may
+   * still be unknown; catalog presence does not guarantee a billed request. */
+  availability?: "available" | "unavailable" | "unknown";
+  reason?: string;
+}
+
+export interface ServiceTierState {
+  /** Explicit host request; null when inheriting native defaults. */
+  requested: string | null;
+  /** Native selected configuration, not proof of processing speed. */
+  selected: string | null;
+  /** Last provider-observed processing speed; null when unreported. */
+  effective: string | null;
+  /** Provider fallback notification or explanation, when observed. */
+  reason: string | null;
+}
+
+/** Invalid or unavailable explicit speed selection, detected before inference. */
+export class ServiceTierConfigurationError extends Error {
+  constructor(readonly code: "unsupported_runtime" | "unsupported_model" | "conflicting_settings" | "unavailable" | "discovery_failed" | "invalid_tier", message: string) {
+    super(message);
+    this.name = "ServiceTierConfigurationError";
+  }
+}
+
 export interface ProviderModel {
+  /** Omitted means discovery could not determine supported tiers. */
+  serviceTiers?: ProviderServiceTier[];
+  defaultServiceTier?: string;
   id: string;
   name: string;
   /** One-line blurb from the provider's own catalog, when it ships one. */
@@ -1878,6 +1922,8 @@ export interface SendOptions {
 
 /** A persistent session handle for multi-turn conversations. */
 export interface AgentSession {
+  /** Latest speed observation. Change config.serviceTier by resuming a session. */
+  readonly serviceTier?: ServiceTierState;
   /** Read the harness-owned title without generating one. */
   readTitle?(options?: NativeTitleOptions): Promise<string | null>;
   /** Set a nonempty title through the native protocol, without inference. */
@@ -2000,6 +2046,7 @@ export interface AgentSession {
 
 /** Result of a single turn within a session. */
 export interface TurnResult {
+  serviceTier?: ServiceTierState;
   summary: string | null;
   usage?: Record<string, TokenUsage>;
   costUsd: number | null;
