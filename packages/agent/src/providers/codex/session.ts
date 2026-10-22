@@ -30,7 +30,6 @@ import { createSessionRecord } from "../../sessions/record.js";
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { translateEndpoint } from "../../utils/endpoint.js";
-import { injectWorkspaceSkills } from "../../utils/skills.js";
 import { resolveInstructions } from "../../utils/instructions.js";
 import { createToolNameTracker } from "../../utils/tool-names.js";
 import { parseCodexStreamLines, parseCodexStreamEvent, codexBackgroundTaskReport, codexMcpToolName } from "./parse.js";
@@ -42,8 +41,10 @@ import {
   codexPermissionConfigArgs,
   codexPermissionThreadParams,
   codexThreadPermissions,
+  type CodexThreadPermissions,
 } from "./permissions.js";
 import { prepareCodexMcp, splitCodexExtraArgs } from "./mcp.js";
+import { cleanupCodexSkills, prepareCodexSkills, type CodexSkills } from "./skills.js";
 
 /**
  * Extract a resume thread id from session params (reusing the codec's
@@ -350,8 +351,43 @@ function classifyMessage(msg: Record<string, unknown>): IncomingMessage | null {
 // createCodexSession
 // ---------------------------------------------------------------------------
 
-export async function createCodexSession(ctx: SessionContext): Promise<AgentSession> {
+/** How long the handshake waits for `skills/extraRoots/set` before going on without the skills. */
+const SKILL_ROOTS_TIMEOUT_MS = 5_000;
+
+export function createCodexSession(ctx: SessionContext): Promise<AgentSession> {
+  return startCodexSession(ctx);
+}
+
+/** How a one-shot run with skills starts its session (see ./app-server-execute.ts). */
+export interface CodexSessionStartOptions {
+  /** `never` gives the run `codex exec`'s policy: nobody is there to answer an approval. */
+  approvalPolicy?: "never";
+  /** Overrides the sandbox `config` picks, for `codex exec`'s `--sandbox`. */
+  sandbox?: CodexThreadPermissions["sandbox"];
+  /** Start the thread ephemeral, for `codex exec`'s `--ephemeral`. */
+  ephemeral?: boolean;
+  /**
+   * Stops a startup in progress: the process is killed, the skills removed,
+   * and the start rejects. Unlike `ctx.signal`, which closes a started session.
+   */
+  startupSignal?: AbortSignal;
+}
+
+/**
+ * `createCodexSession`, typed as the implementation, for one-shot runs with
+ * skills that drive it directly. Without an approval handler a session would
+ * accept every approval, so those runs pass `approvalPolicy: "never"`.
+ */
+export async function startCodexSession(
+  ctx: SessionContext,
+  options: CodexSessionStartOptions = {},
+): Promise<CodexSessionImpl> {
   const config = ctx.config ?? {};
+  const permissions: CodexThreadPermissions = {
+    ...codexThreadPermissions(config),
+    ...(options.approvalPolicy ? { approvalPolicy: options.approvalPolicy } : {}),
+    ...(options.sandbox ? { sandbox: options.sandbox } : {}),
+  };
   const hasMcpConfig = config.mcpServers !== undefined || config.strictMcpConfig === true;
   const restoredCwd = hasMcpConfig ? codexSessionCodec.deserialize(ctx.sessionParams)?.["cwd"] : undefined;
   const cwd = ctx.cwd ?? (typeof restoredCwd === "string" ? restoredCwd : process.cwd());
@@ -372,12 +408,11 @@ export async function createCodexSession(ctx: SessionContext): Promise<AgentSess
   const mcp = await prepareCodexMcp(config, resolved, [...endpointTx.args, ...extra.configArgs], cwd, env);
   Object.assign(env, mcp.env);
 
-  // Inject skills
-  if (config.skillDirs && config.skillDirs.length > 0) {
-    try {
-      await injectWorkspaceSkills(config.skillDirs, cwd);
-    } catch { /* non-fatal */ }
-  }
+  // Skills: a temporary root this app-server process takes in the handshake.
+  let skills: CodexSkills | null = null;
+  try {
+    skills = await prepareCodexSkills(config.skillDirs, cwd);
+  } catch { /* non-fatal */ }
 
   // Resolve instructions. In plan mode, prepend a preamble so the agent
   // investigates-and-proposes rather than attempting writes that the sandbox
@@ -396,7 +431,7 @@ export async function createCodexSession(ctx: SessionContext): Promise<AgentSess
   // handshake repeats them on the thread itself.
   // Native config flags precede the subcommand; runtime extraArgs follow it.
   const args = [...resolved.prefixArgs];
-  args.push(...codexPermissionConfigArgs(codexThreadPermissions(config)));
+  args.push(...codexPermissionConfigArgs(permissions));
   // Custom endpoint model_providers overrides are top-level `-c` options, placed
   // with the other top-level flags before the `app-server` subcommand (the
   // position that is always valid for global options).
@@ -412,16 +447,26 @@ export async function createCodexSession(ctx: SessionContext): Promise<AgentSess
   });
 
   if (!proc.stdin || !proc.stdout || !proc.stderr) {
+    await cleanupCodexSkills(skills);
     throw new Error("Failed to open stdio on Codex process");
   }
 
-  const session = new CodexSessionImpl(proc, ctx, cwd, config.model ?? null, instructions);
+  const session = new CodexSessionImpl(proc, ctx, cwd, config.model ?? null, instructions, skills, permissions, options.ephemeral ?? false);
 
   // Perform JSON-RPC initialize handshake + thread/start
+  // Closing rejects every pending request, so a stopped startup throws out of
+  // the handshake and lands in the catch below.
+  const stopStartup = () => void session.close();
+  const startupSignal = options.startupSignal;
+  if (startupSignal?.aborted) stopStartup();
+  else startupSignal?.addEventListener("abort", stopStartup, { once: true });
   try { await session.handshake(); }
   catch (error) {
     await session.close().catch(() => { /* best effort after failed startup */ });
     throw error;
+  }
+  finally {
+    startupSignal?.removeEventListener("abort", stopStartup);
   }
 
   // Wire up AbortSignal
@@ -552,6 +597,12 @@ export class CodexSessionImpl implements AgentSession {
     private readonly cwd: string,
     private readonly model: string | null,
     private readonly instructions: string | null,
+    /** The chat's staged skills. Handed over in the handshake, removed on close. */
+    private readonly skills: CodexSkills | null = null,
+    /** Approval policy and sandbox for the root thread. */
+    private readonly permissions: CodexThreadPermissions = codexThreadPermissions(ctx.config),
+    /** Start the root thread ephemeral. */
+    private readonly ephemeral: boolean = false,
   ) {
     this._resumeThreadId = readCodexResumeId(ctx.sessionParams);
     this._expectedThreadId = this._resumeThreadId;
@@ -649,6 +700,8 @@ export class CodexSessionImpl implements AgentSession {
         this.cancelBackgroundTaskPollTimers();
         const err = new Error(message);
         this.rejectAllPending(err);
+        // close() is a no-op once closed, so the skills go now.
+        void cleanupCodexSkills(this.skills);
       }
     });
 
@@ -662,6 +715,7 @@ export class CodexSessionImpl implements AgentSession {
         });
         this.cancelBackgroundTaskPollTimers();
         this.rejectAllPending(err);
+        void cleanupCodexSkills(this.skills);
       }
     });
   }
@@ -937,6 +991,10 @@ export class CodexSessionImpl implements AgentSession {
       capabilities: { experimentalApi: true },
     });
 
+    // 1b. The chat's skills, before any thread exists to use them. They're
+    // this process's alone: nothing is written to the project or config.
+    if (this.skills) await this.setSkillRoots([this.skills.root]);
+
     // 2. Resume an existing thread when the caller supplied sessionParams,
     //    otherwise start a fresh one. `thread/resume` continues the SAME thread
     //    with its full context retained — distinct from `thread/fork`, which is
@@ -946,7 +1004,7 @@ export class CodexSessionImpl implements AgentSession {
     //    from the ones the thread was created under). MCP-configured resumes
     //    explicitly select the cwd used by discovery, so an old thread cannot
     //    load unverified project servers. Restored sessionParams carry that cwd.
-    const permissionParams = codexPermissionThreadParams(codexThreadPermissions(this.ctx.config));
+    const permissionParams = codexPermissionThreadParams(this.permissions);
     if (this._resumeThreadId) {
       const resumeParams: Record<string, unknown> = { threadId: this._resumeThreadId, ...permissionParams };
       if (this.ctx.config?.mcpServers !== undefined || this.ctx.config?.strictMcpConfig === true) resumeParams["cwd"] = this.cwd;
@@ -994,6 +1052,7 @@ export class CodexSessionImpl implements AgentSession {
 
     // thread/start (fresh)
     const threadParams: Record<string, unknown> = { cwd: this.cwd, ...permissionParams };
+    if (this.ephemeral) threadParams["ephemeral"] = true;
     if (this.model) threadParams["model"] = this.model;
     if (this.instructions) threadParams["developerInstructions"] = this.instructions;
 
@@ -1037,6 +1096,19 @@ export class CodexSessionImpl implements AgentSession {
   // -------------------------------------------------------------------------
 
   async send(message: string, options?: SendOptions): Promise<SendHandle> {
+    return this.sendTurn(message, options);
+  }
+
+  /**
+   * `send`, with what a one-shot run translates from `codex exec` flags:
+   * local images after the text (`--image`) and a schema for the final
+   * message (`--output-schema`).
+   */
+  async sendTurn(
+    message: string,
+    options?: SendOptions,
+    extra: { images?: string[]; outputSchema?: unknown } = {},
+  ): Promise<SendHandle> {
     if (this._state === "closed") throw new Error("Session is closed");
     if (this._draining) throw new Error("Session is draining — no new sends accepted");
 
@@ -1072,8 +1144,12 @@ export class CodexSessionImpl implements AgentSession {
     // codex-cli 0.130.0+ expects `input` as a content-block array, not a plain
     // string. The MCP-style shape: [{type:"text", text:"..."}].
     const turnParams: Record<string, unknown> = {
-      input: [{ type: "text", text: message }],
+      input: [
+        { type: "text", text: message },
+        ...(extra.images ?? []).map((imagePath) => ({ type: "localImage", path: imagePath })),
+      ],
     };
+    if (extra.outputSchema !== undefined) turnParams["outputSchema"] = extra.outputSchema;
     if (this._threadId) turnParams["threadId"] = this._threadId;
     // Codex app-server accepts model and reasoning effort as turn/start
     // overrides. Selected values become defaults for later turns on the same
@@ -1114,15 +1190,13 @@ export class CodexSessionImpl implements AgentSession {
         // Some app-server versions may omit the id from the response and send
         // it only in turn/started. Keep the latch open for that notification.
       }).catch((err: unknown) => {
-        this.rejectActiveTurnReady(
-          err instanceof Error ? err : new Error(String(err)),
-          turnReady,
-        );
-        // Turn-level failures may also arrive via turn/failed notifications.
+        const error = err instanceof Error ? err : new Error(String(err));
+        this.rejectActiveTurnReady(error, turnReady);
+        this.settleRejectedTurnStart(entry, error, turnReady);
       });
     } else {
-      void turnStart.catch(() => {
-        // Turn-level failures arrive via turn/failed notifications.
+      void turnStart.catch((err: unknown) => {
+        this.settleRejectedTurnStart(entry, err instanceof Error ? err : new Error(String(err)), turnReady);
       });
     }
 
@@ -1156,6 +1230,33 @@ export class CodexSessionImpl implements AgentSession {
       if (timer) clearTimeout(timer);
       if (signal) signal.removeEventListener("abort", onAbort);
     };
+  }
+
+  /**
+   * The app-server rejected this send's `turn/start`, so it started no turn
+   * and no turn/completed will ever settle it: settle it now as failed. A
+   * turn no other send is still waiting on, and that never got an id, is
+   * released too, so the session takes the next send.
+   */
+  private settleRejectedTurnStart(entry: PendingResult, err: Error, turnReady: ActiveTurnReady): void {
+    if (entry.settled) return;
+    entry.settled = true;
+    entry.cleanup?.();
+    const idx = this._pendingResults.indexOf(entry);
+    if (idx >= 0) this._pendingResults.splice(idx, 1);
+    const othersWaiting = this._pendingResults.some((pending) => pending.generation === turnReady.generation);
+    if (!othersWaiting && this._activeTurnReady === turnReady && this._activeTurnId === null) {
+      this.clearActiveTurn(err, turnReady);
+      if (this._state !== "closed") this._state = "idle";
+    }
+    entry.resolve({
+      summary: null,
+      usage: undefined,
+      costUsd: null,
+      status: "failed",
+      errorCode: "turn_start_failed",
+      errorMessage: `Codex rejected the turn: ${err.message}`,
+    });
   }
 
   /**
@@ -1290,6 +1391,40 @@ export class CodexSessionImpl implements AgentSession {
     return this._drainPromise;
   }
 
+  /** The app-server process id. */
+  get pid(): number | null {
+    return this.proc.pid ?? null;
+  }
+
+  /**
+   * Give this app-server process extra skill roots. An app-server that
+   * doesn't know the method (codex-cli before skills/extraRoots/set) runs
+   * the chat without them, and says so on stderr.
+   */
+  private async setSkillRoots(extraRoots: string[]): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      // Bounded: the app-server answers at once, and an unanswered call must
+      // not hold up the session it only adds skills to.
+      await Promise.race([
+        this.rpcRequest("skills/extraRoots/set", { extraRoots }),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`no answer in ${SKILL_ROOTS_TIMEOUT_MS / 1000}s`)), SKILL_ROOTS_TIMEOUT_MS);
+        }),
+      ]);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      try {
+        void this.ctx.onOutput?.(
+          "stderr",
+          `agentex: codex skills/extraRoots/set failed, so this chat has no skillDirs: ${reason}\n`,
+        );
+      } catch { /* swallow */ }
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   close(): Promise<void> {
     if (this._closePromise) return this._closePromise;
     if (this._state === "closed") return Promise.resolve();
@@ -1327,6 +1462,7 @@ export class CodexSessionImpl implements AgentSession {
 
       this.proc.kill("SIGTERM");
     });
+    await cleanupCodexSkills(this.skills);
   }
 
   // -------------------------------------------------------------------------

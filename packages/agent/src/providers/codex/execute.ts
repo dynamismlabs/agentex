@@ -3,13 +3,12 @@ import { observeExecution } from "../../telemetry/integration.js";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ExecutionContext, ExecutionResult } from "../../types.js";
+import type { ExecutionContext, ExecutionResult, ProviderConfig } from "../../types.js";
 import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { translateEndpoint } from "../../utils/endpoint.js";
 import { runChildProcess, deriveErrorCode } from "../../utils/process.js";
 import { detectAuth } from "../../utils/auth.js";
-import { injectWorkspaceSkills } from "../../utils/skills.js";
 import { resolveInstructions } from "../../utils/instructions.js";
 import { createToolNameTracker } from "../../utils/tool-names.js";
 import { prepareWorkspace } from "../../utils/workspace.js";
@@ -96,6 +95,23 @@ async function executeCodexProviderInner(ctx: ExecutionContext): Promise<Executi
   const endpointTx = translateEndpoint("codex", config.endpoint);
   Object.assign(env, endpointTx.env);
   for (const key of endpointTx.unset) delete env[key];
+
+  // A run with skills goes through `codex app-server`, the only way to give
+  // Codex skills for one run without writing them where every session finds
+  // them (see ./skills.ts). Loaded lazily: it pulls in the session module.
+  if (config.skillDirs && config.skillDirs.length > 0) {
+    const { executeCodexOnAppServer } = await import("./app-server-execute.js");
+    return executeCodexOnAppServer(ctx, {
+      runId,
+      startedAt,
+      cwd,
+      model: model ?? null,
+      workspace,
+      billingType: await codexBillingType(config, env),
+      resumeId: codexResumeId(ctx.sessionParams ?? null, cwd),
+    });
+  }
+
   let extra: ReturnType<typeof splitCodexExtraArgs>;
   let mcp: Awaited<ReturnType<typeof prepareCodexMcp>>;
   try {
@@ -118,49 +134,11 @@ async function executeCodexProviderInner(ctx: ExecutionContext): Promise<Executi
     : baseInstructions;
   const fullPrompt = instructions ? `${instructions}\n\n${ctx.prompt}` : ctx.prompt;
 
-  // 4. Inject skills into workspace
-  ctx.onLifecycle?.({ phase: "preparing", step: "skills" });
-  if (config.skillDirs && config.skillDirs.length > 0) {
-    try {
-      await injectWorkspaceSkills(config.skillDirs, cwd);
-    } catch {
-      // Non-fatal
-    }
-  }
-
-  // Detect auth/billing. Codex prefers its stored subscription (`codex login`)
-  // over OPENAI_API_KEY when both exist, so env-only detection would wrongly
-  // predict "api" whenever OPENAI_API_KEY is set. Check the auth.json stat:
-  // if the subscription file is present, billing is "subscription" regardless.
   ctx.onLifecycle?.({ phase: "preparing", step: "auth" });
-  const codexAuthPath = path.join(
-    process.env["CODEX_HOME"] || path.join(os.homedir(), ".codex"),
-    "auth.json",
-  );
-  const hasCodexSubscription = await fs.stat(codexAuthPath).then(
-    (s) => s.isFile(),
-    () => false,
-  );
-  // A custom base URL is external/BYOK billing, not the codex subscription.
-  const billingType = config.endpoint?.baseUrl
-    ? "api"
-    : hasCodexSubscription
-    ? "subscription"
-    : detectAuth("codex", env).billingType;
+  const billingType = await codexBillingType(config, env);
 
   // 4. Determine session resume
-  const sessionParams = ctx.sessionParams ?? null;
-  const sessionId = (() => {
-    if (!sessionParams) return null;
-    const id =
-      (sessionParams["sessionId"] as string | undefined) ??
-      (sessionParams["session_id"] as string | undefined) ??
-      (sessionParams["thread_id"] as string | undefined);
-    if (!id || typeof id !== "string") return null;
-    const sessionCwd = sessionParams["cwd"] as string | undefined;
-    if (sessionCwd && path.resolve(sessionCwd) !== path.resolve(cwd)) return null;
-    return id;
-  })();
+  const sessionId = codexResumeId(ctx.sessionParams ?? null, cwd);
 
   // 5. Build args
   const buildArgs = (resumeSessionId: string | null): string[] => {
@@ -406,4 +384,30 @@ async function executeCodexProviderInner(ctx: ExecutionContext): Promise<Executi
     raw: parsed.finalEvent,
     workspace,
   };
+}
+
+/**
+ * Codex prefers its stored subscription (`codex login`) over OPENAI_API_KEY
+ * when both exist, so env-only detection would wrongly predict "api" whenever
+ * OPENAI_API_KEY is set. If the subscription file is present, billing is
+ * "subscription" regardless. A custom base URL is external/BYOK billing.
+ */
+async function codexBillingType(config: ProviderConfig, env: Record<string, string>): Promise<ExecutionResult["billingType"]> {
+  if (config.endpoint?.baseUrl) return "api";
+  const codexAuthPath = path.join(process.env["CODEX_HOME"] || path.join(os.homedir(), ".codex"), "auth.json");
+  const hasCodexSubscription = await fs.stat(codexAuthPath).then((s) => s.isFile(), () => false);
+  return hasCodexSubscription ? "subscription" : detectAuth("codex", env).billingType;
+}
+
+/** The thread to resume, or null when there is none or it ran in another folder. */
+function codexResumeId(sessionParams: Record<string, unknown> | null, cwd: string): string | null {
+  if (!sessionParams) return null;
+  const id =
+    (sessionParams["sessionId"] as string | undefined) ??
+    (sessionParams["session_id"] as string | undefined) ??
+    (sessionParams["thread_id"] as string | undefined);
+  if (!id || typeof id !== "string") return null;
+  const sessionCwd = sessionParams["cwd"] as string | undefined;
+  if (sessionCwd && path.resolve(sessionCwd) !== path.resolve(cwd)) return null;
+  return id;
 }

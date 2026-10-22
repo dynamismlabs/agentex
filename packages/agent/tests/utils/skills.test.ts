@@ -10,7 +10,6 @@ import {
   resolveNativeSkillsHome,
   resolveNativeSkillsWorkspace,
   ensureSkillSymlink,
-  injectWorkspaceSkills,
   installSkills,
   removeSkills,
   listInstalledSkills,
@@ -258,52 +257,6 @@ describe("ensureSkillSymlink", () => {
 
     const result = await ensureSkillSymlink(sourceDir, target);
     expect(result).toBe("conflict");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// injectWorkspaceSkills (internal, used by the Codex provider)
-// ---------------------------------------------------------------------------
-
-describe("injectWorkspaceSkills", () => {
-  const tmpDirs: string[] = [];
-
-  afterEach(async () => {
-    for (const dir of tmpDirs) {
-      try { await fs.rm(dir, { recursive: true, force: true }); } catch { /* ignore */ }
-    }
-    tmpDirs.length = 0;
-  });
-
-  it("returns null for empty skillDirs", async () => {
-    const result = await injectWorkspaceSkills([], "/tmp/fake-cwd");
-    expect(result).toBeNull();
-  });
-
-  it("creates skills in {cwd}/.agents/skills/", async () => {
-    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "ws-cwd-"));
-    const skillDir = await fs.mkdtemp(path.join(os.tmpdir(), "ws-skill-"));
-    await fs.writeFile(path.join(skillDir, "SKILL.md"), "# Test");
-    tmpDirs.push(cwd, skillDir);
-
-    const result = await injectWorkspaceSkills([skillDir], cwd);
-    expect(result).toBe(path.join(cwd, ".agents", "skills"));
-    expect((await fs.stat(result!)).isDirectory()).toBe(true);
-  });
-
-  it("creates symlinks for skill directories", async () => {
-    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "ws-cwd-"));
-    const skillDir1 = await fs.mkdtemp(path.join(os.tmpdir(), "ws-skill-"));
-    const skillDir2 = await fs.mkdtemp(path.join(os.tmpdir(), "ws-skill-"));
-    tmpDirs.push(cwd, skillDir1, skillDir2);
-
-    const result = await injectWorkspaceSkills([skillDir1, skillDir2], cwd);
-    expect(result).not.toBeNull();
-
-    const link1 = path.join(result!, path.basename(skillDir1));
-    const link2 = path.join(result!, path.basename(skillDir2));
-    expect((await fs.lstat(link1)).isSymbolicLink()).toBe(true);
-    expect((await fs.lstat(link2)).isSymbolicLink()).toBe(true);
   });
 });
 
