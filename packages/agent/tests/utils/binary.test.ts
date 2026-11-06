@@ -92,3 +92,22 @@ describe("ensureCommandResolvable", () => {
     expect(result.bin).toContain("echo");
   });
 });
+
+describe("Windows npm shims", () => {
+  it("resolves dp0 shims with spaces and a cjs extension, including overrides", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "agentex windows "));
+    const platform = process.platform;
+    try {
+      const entry = path.join(directory, "entry with spaces.cjs");
+      const shim = path.join(directory, "tool.cmd");
+      await fs.writeFile(entry, "");
+      await fs.writeFile(shim, '@echo off\r\nnode "%dp0%\\entry with spaces.cjs" %*\r\n');
+      Object.defineProperty(process, "platform", { value: "win32" });
+      expect(await resolveWindowsCmdShim(shim)).toEqual({ bin: "node", prefixArgs: [entry] });
+      expect(await findBinary("tool", shim)).toEqual({ bin: "node", prefixArgs: [entry] });
+    } finally {
+      Object.defineProperty(process, "platform", { value: platform });
+      await fs.rm(directory, { recursive: true, force: true });
+    }
+  });
+});

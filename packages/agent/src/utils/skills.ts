@@ -479,7 +479,7 @@ export async function ensureSkillSymlink(
     }
     return "conflict";
   } catch {
-    await fs.symlink(source, target, "dir");
+    await fs.symlink(process.platform === "win32" ? path.resolve(source) : source, target, process.platform === "win32" ? "junction" : "dir");
     return "created";
   }
 }
@@ -512,7 +512,7 @@ export async function buildSkillsDir(skillDirs: string[], runtime: SkillRuntime)
   for (const dir of skillDirs) {
     const name = path.basename(dir);
     try {
-      await fs.symlink(path.resolve(dir), path.join(skillsRoot, name), "dir");
+      await fs.symlink(path.resolve(dir), path.join(skillsRoot, name), process.platform === "win32" ? "junction" : "dir");
     } catch (err) {
       console.warn(`Failed to symlink skill "${name}": ${err}`);
     }

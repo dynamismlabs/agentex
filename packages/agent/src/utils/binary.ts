@@ -94,7 +94,7 @@ export async function resolveWindowsCmdShim(cmdPath: string): Promise<ResolvedBi
   try {
     const content = await fs.readFile(cmdPath, "utf-8");
     // Match patterns like: "%dp0%\node_modules\...\.js" or "%~dp0\...\entry.js"
-    const match = content.match(/%(?:~dp0|dp0)[\\\/]([^\s"]+\.js)/i);
+    const match = content.match(/%(?:~dp0|dp0%)[\\\/]?([^"\r\n]+?\.[cm]?js)(?=["\s]|$)/i);
     if (match?.[1]) {
       const dir = path.dirname(cmdPath);
       const jsPath = path.resolve(dir, match[1]);
@@ -112,6 +112,10 @@ export async function findBinary(name: string, configOverride?: string): Promise
   // 1. Config override
   if (configOverride) {
     if (await fileExists(configOverride)) {
+      if (process.platform === "win32" && /\.cmd$/i.test(configOverride)) {
+        const resolved = await resolveWindowsCmdShim(configOverride);
+        if (resolved) return resolved;
+      }
       return { bin: configOverride, prefixArgs: [] };
     }
     throw new Error(

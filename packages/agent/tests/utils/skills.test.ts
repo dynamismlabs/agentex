@@ -877,3 +877,26 @@ describe("removeLegacySkillLinks", () => {
     await expect(removeLegacySkillLinks("/nonexistent/legacy/skills", ["/x/alpha"])).resolves.toBeUndefined();
   });
 });
+
+describe("Windows skill links", () => {
+  it("creates usable links for a normal Windows account", async () => {
+    const platform = process.platform;
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "agentex-windows-skills-"));
+    let generated: string | undefined;
+    try {
+      const source = path.join(directory, "example");
+      const target = path.join(directory, "linked");
+      await fs.mkdir(source);
+      await fs.writeFile(path.join(source, "SKILL.md"), "# Fixture");
+      Object.defineProperty(process, "platform", { value: "win32" });
+      expect(await ensureSkillSymlink(source, target)).toBe("created");
+      expect(await ensureSkillSymlink(source, target)).toBe("skipped");
+      generated = await buildSkillsDir([source], "claude");
+      expect(await fs.readFile(path.join(generated, ".claude/skills/example/SKILL.md"), "utf8")).toBe("# Fixture");
+    } finally {
+      Object.defineProperty(process, "platform", { value: platform });
+      if (generated) await cleanupSkillsDir(generated);
+      await fs.rm(directory, { recursive: true, force: true });
+    }
+  });
+});
