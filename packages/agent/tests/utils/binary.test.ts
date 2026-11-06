@@ -94,6 +94,16 @@ describe("ensureCommandResolvable", () => {
 });
 
 describe("Windows npm shims", () => {
+  it("resolves native npm executables directly", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "agentex native "));
+    try {
+      const entry = path.join(directory, "claude with spaces.exe");
+      const shim = path.join(directory, "claude.cmd");
+      await fs.writeFile(entry, "");
+      await fs.writeFile(shim, '@echo off\r\n"%dp0%\\claude with spaces.exe" %*\r\n');
+      expect(await resolveWindowsCmdShim(shim)).toEqual({ bin: entry, prefixArgs: [] });
+    } finally { await fs.rm(directory, { recursive: true, force: true }); }
+  });
   it("resolves dp0 shims with spaces and a cjs extension, including overrides", async () => {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "agentex windows "));
     const platform = process.platform;

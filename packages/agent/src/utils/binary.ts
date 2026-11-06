@@ -93,13 +93,15 @@ function runWhich(name: string): Promise<string | null> {
 export async function resolveWindowsCmdShim(cmdPath: string): Promise<ResolvedBinary | null> {
   try {
     const content = await fs.readFile(cmdPath, "utf-8");
-    // Match patterns like: "%dp0%\node_modules\...\.js" or "%~dp0\...\entry.js"
-    const match = content.match(/%(?:~dp0|dp0%)[\\\/]?([^"\r\n]+?\.[cm]?js)(?=["\s]|$)/i);
+    // npm shims invoke either a JS entry with Node or a native executable.
+    // Prefer JS so the wrapper's optional local node.exe is never the target.
+    const match = content.match(/%(?:~dp0|dp0%)[\\\/]?([^"\r\n]+?\.[cm]?js)(?=["\s]|$)/i)
+      ?? content.match(/%(?:~dp0|dp0%)[\\\/]?([^"\r\n]+?\.exe)(?=["\s]|$)/i);
     if (match?.[1]) {
       const dir = path.dirname(cmdPath);
-      const jsPath = path.resolve(dir, match[1]);
-      if (await fileExists(jsPath)) {
-        return { bin: "node", prefixArgs: [jsPath] };
+      const entry = path.resolve(dir, match[1]);
+      if (await fileExists(entry)) {
+        return /\.exe$/i.test(entry) ? { bin: entry, prefixArgs: [] } : { bin: "node", prefixArgs: [entry] };
       }
     }
   } catch {
