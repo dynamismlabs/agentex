@@ -1,3 +1,15 @@
+## Unreleased Windows compatibility
+
+- Windows npm shims resolve `%dp0%` and `%~dp0` paths with spaces, JavaScript
+  entries (`.js`, `.mjs`, `.cjs`) and native `.exe` entries. Configured `.cmd`
+  overrides use the same resolver. Native executables run directly, including
+  current Claude Code npm packages.
+- Skill directory links use absolute Windows junctions, so creating them does
+  not require Developer Mode or administrator privileges.
+- Verified with the source suite (1,771 passed, six skipped) and Ri's hosted
+  Windows runtime checks using Codex 0.167.0 and Claude Code 2.1.319. Streaming
+  chat used a stand-in Claude protocol, without provider credentials.
+
 ## 0.0.48 — Codex chats stop writing skills into the project
 
 - **Codex `skillDirs` no longer go in the project.** Codex runs and sessions linked a chat's `skillDirs` into `{cwd}/.agents/skills` and never removed them, so they turned up in the project's git status, got committed (Ri's repo carries five), reached every later Codex session in that folder and every worktree made from it, and two chats sharing a folder saw each other's skills. Now each session stages its skills in a temporary folder of links and hands it to `codex app-server` with `skills/extraRoots/set` before its thread starts or resumes, and removes it when the session closes or its process exits. Verified live against codex-cli 0.163.0: a root's linked and real skill folders are used, nothing is written to the project or `~/.codex/config.toml`, another app-server in the same folder sees none of them, and two concurrent sessions in one git repo each used only their own skills while `git status` stayed empty.
