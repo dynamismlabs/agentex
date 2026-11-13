@@ -16,6 +16,7 @@ import { assertSessionRecord, createSessionRecord, MalformedSessionRecordError }
 import { acquireOpenCodeRuntime } from "./runtime.js";
 import { opencodeSessionCodec } from "./codec.js";
 import { createOpenCodeSession } from "./http-session.js";
+import { normalizeV2MessageToEnvelope, rec as v2Rec, serverApiVersion, v2DataArray } from "./v2.js";
 import {
   assistantTextFromParts,
   incompleteTurnMessage,
@@ -271,19 +272,27 @@ export async function collectHistory(
   mapping: {
     includeUserMessages?: boolean;
     missingSession?: "empty" | "error";
+    apiVersion?: 1 | 2;
   } = {},
 ): Promise<CollectedHistoryEvent[]> {
+  const isV2 = mapping.apiVersion === 2;
   const after = options?.mode === "bounded_full_resync" ? null : decodeCheckpoint(options?.after);
   const pages: MessageEnvelope[][] = [];
-  let before: string | null = null;
+  let cursor: string | null = null;
   let foundMessage = after === null;
   let collectedMessages = 0;
   let collectedBytes = 0;
 
   for (let pageIndex = 0; pageIndex < MAX_PAGES; pageIndex += 1) {
     const query = new URLSearchParams({ limit: String(PAGE_SIZE) });
-    if (before) query.set("before", before);
-    const response = await client.request(`/session/${encodeURIComponent(sessionId)}/message?${query}`);
+    if (isV2) {
+      if (cursor) query.set("cursor", cursor);
+      else query.set("order", "desc");
+    } else if (cursor) {
+      query.set("before", cursor);
+    }
+    const basePath = isV2 ? "/api/session" : "/session";
+    const response = await client.request(`${basePath}/${encodeURIComponent(sessionId)}/message?${query}`);
     if (response.status === 404) {
       if (mapping.missingSession === "error") {
         throw new OpenCodeHistorySourceMissingError(sessionId);
@@ -294,10 +303,14 @@ export async function collectHistory(
     const text = await response.text();
     collectedBytes += Buffer.byteLength(text);
     const parsed = JSON.parse(text) as unknown;
-    const page = Array.isArray(parsed)
-      ? parsed.map((value) => rec(value) as MessageEnvelope).filter(Boolean)
-      : [];
-    collectedMessages += page.length;
+    const rawItems = isV2 ? v2DataArray(parsed) : (Array.isArray(parsed) ? parsed : []);
+    const normalized = isV2
+      ? rawItems
+          .map((value) => normalizeV2MessageToEnvelope(value) as MessageEnvelope | null)
+          .filter((value): value is MessageEnvelope => value !== null)
+      : rawItems.map((value) => rec(value) as MessageEnvelope).filter(Boolean);
+    const page = isV2 ? normalized.reverse() : normalized;
+    collectedMessages += rawItems.length;
     if (collectedBytes > MAX_BYTES || collectedMessages > MAX_MESSAGES) {
       throw new OpenCodeHistoryResyncLimitError();
     }
@@ -306,10 +319,16 @@ export async function collectHistory(
       foundMessage = true;
       break;
     }
-    if (page.length < PAGE_SIZE) break;
-    const next = response.headers.get("x-next-cursor");
-    if (!next || next === before) break;
-    before = next;
+    if (isV2) {
+      const next = string(v2Rec(v2Rec(parsed)["cursor"])["next"]);
+      if (!next || next === cursor || rawItems.length === 0) break;
+      cursor = next;
+    } else {
+      if (page.length < PAGE_SIZE) break;
+      const next = response.headers.get("x-next-cursor");
+      if (!next || next === cursor) break;
+      cursor = next;
+    }
   }
 
   if (!foundMessage) throw new OpenCodeHistoryCheckpointNotFoundError();
@@ -386,11 +405,21 @@ export async function attachOpenCodeHistory(
   const sessionId = params["sessionId"] as string;
   const cwd = typeof params["cwd"] === "string" ? params["cwd"] : record.cwd ?? process.cwd();
   const runtime = await acquireOpenCodeRuntime({ cwd, env: opts?.env, config: opts?.config });
+  const apiVersion = serverApiVersion(runtime.server);
+  const isV2 = apiVersion === 2;
   let lastTurn: LastTurnStatus = "unknown";
   try {
-    const response = await runtime.server.client.request(`/session/${encodeURIComponent(sessionId)}/message?limit=1`);
+    const path = isV2
+      ? `/api/session/${encodeURIComponent(sessionId)}/message?limit=1&order=desc`
+      : `/session/${encodeURIComponent(sessionId)}/message?limit=1`;
+    const response = await runtime.server.client.request(path);
     if (response.ok) {
-      const messages = await response.json() as MessageEnvelope[];
+      const payload = await response.json() as unknown;
+      const messages = isV2
+        ? v2DataArray(payload)
+            .map((value) => normalizeV2MessageToEnvelope(value) as MessageEnvelope | null)
+            .filter((value): value is MessageEnvelope => value !== null)
+        : (Array.isArray(payload) ? payload as MessageEnvelope[] : []);
       const info = messages.at(-1)?.info;
       lastTurn = info
         ? (info["finish"] && !info["error"] ? "completed" : "interrupted")
@@ -415,7 +444,7 @@ export async function attachOpenCodeHistory(
     catchUp(options) {
       return {
         async *[Symbol.asyncIterator](): AsyncIterator<HistoryCatchUpYield> {
-          for (const yielded of await collectHistory(runtime.server.client, sessionId, options)) {
+          for (const yielded of await collectHistory(runtime.server.client, sessionId, options, { apiVersion })) {
             // Known-session catch-up deliberately excludes user prompts. The
             // host already owns them. `savedHistory.read()` opts in to users
             // when importing a conversation the host did not create.

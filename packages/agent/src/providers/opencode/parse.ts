@@ -1,4 +1,5 @@
 import type { BaseStreamEventFields, StreamEvent } from "../../types.js";
+import { v2ErrorMessage, v2ToolContentText } from "./v2.js";
 
 const PROVIDER_TYPE = "opencode";
 
@@ -95,14 +96,14 @@ export function parseOpenCodeJsonl(stdout: string): OpenCodeParsedResult {
       const part = parseObject(event["part"]);
       const state = parseObject(part["state"]);
       if (asString(state["status"], "") === "error") {
-        const text = asString(state["error"], "").trim();
+        const text = v2ErrorMessage(state["error"]).trim();
         if (text) errors.push(text);
       }
       continue;
     }
 
     if (type === "error") {
-      const text = asString(event["message"] as string ?? event["error"] as string, "").trim();
+      const text = (asString(event["message"], "") || v2ErrorMessage(event["error"])).trim();
       if (text) errors.push(text);
       continue;
     }
@@ -143,7 +144,9 @@ export function parseOpenCodeStreamLine(line: string): StreamEvent | null {
         type: "tool_result",
         toolCallId: asString(part["id"], "") || asString(part["tool_use_id"], "") || null,
         toolName: name || null,
-        content: status === "error" ? asString(state["error"], "") : asString(state["result"], ""),
+        content: status === "error"
+          ? v2ErrorMessage(state["error"])
+          : (asString(state["result"], "") || v2ToolContentText(state["content"]) || ""),
         isError: status === "error",
         exitCode: null,
         ...base,
