@@ -20,7 +20,7 @@ import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { uuidv7 } from "../../utils/uuid.js";
 import { acquireOpenCodeServer, type OpenCodeServerHandle } from "./server.js";
-import type { OpenCodeClient } from "./client.js";
+import { OpenCodeHttpError, type OpenCodeClient } from "./client.js";
 import { createSessionRecord } from "../../sessions/record.js";
 import { opencodeSessionCodec } from "./codec.js";
 import { prepareOpenCodeSkillConfig } from "./skill-config.js";
@@ -33,6 +33,26 @@ import {
   usageFromMessage,
   type OcBaseInfo,
 } from "./event-parse.js";
+import {
+  normalizeV2MessageToEnvelope,
+  serverApiVersion,
+  v2DataArray,
+  v2DataRecord,
+  v2ErrorMessage,
+  v2ToolContentText,
+} from "./v2.js";
+
+interface V2TurnOutcome {
+  status: "succeeded" | "failed" | "interrupted" | "idle";
+  error?: unknown;
+  reason?: string;
+}
+
+interface V2TurnWaiter {
+  promise: Promise<V2TurnOutcome>;
+  resolve: (value: V2TurnOutcome) => void;
+  started: boolean;
+}
 
 function str(v: unknown): string | null {
   return typeof v === "string" && v.length > 0 ? v : null;
@@ -85,6 +105,8 @@ class OpenCodeSession implements AgentSession {
   private readonly _seenTextLen = new Map<string, number>();
   private readonly _emittedToolCall = new Set<string>();
   private readonly _emittedToolResult = new Set<string>();
+  private readonly _v2ToolNames = new Map<string, string>();
+  private _v2TurnWaiter: V2TurnWaiter | null = null;
   /**
    * messageID → role, learned from `message.updated` SSE frames. Lets `emitPart`
    * drop a user message's own text part, which opencode streams once a turn is
@@ -94,7 +116,7 @@ class OpenCodeSession implements AgentSession {
   private _sse: AbortController | null = null;
   private readonly _handledInput = new Set<string>();
   private readonly _inputInFlight = new Set<string>();
-  private readonly _inputReplies = new Map<string, { path: string; body?: Record<string, unknown> }>();
+  private readonly _inputReplies = new Map<string, { path: string; method?: string; body?: Record<string, unknown> }>();
   private readonly _inputAbort = new AbortController();
   private _pendingPoll: ReturnType<typeof setInterval> | null = null;
   private _skillConfigCleanup: (() => Promise<void>) | null = null;
@@ -122,6 +144,23 @@ class OpenCodeSession implements AgentSession {
     return this._state;
   }
 
+  private get isV2(): boolean {
+    return serverApiVersion(this.server) === 2;
+  }
+
+  private v2ModelRef(): Record<string, unknown> | null {
+    if (!this.model) return null;
+    return {
+      providerID: this.model.providerID,
+      id: this.model.modelID,
+      ...(this.ctx.config?.modelVariant ? { variant: this.ctx.config.modelVariant } : {}),
+    };
+  }
+
+  private selectedAgent(): string | undefined {
+    return this.ctx.config?.planMode ? "plan" : (this.ctx.config?.modeId ?? this.ctx.config?.mode);
+  }
+
   async connect(): Promise<void> {
     const config = this.ctx.config ?? {};
     const resolved = await findBinary("opencode", config.command);
@@ -146,7 +185,37 @@ class OpenCodeSession implements AgentSession {
     // pooled `opencode serve` process leaks (refCount stuck at 1 forever).
     try {
       const resumeId = readResumeId(this.ctx.sessionParams);
-      if (resumeId) {
+      if (this.isV2) {
+        const modelRef = this.v2ModelRef();
+        const agent = this.selectedAgent();
+        if (resumeId) {
+          this._sessionId = resumeId;
+          if (modelRef) {
+            await this.client.ok(`/api/session/${encodeURIComponent(resumeId)}/model`, {
+              method: "POST",
+              body: JSON.stringify({ model: modelRef }),
+            });
+          }
+          if (agent) {
+            await this.client.ok(`/api/session/${encodeURIComponent(resumeId)}/agent`, {
+              method: "POST",
+              body: JSON.stringify({ agent }),
+            });
+          }
+        } else {
+          const createBody: Record<string, unknown> = {};
+          if (modelRef) createBody["model"] = modelRef;
+          if (agent) createBody["agent"] = agent;
+          const res = await this.client.request("/api/session", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(createBody),
+          });
+          if (!res.ok) throw new Error(`opencode: failed to create session (${res.status})`);
+          const data = v2DataRecord(await res.json());
+          this._sessionId = str(data["id"]);
+        }
+      } else if (resumeId) {
         this._sessionId = resumeId;
       } else {
         const res = await this.client.request("/session", {
@@ -192,7 +261,7 @@ class OpenCodeSession implements AgentSession {
 
   private async startSse(signal: AbortSignal): Promise<void> {
     if (!this.client) throw new Error("OpenCode client is unavailable");
-    const response = await this.client.request("/global/event", { signal });
+    const response = await this.client.request(this.isV2 ? "/api/event" : "/global/event", { signal });
     if (!response.ok || !response.body) {
       throw new Error(`opencode: failed to establish event stream (${response.status})`);
     }
@@ -241,6 +310,11 @@ class OpenCodeSession implements AgentSession {
     } catch {
       return;
     }
+    if (this.isV2) {
+      const event = rec(parsed);
+      if (event) await this.handleV2Sse(event);
+      return;
+    }
     const payload = rec(rec(parsed)?.["payload"]);
     if (!payload) return;
     if (payload["type"] === "permission.asked" || payload["type"] === "permission.updated") {
@@ -271,8 +345,158 @@ class OpenCodeSession implements AgentSession {
     await this.emitPart(part);
   }
 
+  private async handleV2Sse(event: Record<string, unknown>): Promise<void> {
+    const type = str(event["type"]);
+    const data = rec(event["data"]);
+    if (!type || !data) return;
+
+    if (type === "permission.asked") {
+      if (str(data["sessionID"]) === this._sessionId) {
+        await this.handlePermission(data);
+      }
+      return;
+    }
+    if (type === "form.created") {
+      const form = rec(data["form"]);
+      if (form && str(form["sessionID"]) === this._sessionId) {
+        await this.handleForm(form);
+      }
+      return;
+    }
+
+    if (str(data["sessionID"]) !== this._sessionId) return;
+
+    if (type === "session.execution.started") {
+      if (this._v2TurnWaiter) this._v2TurnWaiter.started = true;
+      return;
+    }
+    if (type === "session.execution.succeeded") {
+      this._v2TurnWaiter?.resolve({ status: "succeeded" });
+      return;
+    }
+    if (type === "session.execution.failed") {
+      this._v2TurnWaiter?.resolve({ status: "failed", error: data["error"] });
+      return;
+    }
+    if (type === "session.execution.interrupted") {
+      this._v2TurnWaiter?.resolve({ status: "interrupted", reason: str(data["reason"]) ?? undefined });
+      return;
+    }
+    if (type === "session.idle") {
+      if (this._v2TurnWaiter?.started) this._v2TurnWaiter.resolve({ status: "idle" });
+      return;
+    }
+
+    if (!this._turnActive) return;
+
+    const nowIso = new Date().toISOString();
+    const messageId = str(data["assistantMessageID"]);
+    const base = {
+      timestamp: nowIso,
+      providerType: "opencode",
+      sessionId: this._sessionId,
+      messageId,
+      turnId: null,
+      parentToolCallId: null,
+      raw: event,
+    };
+
+    if (type === "session.text.delta") {
+      const delta = typeof data["delta"] === "string" ? data["delta"] : "";
+      if (!delta) return;
+      const ordinal = num(data["ordinal"]);
+      await this.emit({
+        type: "assistant",
+        text: delta,
+        eventId: messageId && ordinal !== null ? `${messageId}:part:${ordinal}` : null,
+        ...base,
+      });
+      return;
+    }
+    if (type === "session.reasoning.delta") {
+      const delta = typeof data["delta"] === "string" ? data["delta"] : "";
+      if (!delta) return;
+      const ordinal = num(data["ordinal"]);
+      await this.emit({
+        type: "thinking",
+        text: delta,
+        eventId: messageId && ordinal !== null ? `${messageId}:part:${ordinal}` : null,
+        ...base,
+      });
+      return;
+    }
+    if (type === "session.tool.input.started") {
+      const toolId = str(data["id"]);
+      const toolName = str(data["name"]);
+      if (toolId && toolName) this._v2ToolNames.set(toolId, toolName);
+      return;
+    }
+    if (type === "session.tool.called") {
+      const callId = str(data["id"]);
+      if (!callId || this._emittedToolCall.has(callId)) return;
+      this._emittedToolCall.add(callId);
+      const name = this._v2ToolNames.get(callId) ?? "tool";
+      await this.emit({
+        type: "tool_call",
+        toolCallId: callId,
+        name,
+        input: data["input"],
+        eventId: `${callId}:call`,
+        ...base,
+      });
+      return;
+    }
+    if (type === "session.tool.success" || type === "session.tool.failed") {
+      const callId = str(data["id"]);
+      if (!callId || this._emittedToolResult.has(callId)) return;
+      const name = this._v2ToolNames.get(callId) ?? null;
+      if (!this._emittedToolCall.has(callId)) {
+        this._emittedToolCall.add(callId);
+        await this.emit({
+          type: "tool_call",
+          toolCallId: callId,
+          name: name ?? "tool",
+          input: undefined,
+          eventId: `${callId}:call`,
+          ...base,
+        });
+      }
+      this._emittedToolResult.add(callId);
+      const isError = type === "session.tool.failed";
+      const content = isError
+        ? (v2ErrorMessage(data["error"]) || v2ToolContentText(data["content"]) || "Tool error")
+        : (v2ToolContentText(data["content"]) ?? "");
+      await this.emit({
+        type: "tool_result",
+        toolCallId: callId,
+        toolName: name,
+        content,
+        isError,
+        exitCode: null,
+        eventId: `${callId}:result`,
+        ...base,
+      });
+    }
+  }
+
   private async reconcilePendingInput(): Promise<void> {
     if (!this.client || !this._sessionId || this._state === "closed") return;
+    if (this.isV2) {
+      const encodedId = encodeURIComponent(this._sessionId);
+      const [permissionsPayload, formsPayload] = await Promise.all([
+        this.client.json<unknown>(`/api/session/${encodedId}/permission`).catch(() => []),
+        this.client.json<unknown>(`/api/session/${encodedId}/form`).catch(() => []),
+      ]);
+      for (const value of v2DataArray(permissionsPayload)) {
+        const request = rec(value);
+        if (request && str(request["sessionID"]) === this._sessionId) await this.handlePermission(request);
+      }
+      for (const value of v2DataArray(formsPayload)) {
+        const form = rec(value);
+        if (form && str(form["sessionID"]) === this._sessionId) await this.handleForm(form);
+      }
+      return;
+    }
     const [permissions, questions] = await Promise.all([
       this.client.json<unknown[]>("/permission").catch(() => []),
       this.client.json<unknown[]>("/question").catch(() => []),
@@ -329,36 +553,68 @@ class OpenCodeSession implements AgentSession {
       let reply = this._inputReplies.get(id);
       if (!reply) {
         this._state = "waiting_for_approval";
-        const permission = str(request["permission"]) ?? "Tool";
+        const permission = str(request["permission"]) ?? str(request["action"]) ?? "Tool";
+        const resourceList = Array.isArray(request["patterns"])
+          ? request["patterns"]
+          : Array.isArray(request["resources"])
+            ? request["resources"]
+            : [];
+        const resourceText = resourceList.filter((item): item is string => typeof item === "string").join(", ");
+        const msgText = str(request["message"]);
+        const description = [msgText, resourceText].filter(Boolean).join(": ") || undefined;
         const response = await this.hostInput({
           toolName: permission,
           input: rec(request["metadata"]) ?? {},
           toolUseId: id,
           title: permission,
-          description: Array.isArray(request["patterns"])
-            ? request["patterns"].filter((item): item is string => typeof item === "string").join(", ")
-            : undefined,
+          description,
         });
-        reply = {
-          path: `/permission/${encodeURIComponent(id)}/reply`,
-          body: {
-            reply: response.allow ? "once" : "reject",
-            ...(response.message ? { message: response.message } : {}),
-          },
-        };
+        reply = this.isV2
+          ? {
+              path: `/api/session/${encodeURIComponent(this._sessionId!)}/permission/${encodeURIComponent(id)}/reply`,
+              body: {
+                decision: response.allow ? "once" : "reject",
+                ...(response.message ? { message: response.message } : {}),
+              },
+            }
+          : {
+              path: `/permission/${encodeURIComponent(id)}/reply`,
+              body: {
+                reply: response.allow ? "once" : "reject",
+                ...(response.message ? { message: response.message } : {}),
+              },
+            };
         this._inputReplies.set(id, reply);
       }
-      await this.client.ok(reply.path, {
-        method: "POST",
-        body: JSON.stringify(reply.body ?? {}),
-      });
-      this._handledInput.add(id);
-      this._inputReplies.delete(id);
-    } catch {
-      // Keep the cached host decision so reconciliation retries only the reply.
+      await this.deliverInputReply(id, reply);
     } finally {
       this._inputInFlight.delete(id);
       this.restoreAfterInput();
+    }
+  }
+
+  private async deliverInputReply(
+    id: string,
+    reply: { path: string; method?: string; body?: Record<string, unknown> },
+  ): Promise<void> {
+    if (!this.client) return;
+    try {
+      await this.client.ok(reply.path, {
+        method: reply.method ?? "POST",
+        ...(reply.body ? { body: JSON.stringify(reply.body) } : {}),
+      });
+      this._handledInput.add(id);
+      this._inputReplies.delete(id);
+    } catch (err) {
+      if (err instanceof OpenCodeHttpError) {
+        if (err.status === 404 || err.status === 409 || err.status === 410) {
+          this._handledInput.add(id);
+          this._inputReplies.delete(id);
+        } else if (err.status >= 400 && err.status < 500 && err.status !== 408 && err.status !== 429) {
+          this._inputReplies.delete(id);
+        }
+      }
+      // Keep the cached host decision on transient errors so reconciliation retries only the reply.
     }
   }
 
@@ -404,14 +660,114 @@ class OpenCodeSession implements AgentSession {
         }
         this._inputReplies.set(id, reply);
       }
-      await this.client.ok(reply.path, {
-        method: "POST",
-        ...(reply.body ? { body: JSON.stringify(reply.body) } : {}),
-      });
-      this._handledInput.add(id);
-      this._inputReplies.delete(id);
-    } catch {
-      // Keep the cached host decision so reconciliation retries only the reply.
+      await this.deliverInputReply(id, reply);
+    } finally {
+      this._inputInFlight.delete(id);
+      this.restoreAfterInput();
+    }
+  }
+
+  private async handleForm(form: Record<string, unknown>): Promise<void> {
+    const id = str(form["id"]);
+    if (!id || this._handledInput.has(id) || this._inputInFlight.has(id)
+      || str(form["sessionID"]) !== this._sessionId || !this.client) return;
+    this._inputInFlight.add(id);
+    try {
+      let reply = this._inputReplies.get(id);
+      if (!reply) {
+        this._state = "waiting_for_input";
+        const rawFields = Array.isArray(form["fields"]) ? form["fields"] : [];
+        const fieldMetas: Array<{
+          key: string;
+          kind: string;
+          questionText: string;
+          header: string;
+          labelToValue: Map<string, string>;
+        }> = [];
+        const questions = rawFields.map((value) => {
+          const field = rec(value) ?? {};
+          const key = str(field["key"]) ?? "answer";
+          const kind = str(field["type"]) ?? "string";
+          const questionText = str(field["title"]) ?? str(field["description"]) ?? key;
+          const labelToValue = new Map<string, string>();
+          let options: Array<{ label: string; description: string }> = [];
+          if ((kind === "multiselect" || kind === "string") && Array.isArray(field["options"])) {
+            options = field["options"]
+              .map((rawOpt) => {
+                const opt = rec(rawOpt) ?? {};
+                const optLabel = str(opt["label"]) ?? str(opt["value"]) ?? "";
+                const optValue = str(opt["value"]) ?? optLabel;
+                if (optLabel && optValue) labelToValue.set(optLabel, optValue);
+                return { label: optLabel, description: str(opt["description"]) ?? "" };
+              })
+              .filter((opt) => opt.label);
+          } else if (kind === "boolean") {
+            options = [
+              { label: "Yes", description: "" },
+              { label: "No", description: "" },
+            ];
+          }
+          fieldMetas.push({ key, kind, questionText, header: key, labelToValue });
+          const maxItems = num(field["maxItems"]);
+          return {
+            question: questionText,
+            header: key,
+            options,
+            ...(kind === "multiselect" && (maxItems === null || maxItems > 1) ? { multiSelect: true } : {}),
+          };
+        });
+        const response = await this.hostInput({
+          toolName: "AskUserQuestion",
+          input: { questions },
+          toolUseId: id,
+        });
+        const encodedSession = encodeURIComponent(this._sessionId!);
+        const encodedForm = encodeURIComponent(id);
+        if (!response.allow) {
+          reply = {
+            path: `/api/session/${encodedSession}/form/${encodedForm}`,
+            method: "DELETE",
+          };
+        } else {
+          const answerMap = rec(response.updatedInput?.["answers"]) ?? {};
+          const answer: Record<string, unknown> = {};
+          for (const meta of fieldMetas) {
+            const raw = answerMap[meta.questionText] ?? answerMap[meta.header] ?? answerMap[meta.key];
+            if (meta.kind === "multiselect") {
+              const list = Array.isArray(raw)
+                ? raw.filter((item): item is string => typeof item === "string")
+                : typeof raw === "string" && raw.length > 0 ? [raw] : [];
+              answer[meta.key] = list.map((item) => meta.labelToValue.get(item) ?? item);
+            } else if (meta.kind === "boolean") {
+              const first = Array.isArray(raw) ? raw[0] : raw;
+              answer[meta.key] = first === true || /^(yes|true|1)$/i.test(String(first ?? ""));
+            } else if (meta.kind === "number" || meta.kind === "integer") {
+              const first = Array.isArray(raw) ? raw[0] : raw;
+              const parsedNum = typeof first === "number" ? first : Number(first);
+              if (Number.isFinite(parsedNum)) {
+                answer[meta.key] = meta.kind === "integer" ? Math.trunc(parsedNum) : parsedNum;
+              }
+            } else {
+              const strVal = Array.isArray(raw)
+                ? (raw.length === 1 ? raw[0] : raw.join(", "))
+                : raw;
+              if (typeof strVal === "string") {
+                answer[meta.key] = meta.labelToValue.get(strVal) ?? strVal;
+              } else if (strVal !== undefined) {
+                const asString = String(strVal);
+                answer[meta.key] = meta.labelToValue.get(asString) ?? asString;
+              }
+            }
+          }
+          reply = {
+            path: `/api/session/${encodedSession}/form/${encodedForm}/reply`,
+            method: "POST",
+            body: { answer },
+          };
+        }
+        this._inputReplies.set(id, reply);
+      }
+      await this.deliverInputReply(id, reply);
     } finally {
       this._inputInFlight.delete(id);
       this.restoreAfterInput();
@@ -521,6 +877,7 @@ class OpenCodeSession implements AgentSession {
     this._seenTextLen.clear();
     this._emittedToolCall.clear();
     this._emittedToolResult.clear();
+    this._v2ToolNames.clear();
 
     const ac = new AbortController();
     this._activeController = ac;
@@ -533,7 +890,7 @@ class OpenCodeSession implements AgentSession {
     const body: Record<string, unknown> = { parts: [{ type: "text", text: message }] };
     if (this.model) body["model"] = this.model;
     if (this.ctx.config?.modelVariant) body["variant"] = this.ctx.config.modelVariant;
-    const agent = this.ctx.config?.planMode ? "plan" : (this.ctx.config?.modeId ?? this.ctx.config?.mode);
+    const agent = this.selectedAgent();
     if (agent) body["agent"] = agent;
 
     let outcome: TurnResult;
@@ -547,6 +904,11 @@ class OpenCodeSession implements AgentSession {
           errorCode: "runtime_reconfigured",
           errorMessage: "OpenCode runtime configuration changed. Start a fresh session.",
         };
+      } else if (this.isV2) {
+        this._pendingPoll = setInterval(() => void this.reconcilePendingInput(), 750);
+        const v2Result = await this.runV2Turn(message, ac.signal);
+        outcome = v2Result.outcome;
+        terminalRaw = v2Result.terminalRaw;
       } else {
         this._pendingPoll = setInterval(() => void this.reconcilePendingInput(), 750);
         const res = await this.client!.request(`/session/${this._sessionId}/message`, {
@@ -606,6 +968,7 @@ class OpenCodeSession implements AgentSession {
         };
       }
     } finally {
+      this._v2TurnWaiter = null;
       if (this._pendingPoll) clearInterval(this._pendingPoll);
       this._pendingPoll = null;
       if (timer) clearTimeout(timer);
@@ -615,6 +978,230 @@ class OpenCodeSession implements AgentSession {
     await this.emitTerminal(outcome, terminalRaw, startedAt);
     this.finishTurn();
     return outcome;
+  }
+
+  private async runV2Turn(
+    message: string,
+    signal: AbortSignal,
+  ): Promise<{ outcome: TurnResult; terminalRaw: Record<string, unknown> }> {
+    const encodedId = encodeURIComponent(this._sessionId!);
+    let resolveWaiter!: (value: V2TurnOutcome) => void;
+    const waiterPromise = new Promise<V2TurnOutcome>((resolve) => {
+      resolveWaiter = resolve;
+    });
+    this._v2TurnWaiter = { promise: waiterPromise, resolve: resolveWaiter, started: false };
+
+    const promptRes = await this.client!.request(`/api/session/${encodedId}/prompt`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: message }),
+      signal,
+    });
+    if (!promptRes.ok) {
+      return {
+        outcome: {
+          summary: null,
+          costUsd: null,
+          status: "failed",
+          errorCode: "http_error",
+          errorMessage: `OpenCode prompt request failed (${promptRes.status})`,
+        },
+        terminalRaw: { status: promptRes.status },
+      };
+    }
+
+    const promptPayload = await promptRes.json().catch(() => null);
+    const promptId = str(v2DataRecord(promptPayload)["id"]);
+
+    const waitController = new AbortController();
+    const onTurnAbort = (): void => waitController.abort(signal.reason);
+    if (signal.aborted) {
+      waitController.abort(signal.reason);
+    } else {
+      signal.addEventListener("abort", onTurnAbort, { once: true });
+    }
+
+    const waitFallback = (async (): Promise<V2TurnOutcome> => {
+      try {
+        const res = await this.client!.request(`/api/experimental/session/${encodedId}/wait`, {
+          method: "POST",
+          signal: waitController.signal,
+        });
+        if (!res.ok) return waiterPromise;
+        return await new Promise<V2TurnOutcome>((resolve) => {
+          const timer = setTimeout(() => {
+            waitController.signal.removeEventListener("abort", onWaitAbort);
+            resolve({ status: "idle" });
+          }, 100);
+          timer.unref?.();
+          const onWaitAbort = (): void => {
+            clearTimeout(timer);
+            resolve({ status: "idle" });
+          };
+          if (waitController.signal.aborted) {
+            onWaitAbort();
+            return;
+          }
+          waitController.signal.addEventListener("abort", onWaitAbort, { once: true });
+          void waiterPromise.then((value) => {
+            clearTimeout(timer);
+            waitController.signal.removeEventListener("abort", onWaitAbort);
+            resolve(value);
+          });
+        });
+      } catch {
+        return waiterPromise;
+      }
+    })();
+
+    let onRaceAbort: (() => void) | null = null;
+    const abortedPromise = new Promise<never>((_, reject) => {
+      const rejectAbort = (): void => {
+        reject(signal.reason instanceof Error ? signal.reason : new Error(String(signal.reason ?? "aborted")));
+      };
+      if (signal.aborted) {
+        rejectAbort();
+        return;
+      }
+      onRaceAbort = rejectAbort;
+      signal.addEventListener("abort", onRaceAbort, { once: true });
+    });
+
+    let waitOutcome: V2TurnOutcome;
+    try {
+      waitOutcome = await Promise.race([waiterPromise, waitFallback, abortedPromise]);
+    } finally {
+      waitController.abort("settled");
+      signal.removeEventListener("abort", onTurnAbort);
+      if (onRaceAbort) signal.removeEventListener("abort", onRaceAbort);
+    }
+
+    const msgRes = await this.client!.request(`/api/session/${encodedId}/message?limit=20&order=desc`, { signal });
+    const rawList = msgRes.ok ? v2DataArray(await msgRes.json().catch(() => [])) : [];
+    let rawAssistant: Record<string, unknown> | null = null;
+    let rawIdle: Record<string, unknown> | null = null;
+    for (const item of rawList) {
+      const entry = rec(item);
+      if (!entry) continue;
+      if (promptId && str(entry["id"]) === promptId) break;
+      if (!rawIdle && entry["type"] === "idle") {
+        rawIdle = entry;
+      }
+      if (!rawAssistant && entry["type"] === "assistant") {
+        rawAssistant = entry;
+      }
+      if (rawIdle && rawAssistant) break;
+    }
+
+    const idleOutcome = rawIdle ? str(rawIdle["outcome"]) : null;
+    const effectiveWaitOutcome: V2TurnOutcome =
+      waitOutcome.status === "idle" && idleOutcome
+        ? idleOutcome === "failed"
+          ? { status: "failed", error: rawIdle?.["error"] ?? { type: "idle_failed", message: "OpenCode turn failed" } }
+          : idleOutcome === "interrupted"
+            ? { status: "interrupted", reason: str(rawIdle?.["reason"]) ?? undefined }
+            : { status: "succeeded" }
+        : waitOutcome;
+
+    if (!rawAssistant) {
+      if (effectiveWaitOutcome.status === "failed") {
+        const msg = v2ErrorMessage(effectiveWaitOutcome.error)
+          || JSON.stringify(effectiveWaitOutcome.error ?? "OpenCode turn failed");
+        return {
+          outcome: {
+            summary: null,
+            costUsd: null,
+            status: "failed",
+            errorCode: "agent_error",
+            errorMessage: msg,
+          },
+          terminalRaw: { error: effectiveWaitOutcome.error, ...(rawIdle ? { idle: rawIdle } : {}) },
+        };
+      }
+      if (effectiveWaitOutcome.status === "interrupted") {
+        return {
+          outcome: {
+            summary: null,
+            costUsd: null,
+            status: "aborted",
+            errorCode: "aborted",
+            errorMessage: "The turn was interrupted.",
+          },
+          terminalRaw: { interrupted: true, reason: effectiveWaitOutcome.reason, ...(rawIdle ? { idle: rawIdle } : {}) },
+        };
+      }
+      if (effectiveWaitOutcome.status === "idle") {
+        const msg = "OpenCode turn became idle without a recorded completion or assistant response.";
+        return {
+          outcome: {
+            summary: null,
+            costUsd: null,
+            status: "failed",
+            errorCode: "incomplete_turn",
+            errorMessage: msg,
+          },
+          terminalRaw: { idle: true },
+        };
+      }
+    }
+
+    const envelope = rawAssistant ? normalizeV2MessageToEnvelope(rawAssistant) : null;
+    const baseInfo = envelope?.info ?? {};
+    const effectiveInfo = !baseInfo["error"] && effectiveWaitOutcome.status === "failed" && effectiveWaitOutcome.error != null
+      ? { ...baseInfo, error: effectiveWaitOutcome.error }
+      : baseInfo;
+    const usage = usageFromMessage(effectiveInfo);
+    const summary = envelope ? (assistantTextFromParts(envelope.parts) || null) : null;
+    const costUsd = num(effectiveInfo["cost"]);
+    const terminalRaw: Record<string, unknown> = {
+      info: effectiveInfo,
+      parts: envelope?.parts ?? [],
+      v2: rawAssistant,
+      ...(rawIdle ? { idle: rawIdle } : {}),
+    };
+
+    if (effectiveWaitOutcome.status === "interrupted" && effectiveInfo["error"] == null) {
+      return {
+        outcome: {
+          summary,
+          ...(usage ? { usage } : {}),
+          costUsd,
+          status: "aborted",
+          errorCode: "aborted",
+          errorMessage: "The turn was interrupted.",
+        },
+        terminalRaw,
+      };
+    }
+
+    if (effectiveWaitOutcome.status === "failed" && effectiveInfo["error"] != null && !effectiveInfo["finish"]) {
+      const msg = v2ErrorMessage(effectiveInfo["error"]) || JSON.stringify(effectiveInfo["error"]);
+      return {
+        outcome: {
+          summary,
+          ...(usage ? { usage } : {}),
+          costUsd,
+          status: "failed",
+          errorCode: "agent_error",
+          errorMessage: msg,
+        },
+        terminalRaw,
+      };
+    }
+
+    const term = terminalOutcome(effectiveInfo, summary != null && summary.trim().length > 0);
+    if (term.incomplete && rawAssistant) await this.emitIncompleteNote(effectiveInfo);
+    return {
+      outcome: {
+        summary,
+        ...(usage ? { usage } : {}),
+        costUsd,
+        status: term.status,
+        errorCode: term.errorCode,
+        errorMessage: term.errorMessage,
+      },
+      terminalRaw,
+    };
   }
 
   /**
@@ -699,7 +1286,10 @@ class OpenCodeSession implements AgentSession {
   async interrupt(): Promise<void> {
     if (!this._sessionId) return;
     try {
-      await this.client?.ok(`/session/${this._sessionId}/abort`, { method: "POST" });
+      const path = this.isV2
+        ? `/api/session/${encodeURIComponent(this._sessionId)}/interrupt`
+        : `/session/${this._sessionId}/abort`;
+      await this.client?.ok(path, { method: "POST" });
     } catch {
       /* best effort */
     }

@@ -7,6 +7,8 @@ import { OpenCodeClient } from "./client.js";
 
 export interface OpenCodeServerHandle {
   client: OpenCodeClient;
+  apiVersion: 1 | 2;
+  serverVersion: string | null;
   generation: number;
   release: () => void;
   retire: (options?: { force?: boolean }) => Promise<void>;
@@ -18,6 +20,8 @@ interface PooledServer {
   key: string;
   generation: number;
   client: OpenCodeClient;
+  apiVersion: 1 | 2;
+  serverVersion: string | null;
   proc: ChildProcess;
   refCount: number;
   retired: boolean;
@@ -68,12 +72,39 @@ function kill(entry: PooledServer): void {
   }
 }
 
-async function waitForHealth(client: OpenCodeClient, timeoutMs: number): Promise<void> {
+function isJsonResponse(response: Response): boolean {
+  return (response.headers.get("content-type") ?? "").toLowerCase().includes("application/json");
+}
+
+async function waitForHealth(
+  client: OpenCodeClient,
+  timeoutMs: number,
+): Promise<{ apiVersion: 1 | 2; serverVersion: string | null }> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
-      const response = await client.request("/global/health");
-      if (response.ok) return;
+      const infoResponse = await client.request("/api/info", {
+        headers: { accept: "application/json" },
+      });
+      if (infoResponse.ok && isJsonResponse(infoResponse)) {
+        const info = (await infoResponse.json().catch(() => null)) as Record<string, unknown> | null;
+        if (info && typeof info === "object" && !Array.isArray(info)) {
+          return {
+            apiVersion: 2,
+            serverVersion: typeof info["version"] === "string" ? info["version"] : null,
+          };
+        }
+      }
+    } catch {
+      // Server is still starting.
+    }
+    try {
+      const response = await client.request("/global/health", {
+        headers: { accept: "application/json" },
+      });
+      if (response.ok && isJsonResponse(response)) {
+        return { apiVersion: 1, serverVersion: null };
+      }
     } catch {
       // Server is still starting.
     }
@@ -141,8 +172,8 @@ async function startServer(
     });
 
     const client = new OpenCodeClient(url, password);
-    await waitForHealth(client, 10_000);
-    return { key, generation, client, proc, refCount: 0, retired: false };
+    const { apiVersion, serverVersion } = await waitForHealth(client, 10_000);
+    return { key, generation, client, apiVersion, serverVersion, proc, refCount: 0, retired: false };
   } catch (error) {
     try {
       proc.kill();
@@ -223,6 +254,8 @@ export async function acquireOpenCodeServer(
   let released = false;
   return {
     client: entry.client,
+    apiVersion: entry.apiVersion,
+    serverVersion: entry.serverVersion,
     generation: entry.generation,
     isCurrent: () => !entry.retired && (generations.get(key) ?? 0) === entry.generation,
     retire: (options) => retireOpenCodeRuntime(binary, prefixArgs, env, cwd, options).then(() => undefined),

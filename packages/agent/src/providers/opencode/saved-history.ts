@@ -10,6 +10,7 @@ import { cleanTitle } from "../../history/fs.js";
 import type { OpenCodeClient } from "./client.js";
 import { collectHistory, historicalEvents, type MessageEnvelope } from "./history.js";
 import { acquireOpenCodeRuntime } from "./runtime.js";
+import { normalizeV2MessageToEnvelope, serverApiVersion, v2DataArray } from "./v2.js";
 
 const SESSION_PAGE_SIZE = 100;
 const MAX_SESSION_PAGES = 100;
@@ -22,7 +23,7 @@ const MAX_DISCOVERY_INSPECTION_BYTES = 25 * 1024 * 1024;
 const MAX_DISCOVERY_INSPECTION_MESSAGES = 10_000;
 const INSPECTION_CONCURRENCY = 8;
 
-type SessionListEndpoint = "experimental" | "legacy";
+type SessionListEndpoint = "experimental" | "legacy" | "v2";
 
 interface OpenCodeSessionEnvelope extends Record<string, unknown> {
   id?: unknown;
@@ -124,6 +125,21 @@ function sessionQuery(
 ): URLSearchParams {
   const query = new URLSearchParams({ limit: String(limit) });
   const discover = options as SavedHistoryDiscoverOptions;
+  if (endpoint === "v2") {
+    if (cursor) {
+      query.set("cursor", cursor);
+    } else {
+      query.set("order", "desc");
+    }
+    if (discovery && (discover.mainSessionsOnly ?? true)) {
+      query.set("parentID", "null");
+    }
+    if (discovery && discover.directory) query.set("directory", discover.directory);
+    if (discovery && discover.includeArchived === false) {
+      query.set("archived", "false");
+    }
+    return query;
+  }
   if (discovery && (discover.mainSessionsOnly ?? true)) {
     query.set("roots", "true");
   }
@@ -143,6 +159,31 @@ async function parseSessionPage(
     throw new Error(`OpenCode saved-session request failed (${response.status})`);
   }
   const text = await response.text();
+  if (endpoint === "v2") {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text) as unknown;
+    } catch {
+      throw new OpenCodeSavedHistoryProtocolError(
+        "OpenCode saved-session response is not valid JSON",
+      );
+    }
+    const obj = rec(parsed);
+    if (!obj || !Array.isArray(obj["data"])) {
+      throw new OpenCodeSavedHistoryProtocolError(
+        "OpenCode saved-session response is not a paginated data object",
+      );
+    }
+    const cursorObj = rec(obj["cursor"]);
+    return {
+      endpoint,
+      sessions: v2DataArray(parsed)
+        .map((value) => rec(value))
+        .filter((value): value is OpenCodeSessionEnvelope => !!value),
+      nextCursor: string(cursorObj?.["next"]),
+      bytes: Buffer.byteLength(text),
+    };
+  }
   const parsed = parseResponseArray(text, "saved-session");
   return {
     endpoint,
@@ -157,7 +198,12 @@ async function firstSessionPage(
   options: SavedHistoryDiscoverOptions | SavedHistoryProbeOptions,
   limit: number,
   discovery = false,
+  apiVersion: 1 | 2 = 1,
 ): Promise<SessionPage> {
+  if (apiVersion === 2) {
+    const query = sessionQuery(options, limit, "v2", undefined, discovery);
+    return parseSessionPage(await client.request(`/api/session?${query}`), "v2");
+  }
   const experimentalQuery = sessionQuery(options, limit, "experimental", undefined, discovery);
   const experimental = await client.request(`/experimental/session?${experimentalQuery}`);
   if (experimental.status !== 404) return parseSessionPage(experimental, "experimental");
@@ -182,8 +228,11 @@ async function nextSessionPage(
   cursor: string,
 ): Promise<SessionPage> {
   const query = sessionQuery(options, SESSION_PAGE_SIZE, endpoint, cursor, true);
+  const path = endpoint === "v2"
+    ? "/api/session"
+    : `/${endpoint === "experimental" ? "experimental/" : ""}session`;
   return parseSessionPage(
-    await client.request(`/${endpoint === "experimental" ? "experimental/" : ""}session?${query}`),
+    await client.request(`${path}?${query}`),
     endpoint,
   );
 }
@@ -192,14 +241,23 @@ async function findUserText(
   client: OpenCodeClient,
   sessionId: string,
   budget: InspectionBudget,
+  apiVersion: 1 | 2 = 1,
 ): Promise<string | null> {
-  let before: string | null = null;
+  const isV2 = apiVersion === 2;
+  let cursor: string | null = null;
   let sessionBytes = 0;
   for (let pageIndex = 0; pageIndex < MAX_MESSAGE_SCAN_PAGES; pageIndex += 1) {
     const query = new URLSearchParams({ limit: String(MESSAGE_SCAN_PAGE_SIZE) });
-    if (before) query.set("before", before);
+    if (isV2) {
+      query.set("type", "user");
+      if (cursor) query.set("cursor", cursor);
+      else query.set("order", "asc");
+    } else if (cursor) {
+      query.set("before", cursor);
+    }
+    const basePath = isV2 ? "/api/session" : "/session";
     const response = await client.request(
-      `/session/${encodeURIComponent(sessionId)}/message?${query}`,
+      `${basePath}/${encodeURIComponent(sessionId)}/message?${query}`,
     );
     if (response.status === 404) return null;
     if (!response.ok) {
@@ -208,11 +266,37 @@ async function findUserText(
     const read = await readInspectionText(response, sessionBytes, budget);
     const text = read.text;
     sessionBytes = read.sessionBytes;
-    const parsed = parseResponseArray(text, "saved-session message");
-    const messages = parsed
-      .map((value) => rec(value) as MessageEnvelope)
-      .filter(Boolean);
-    budget.messages += messages.length;
+
+    let rawItems: unknown[];
+    let nextCursor: string | null;
+    if (isV2) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(text) as unknown;
+      } catch {
+        throw new OpenCodeSavedHistoryProtocolError(
+          "OpenCode saved-session message response is not valid JSON",
+        );
+      }
+      const obj = rec(parsed);
+      if (!obj || !Array.isArray(obj["data"])) {
+        throw new OpenCodeSavedHistoryProtocolError(
+          "OpenCode saved-session message response is not a data object",
+        );
+      }
+      rawItems = v2DataArray(parsed);
+      nextCursor = string(rec(obj["cursor"])?.["next"]);
+    } else {
+      rawItems = parseResponseArray(text, "saved-session message");
+      nextCursor = response.headers.get("x-next-cursor");
+    }
+
+    const messages = isV2
+      ? rawItems
+          .map((value) => normalizeV2MessageToEnvelope(value) as MessageEnvelope | null)
+          .filter((value): value is MessageEnvelope => value !== null)
+      : rawItems.map((value) => rec(value) as MessageEnvelope).filter(Boolean);
+    budget.messages += rawItems.length;
     if (budget.messages > MAX_DISCOVERY_INSPECTION_MESSAGES) {
       throw new OpenCodeSavedHistoryDiscoveryLimitError();
     }
@@ -221,10 +305,10 @@ async function findUserText(
         .find((item) => item.event.type === "user");
       if (user?.event.type === "user") return user.event.text;
     }
-    if (messages.length < MESSAGE_SCAN_PAGE_SIZE) return null;
-    const next = response.headers.get("x-next-cursor");
-    if (!next || next === before) return null;
-    before = next;
+    if (!isV2 && messages.length < MESSAGE_SCAN_PAGE_SIZE) return null;
+    if (isV2 && rawItems.length === 0) return null;
+    if (!nextCursor || nextCursor === cursor) return null;
+    cursor = nextCursor;
   }
   throw new OpenCodeSavedHistoryDiscoveryLimitError();
 }
@@ -279,6 +363,7 @@ async function inspectSession(
   raw: OpenCodeSessionEnvelope,
   options: SavedHistoryDiscoverOptions,
   budget: InspectionBudget,
+  apiVersion: 1 | 2 = 1,
 ): Promise<SavedHistorySession | null> {
   const externalSessionId = string(raw.id);
   const time = rec(raw.time);
@@ -286,15 +371,16 @@ async function inspectSession(
   if (!externalSessionId || !updatedAt) return null;
   if ((options.mainSessionsOnly ?? true) && string(raw.parentID)) return null;
 
-  const userText = await findUserText(client, externalSessionId, budget);
+  const userText = await findUserText(client, externalSessionId, budget, apiVersion);
   const hasUserMessage = userText !== null;
   if ((options.requireUserMessage ?? true) && !hasUserMessage) return null;
   const archived = millis(time?.["archived"]);
+  const location = rec(raw["location"]);
   return {
     version: 1,
     providerType: "opencode",
     externalSessionId,
-    cwd: string(raw.directory),
+    cwd: string(raw.directory) ?? string(location?.["directory"]),
     title: cleanTitle(string(raw.title)) ?? cleanTitle(userText),
     startedAt: isoMillis(time?.["created"]),
     updatedAt,
@@ -310,6 +396,7 @@ async function inspectBatch(
   sessions: OpenCodeSessionEnvelope[],
   options: SavedHistoryDiscoverOptions,
   budget: InspectionBudget,
+  apiVersion: 1 | 2 = 1,
 ): Promise<Array<SavedHistorySession | null>> {
   const output = new Array<SavedHistorySession | null>(sessions.length).fill(null);
   const failures: unknown[] = [];
@@ -325,7 +412,7 @@ async function inspectBatch(
         const session = sessions[index];
         if (!session) continue;
         try {
-          output[index] = await inspectSession(client, session, options, budget);
+          output[index] = await inspectSession(client, session, options, budget, apiVersion);
         } catch (error) {
           // A 404 is converted to null inside findUserText because that one
           // candidate disappeared. Any thrown error is systemic or makes the
@@ -346,11 +433,12 @@ async function inspectBatch(
 export async function* discoverOpenCodeSavedSessions(
   client: OpenCodeClient,
   options: SavedHistoryDiscoverOptions = {},
+  apiVersion: 1 | 2 = 1,
 ): AsyncIterable<SavedHistorySession> {
   const requestedLimit = normalizedLimit(options.limit);
   if (requestedLimit === 0) return;
 
-  let page = await firstSessionPage(client, options, SESSION_PAGE_SIZE, true);
+  let page = await firstSessionPage(client, options, SESSION_PAGE_SIZE, true, apiVersion);
   let totalSessions = 0;
   let totalBytes = 0;
   let yielded = 0;
@@ -369,7 +457,7 @@ export async function* discoverOpenCodeSavedSessions(
       throw new OpenCodeSavedHistoryDiscoveryLimitError();
     }
 
-    const inspected = await inspectBatch(client, page.sessions, options, inspectionBudget);
+    const inspected = await inspectBatch(client, page.sessions, options, inspectionBudget, apiVersion);
     for (const session of inspected) {
       if (!session) continue;
       yield session;
@@ -398,6 +486,7 @@ export async function* readOpenCodeSavedSession(
   client: OpenCodeClient,
   session: SavedHistorySession,
   options: SavedHistoryReadOptions = {},
+  apiVersion: 1 | 2 = 1,
 ): AsyncIterable<SavedHistoryYield> {
   if (session.providerType !== "opencode" || !session.externalSessionId) {
     throw new OpenCodeSavedHistoryInvalidSessionError();
@@ -406,7 +495,7 @@ export async function* readOpenCodeSavedSession(
     client,
     session.externalSessionId,
     { after: options.after, mode: options.mode },
-    { includeUserMessages: true, missingSession: "error" },
+    { includeUserMessages: true, missingSession: "error", apiVersion },
   );
   for (const item of collected) {
     const eventId = item.eventId;
@@ -426,7 +515,13 @@ export const openCodeSavedHistory: SavedHistoryOps = {
     try {
       runtime = await acquireOpenCodeRuntime(options);
       const limit = Math.max(1, normalizedLimit(options.limit) ?? SESSION_PAGE_SIZE);
-      const page = await firstSessionPage(runtime.server.client, options, limit);
+      const page = await firstSessionPage(
+        runtime.server.client,
+        options,
+        limit,
+        false,
+        serverApiVersion(runtime.server),
+      );
       return {
         providerType: "opencode",
         sourceAvailable: true,
@@ -447,7 +542,11 @@ export const openCodeSavedHistory: SavedHistoryOps = {
   async *discover(options: SavedHistoryDiscoverOptions = {}) {
     const runtime = await acquireOpenCodeRuntime(options);
     try {
-      yield* discoverOpenCodeSavedSessions(runtime.server.client, options);
+      yield* discoverOpenCodeSavedSessions(
+        runtime.server.client,
+        options,
+        serverApiVersion(runtime.server),
+      );
     } finally {
       runtime.server.release();
     }
@@ -459,7 +558,12 @@ export const openCodeSavedHistory: SavedHistoryOps = {
       cwd: session.cwd ?? options.cwd,
     });
     try {
-      yield* readOpenCodeSavedSession(runtime.server.client, session, options);
+      yield* readOpenCodeSavedSession(
+        runtime.server.client,
+        session,
+        options,
+        serverApiVersion(runtime.server),
+      );
     } finally {
       runtime.server.release();
     }
