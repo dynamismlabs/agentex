@@ -208,7 +208,7 @@ export function defineDerivedProvider(cfg: DerivedProviderConfig): ProviderModul
     derived.upstreamProviders = {
       list: (ctx) => manager.list(runtime(ctx)),
       authMethods: (providerId, ctx) => manager.authMethods(providerId, runtime(ctx)),
-      setApiKey: (providerId, key, ctx) => manager.setApiKey(providerId, key, runtime(ctx)),
+      setApiKey: (providerId, key, ctx, inputs) => manager.setApiKey(providerId, key, runtime(ctx), inputs),
       beginOAuth: (providerId, methodId, inputs, ctx) =>
         manager.beginOAuth(providerId, methodId, inputs, runtime(ctx)),
       completeOAuth: (flowId, code, ctx) => manager.completeOAuth(flowId, code, runtime(ctx)),

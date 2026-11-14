@@ -136,17 +136,18 @@ export function parseOpenCodeStreamLine(line: string): StreamEvent | null {
 
   if (type === "tool_use") {
     const part = parseObject(event["part"]);
-    const name = asString(part["name"], "");
+    const name = asString(part["name"], "") || asString(part["tool"], "");
     const state = parseObject(part["state"]);
     const status = asString(state["status"], "");
+    const toolCallId = asString(part["id"], "") || asString(part["tool_use_id"], "") || asString(part["callID"], "") || null;
     if (status === "error" || status === "completed") {
       return {
         type: "tool_result",
-        toolCallId: asString(part["id"], "") || asString(part["tool_use_id"], "") || null,
+        toolCallId,
         toolName: name || null,
         content: status === "error"
           ? v2ErrorMessage(state["error"])
-          : (asString(state["result"], "") || v2ToolContentText(state["content"]) || ""),
+          : (asString(state["result"], "") || asString(state["output"], "") || v2ToolContentText(state["content"]) || ""),
         isError: status === "error",
         exitCode: null,
         ...base,
@@ -154,9 +155,9 @@ export function parseOpenCodeStreamLine(line: string): StreamEvent | null {
     }
     return {
       type: "tool_call",
-      toolCallId: asString(part["id"], "") || asString(part["tool_use_id"], "") || null,
+      toolCallId,
       name,
-      input: part["input"],
+      input: part["input"] ?? state["input"],
       ...base,
     };
   }

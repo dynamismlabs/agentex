@@ -1200,6 +1200,214 @@ describe("OpenCode v2 OAuth error & expiry coverage", () => {
 
     await expect(openCodeUpstreamProviders.completeOAuth("ocf_missing_or_expired", undefined, ctx)).rejects.toThrow(/expired/i);
   });
+
+  it("waits for cold v2 plugin registration, merges unconnected integrations into list(), supports select string fields, and submits key form inputs", async () => {
+    let integrationsFetches = 0;
+    const oauthPosts: unknown[] = [];
+    const keyPosts: unknown[] = [];
+
+    const { baseUrl } = await startFakeOpenCodeV2Server({
+      handle: (req, res, bodyText) => {
+        const url = req.url ?? "/";
+        if (url === "/api/provider") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({
+            data: [{ id: "opencode", integrationID: "opencode", name: "OpenCode Zen", activation: "enabled" }],
+          }));
+          return;
+        }
+        if (url === "/api/credential") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ data: [] }));
+          return;
+        }
+        if (url === "/api/integration") {
+          integrationsFetches += 1;
+          res.writeHead(200, { "content-type": "application/json" });
+          if (integrationsFetches === 1) {
+            res.end(JSON.stringify({ data: [] }));
+            return;
+          }
+          if (integrationsFetches === 2) {
+            // Transient first pass before auth plugin registration completes.
+            res.end(JSON.stringify({
+              data: [
+                {
+                  id: "github-copilot",
+                  name: "GitHub Copilot",
+                  methods: [
+                    { type: "key", label: "API key" },
+                    { type: "env", names: ["GITHUB_TOKEN"] },
+                  ],
+                  connections: [],
+                },
+              ],
+            }));
+            return;
+          }
+          res.end(JSON.stringify({
+            data: [
+              {
+                id: "opencode",
+                name: "OpenCode Zen",
+                methods: [{ type: "key", label: "API key" }],
+                connections: [{ type: "credential", id: "cred_zen", label: "Default", method: "key" }],
+              },
+              {
+                id: "github-copilot",
+                name: "GitHub Copilot",
+                methods: [
+                  {
+                    id: "device",
+                    type: "oauth",
+                    label: "Login with GitHub Copilot",
+                    form: [
+                      {
+                        key: "deploymentType",
+                        title: "Select GitHub deployment type",
+                        type: "string",
+                        options: [
+                          { value: "github.com", label: "GitHub.com" },
+                          { value: "enterprise", label: "GitHub Enterprise" },
+                        ],
+                      },
+                    ],
+                  },
+                ],
+                connections: [],
+              },
+              {
+                id: "azure",
+                name: "Azure OpenAI",
+                methods: [
+                  {
+                    id: "key",
+                    type: "key",
+                    label: "API key",
+                    form: [{ key: "resourceName", title: "Resource name", type: "string" }],
+                  },
+                ],
+                connections: [],
+              },
+            ],
+          }));
+          return;
+        }
+        if (url === "/api/integration/github-copilot") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({
+            data: {
+              id: "github-copilot",
+              name: "GitHub Copilot",
+              methods: [
+                {
+                  id: "device",
+                  type: "oauth",
+                  label: "Login with GitHub Copilot",
+                  form: [
+                    {
+                      key: "deploymentType",
+                      title: "Select GitHub deployment type",
+                      type: "string",
+                      options: [
+                        { value: "github.com", label: "GitHub.com" },
+                        { value: "enterprise", label: "GitHub Enterprise" },
+                      ],
+                    },
+                  ],
+                },
+              ],
+              connections: [],
+            },
+          }));
+          return;
+        }
+        if (url === "/api/integration/azure") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({
+            data: {
+              id: "azure",
+              name: "Azure OpenAI",
+              methods: [
+                {
+                  id: "key",
+                  type: "key",
+                  label: "API key",
+                  form: [{ key: "resourceName", title: "Resource name", type: "string" }],
+                },
+              ],
+              connections: [],
+            },
+          }));
+          return;
+        }
+        if (url === "/api/integration/github-copilot/connect/oauth" && req.method === "POST") {
+          oauthPosts.push(JSON.parse(bodyText));
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({
+            data: {
+              attemptID: "att_gh",
+              url: "https://github.com/login/device",
+              instructions: "Code: ABCD-1234",
+              mode: "auto",
+            },
+          }));
+          return;
+        }
+        if (url === "/api/integration/azure/connect/key" && req.method === "POST") {
+          keyPosts.push(JSON.parse(bodyText));
+          res.writeHead(204).end();
+          return;
+        }
+        res.writeHead(404).end();
+      },
+    });
+
+    const bin = createFakeV2Script(baseUrl);
+    const cwd = makeTempDir("oc-cold-");
+    const ctx = { cwd, config: { command: bin } };
+
+    // Calling beginOAuth directly on a cold server must wait past empty & transient plugin states.
+    const flow = await openCodeUpstreamProviders.beginOAuth(
+      "github-copilot",
+      "device",
+      { deploymentType: "GitHub Enterprise" },
+      ctx,
+    );
+    expect(flow.url).toBe("https://github.com/login/device");
+    expect(oauthPosts).toEqual([{ methodID: "device", answer: { deploymentType: "enterprise" } }]);
+
+    const list = await openCodeUpstreamProviders.list(ctx);
+    expect(list.map((p) => p.id)).toEqual(["opencode", "github-copilot", "azure"]);
+    expect(list.find((p) => p.id === "opencode")?.connected).toBe(true);
+    expect(list.find((p) => p.id === "github-copilot")?.connected).toBe(false);
+
+    const ghMethods = await openCodeUpstreamProviders.authMethods("github-copilot", ctx);
+    expect(ghMethods).toHaveLength(1);
+    expect(ghMethods[0]).toMatchObject({
+      name: "Login with GitHub Copilot",
+      type: "oauth",
+      prompts: [
+        {
+          id: "deploymentType",
+          label: "Select GitHub deployment type",
+          type: "select",
+          options: [
+            { value: "github.com", label: "GitHub.com" },
+            { value: "enterprise", label: "GitHub Enterprise" },
+          ],
+        },
+      ],
+    });
+    expect(list.find((p) => p.id === "github-copilot")?.authMethodIds).toEqual([ghMethods[0]!.id]);
+
+    const azureMethods = await openCodeUpstreamProviders.authMethods("azure", ctx);
+    expect(azureMethods[0]?.prompts).toEqual([{ id: "resourceName", label: "Resource name", type: "text" }]);
+    expect(list.find((p) => p.id === "azure")?.authMethodIds).toEqual([azureMethods[0]!.id]);
+
+    await openCodeUpstreamProviders.setApiKey("azure", "az-secret", ctx, { resourceName: "my-azure-res" });
+    expect(keyPosts).toEqual([{ key: "az-secret", answer: { resourceName: "my-azure-res" } }]);
+  });
 });
 
 describe("OpenCode v2 parse & execute", () => {
@@ -1255,5 +1463,152 @@ console.log(JSON.stringify({ type: "step_finish", sessionID: "ses_exec_v2", part
     expect(args).toContain("anthropic/claude-sonnet-4-5#high");
     expect(args).toContain("--agent");
     expect(args).toContain("plan");
+  });
+
+  it("parses real v2 tool_use JSON lines with part.tool, state.input, and state.output", () => {
+    const line = JSON.stringify({
+      type: "tool_use",
+      timestamp: 1000,
+      sessionID: "ses_tool",
+      part: {
+        id: "prt_1",
+        callID: "call_1",
+        tool: "bash",
+        state: {
+          status: "completed",
+          input: { command: "echo ok" },
+          output: "ok\n",
+        },
+      },
+    });
+    expect(parseOpenCodeStreamLine(line)).toMatchObject({
+      type: "tool_result",
+      toolCallId: "prt_1",
+      toolName: "bash",
+      content: "ok\n",
+      isError: false,
+      exitCode: null,
+      sessionId: "ses_tool",
+    });
+
+    const runningLine = JSON.stringify({
+      type: "tool_use",
+      timestamp: 1001,
+      sessionID: "ses_tool",
+      part: {
+        callID: "call_2",
+        tool: "read",
+        state: {
+          status: "running",
+          input: { filePath: "README.md" },
+        },
+      },
+    });
+    expect(parseOpenCodeStreamLine(runningLine)).toMatchObject({
+      type: "tool_call",
+      toolCallId: "call_2",
+      name: "read",
+      input: { filePath: "README.md" },
+      sessionId: "ses_tool",
+    });
+  });
+
+  it("catches synchronous and async onUserInputRequest errors in v2 form/question reconciliation without unhandledRejection", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandled);
+    cleanups.push(() => {
+      process.off("unhandledRejection", onUnhandled);
+    });
+
+    let formSeen = false;
+    let callbackCalls = 0;
+    const { baseUrl } = await startFakeOpenCodeV2Server({
+      handle: (req, res, _bodyText, emitSse) => {
+        const url = req.url ?? "/";
+        if (url === "/api/session" && req.method === "POST") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ data: { id: "ses_cb_err" } }));
+          return;
+        }
+        if (url === "/api/session/ses_cb_err/permission") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ data: [] }));
+          return;
+        }
+        if (url === "/api/session/ses_cb_err/form") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({
+            data: formSeen
+              ? []
+              : [
+                  {
+                    id: "frm_throw",
+                    sessionID: "ses_cb_err",
+                    title: "Throw check",
+                    fields: [{ key: "x", title: "X", type: "string" }],
+                  },
+                ],
+          }));
+          formSeen = true;
+          return;
+        }
+        if (url === "/api/session/ses_cb_err/prompt" && req.method === "POST") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ data: { id: "msg_throw", type: "user" } }));
+          setTimeout(() => {
+            emitSse({
+              id: "e_text",
+              created: 1,
+              type: "session.text.delta",
+              data: { sessionID: "ses_cb_err", assistantMessageID: "msg_a", ordinal: 0, delta: "Recovered" },
+            });
+            emitSse({ id: "e_done", created: 2, type: "session.execution.succeeded", data: { sessionID: "ses_cb_err" } });
+          }, 80);
+          return;
+        }
+        if (url.startsWith("/api/session/ses_cb_err/message")) {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({
+            data: [
+              {
+                id: "msg_a",
+                type: "assistant",
+                agent: "build",
+                model: { id: "claude-sonnet-4-5", providerID: "anthropic" },
+                time: { created: Date.now() },
+                finish: "stop",
+                cost: 0,
+                tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+                content: [{ type: "text", text: "Recovered" }],
+              },
+            ],
+          }));
+          return;
+        }
+        res.writeHead(404).end();
+      },
+    });
+
+    const bin = createFakeV2Script(baseUrl);
+    const cwd = makeTempDir("oc-cb-throw-");
+    const session = await createOpenCodeSession({
+      cwd,
+      config: { command: bin },
+      onUserInputRequest: () => {
+        callbackCalls += 1;
+        throw new Error("boom in host callback");
+      },
+    });
+    const handle = await session.send("Hi");
+    const result = await handle.result;
+    await session.close();
+
+    expect(callbackCalls).toBeGreaterThanOrEqual(1);
+    expect(result.status).toBe("completed");
+    expect(result.summary).toBe("Recovered");
+    expect(unhandled).toEqual([]);
   });
 });

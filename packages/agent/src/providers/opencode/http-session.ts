@@ -587,6 +587,8 @@ class OpenCodeSession implements AgentSession {
         this._inputReplies.set(id, reply);
       }
       await this.deliverInputReply(id, reply);
+    } catch {
+      // Ignore host callback or reply transport errors during background polling/SSE.
     } finally {
       this._inputInFlight.delete(id);
       this.restoreAfterInput();
@@ -661,6 +663,8 @@ class OpenCodeSession implements AgentSession {
         this._inputReplies.set(id, reply);
       }
       await this.deliverInputReply(id, reply);
+    } catch {
+      // Ignore host callback or reply transport errors during background polling/SSE.
     } finally {
       this._inputInFlight.delete(id);
       this.restoreAfterInput();
@@ -768,6 +772,8 @@ class OpenCodeSession implements AgentSession {
         this._inputReplies.set(id, reply);
       }
       await this.deliverInputReply(id, reply);
+    } catch {
+      // Ignore host callback or reply transport errors during background polling/SSE.
     } finally {
       this._inputInFlight.delete(id);
       this.restoreAfterInput();

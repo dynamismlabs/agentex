@@ -8,7 +8,7 @@ import type {
 } from "../../types.js";
 import type { OpenCodeServerHandle } from "./server.js";
 import { acquireOpenCodeRuntime } from "./runtime.js";
-import { rec, serverApiVersion, v2DataArray, v2DataRecord } from "./v2.js";
+import { ensureV2IntegrationsReady, rec, serverApiVersion, v2DataArray, v2DataRecord } from "./v2.js";
 
 const FLOW_TTL_MS = 10 * 60 * 1000;
 const MAX_FLOWS = 128;
@@ -169,28 +169,25 @@ function v2InteractiveMethods(
     const prompts = Array.isArray(raw["form"])
       ? raw["form"].map((item) => {
           const field = rec(item);
-          const fieldType = field["type"] === "multiselect" && Array.isArray(field["options"])
-            ? ("select" as const)
-            : ("text" as const);
+          const rawOptions = Array.isArray(field["options"]) ? field["options"] : [];
+          const options = rawOptions
+            .map((opt) => {
+              const o = rec(opt);
+              return {
+                value: typeof o["value"] === "string" ? o["value"] : "",
+                label: typeof o["label"] === "string" ? o["label"] : "",
+              };
+            })
+            .filter((o) => o.value);
+          const isSelect = (field["type"] === "multiselect" || field["type"] === "string") && options.length > 0;
+          const fieldType = isSelect ? ("select" as const) : ("text" as const);
           return {
             id: typeof field["key"] === "string" ? field["key"] : "input",
             label: typeof field["title"] === "string"
               ? field["title"]
               : typeof field["key"] === "string" ? field["key"] : "Input",
             type: fieldType,
-            ...(fieldType === "select"
-              ? {
-                  options: (field["options"] as unknown[])
-                    .map((opt) => {
-                      const o = rec(opt);
-                      return {
-                        value: typeof o["value"] === "string" ? o["value"] : "",
-                        label: typeof o["label"] === "string" ? o["label"] : "",
-                      };
-                    })
-                    .filter((o) => o.value),
-                }
-              : {}),
+            ...(fieldType === "select" ? { options } : {}),
           };
         })
       : undefined;
@@ -207,11 +204,75 @@ function v2InteractiveMethods(
   return result;
 }
 
+function coerceV2FieldValue(field: Record<string, unknown>, rawValue: string): unknown {
+  const options = Array.isArray(field["options"]) ? field["options"] : [];
+  const validValues = new Set<string>();
+  const labelToValue = new Map<string, string>();
+  for (const item of options) {
+    const opt = rec(item);
+    const val = typeof opt["value"] === "string" ? opt["value"] : "";
+    const label = typeof opt["label"] === "string" ? opt["label"] : "";
+    if (!val) continue;
+    validValues.add(val);
+    if (label && !labelToValue.has(label)) {
+      labelToValue.set(label, val);
+    }
+  }
+  const resolveChoice = (val: string): string => {
+    if (validValues.has(val)) return val;
+    return labelToValue.get(val) ?? val;
+  };
+  const fieldType = field["type"];
+  if (fieldType === "multiselect") {
+    return rawValue
+      .split(",")
+      .map((part) => resolveChoice(part.trim()))
+      .filter(Boolean);
+  }
+  if (fieldType === "boolean") {
+    const trimmed = rawValue.trim().toLowerCase();
+    if (trimmed === "true" || trimmed === "1" || trimmed === "yes") return true;
+    if (trimmed === "false" || trimmed === "0" || trimmed === "no") return false;
+    return rawValue;
+  }
+  if (fieldType === "number" || fieldType === "integer") {
+    const parsed = Number(rawValue);
+    if (rawValue.trim() !== "" && Number.isFinite(parsed)) return parsed;
+    return rawValue;
+  }
+  return resolveChoice(rawValue);
+}
+
+function buildV2FormAnswer(
+  rawForm: unknown,
+  inputs?: Record<string, string>,
+): Record<string, unknown> | undefined {
+  if (!inputs) return undefined;
+  const entries = Object.entries(inputs).filter(([, value]) => value !== undefined);
+  if (entries.length === 0) return undefined;
+  const fieldsByKey = new Map<string, Record<string, unknown>>();
+  if (Array.isArray(rawForm)) {
+    for (const item of rawForm) {
+      const field = rec(item);
+      if (typeof field["key"] === "string" && field["key"]) {
+        fieldsByKey.set(field["key"], field);
+      }
+    }
+  }
+  const answer: Record<string, unknown> = {};
+  for (const [key, value] of entries) {
+    const field = fieldsByKey.get(key);
+    answer[key] = field ? coerceV2FieldValue(field, value) : value;
+  }
+  return answer;
+}
+
 export const openCodeUpstreamProviders: UpstreamProviderManager = {
   async list(ctx = {}): Promise<UpstreamProvider[]> {
     const runtime = await acquireOpenCodeRuntime(ctx);
     try {
       if (serverApiVersion(runtime.server) === 2) {
+        await ensureV2IntegrationsReady(runtime.server.client);
         const [providersPayload, integrationsPayload, credentialsPayload] = await Promise.all([
           runtime.server.client.json<unknown>("/api/provider"),
           runtime.server.client.json<unknown>("/api/integration").catch(() => []),
@@ -231,12 +292,18 @@ export const openCodeUpstreamProviders: UpstreamProviderManager = {
             credentialIntegrationIds.add(entry["integrationID"]);
           }
         }
-        return v2DataArray(providersPayload).map((raw) => {
+        const seenProviderIds = new Set<string>();
+        const seenIntegrationIds = new Set<string>();
+        const providers: UpstreamProvider[] = [];
+        for (const raw of v2DataArray(providersPayload)) {
           const provider = rec(raw);
           const id = typeof provider["id"] === "string" ? provider["id"] : "";
+          if (!id) continue;
           const integrationId = typeof provider["integrationID"] === "string" && provider["integrationID"]
             ? provider["integrationID"]
             : id;
+          seenProviderIds.add(id);
+          seenIntegrationIds.add(integrationId);
           const integration = integrationsById.get(integrationId) ?? null;
           const connections = integration && Array.isArray(integration["connections"])
             ? integration["connections"]
@@ -244,13 +311,29 @@ export const openCodeUpstreamProviders: UpstreamProviderManager = {
           const connected = connections.length > 0
             || credentialIntegrationIds.has(integrationId)
             || provider["activation"] === "enabled";
-          return {
+          providers.push({
             id,
             name: typeof provider["name"] === "string" ? provider["name"] : id,
             connected,
             authMethodIds: v2InteractiveMethods(id, integration).map((entry) => entry.method.id),
-          };
-        }).filter((provider) => provider.id);
+          });
+        }
+        for (const [integrationId, integration] of integrationsById) {
+          if (seenProviderIds.has(integrationId) || seenIntegrationIds.has(integrationId)) {
+            continue;
+          }
+          const connections = Array.isArray(integration["connections"]) ? integration["connections"] : [];
+          const connected = connections.length > 0 || credentialIntegrationIds.has(integrationId);
+          providers.push({
+            id: integrationId,
+            name: typeof integration["name"] === "string" && integration["name"]
+              ? integration["name"]
+              : integrationId,
+            connected,
+            authMethodIds: v2InteractiveMethods(integrationId, integration).map((entry) => entry.method.id),
+          });
+        }
+        return providers;
       }
 
       const [providers, methods] = await Promise.all([
@@ -280,6 +363,7 @@ export const openCodeUpstreamProviders: UpstreamProviderManager = {
     const runtime = await acquireOpenCodeRuntime(ctx);
     try {
       if (serverApiVersion(runtime.server) === 2) {
+        await ensureV2IntegrationsReady(runtime.server.client);
         const { integration } = await fetchV2Integration(runtime.server, providerId);
         return v2InteractiveMethods(providerId, integration).map((entry) => entry.method);
       }
@@ -291,15 +375,18 @@ export const openCodeUpstreamProviders: UpstreamProviderManager = {
     }
   },
 
-  async setApiKey(providerId, key, ctx = {}) {
+  async setApiKey(providerId, key, ctx = {}, inputs) {
     if (!key.trim()) throw new Error("OpenCode API key must not be empty");
     const runtime = await acquireOpenCodeRuntime(ctx);
     try {
       if (serverApiVersion(runtime.server) === 2) {
-        const { integrationId } = await fetchV2Integration(runtime.server, providerId);
+        await ensureV2IntegrationsReady(runtime.server.client);
+        const { integrationId, integration } = await fetchV2Integration(runtime.server, providerId);
+        const keyMethod = v2InteractiveMethods(providerId, integration).find((entry) => entry.raw["type"] === "key");
+        const answer = buildV2FormAnswer(keyMethod?.raw["form"], inputs);
         await runtime.server.client.ok(`/api/integration/${encodeURIComponent(integrationId)}/connect/key`, {
           method: "POST",
-          body: JSON.stringify({ key }),
+          body: JSON.stringify({ key, ...(answer ? { answer } : {}) }),
         });
       } else {
         await runtime.server.client.ok(`/auth/${encodeURIComponent(providerId)}`, {
@@ -326,6 +413,7 @@ export const openCodeUpstreamProviders: UpstreamProviderManager = {
       let attemptId: string | undefined;
 
       if (apiVersion === 2) {
+        await ensureV2IntegrationsReady(runtime.server.client);
         const resolved = await fetchV2Integration(runtime.server, providerId);
         integrationId = resolved.integrationId;
         const match = v2InteractiveMethods(providerId, resolved.integration).find(
@@ -335,11 +423,12 @@ export const openCodeUpstreamProviders: UpstreamProviderManager = {
         if (!v2MethodId) {
           throw new Error("OpenCode authentication method is unavailable");
         }
+        const answer = buildV2FormAnswer(match?.raw["form"], inputs);
         const rawResponse = await runtime.server.client.json<unknown>(
           `/api/integration/${encodeURIComponent(integrationId)}/connect/oauth`,
           {
             method: "POST",
-            body: JSON.stringify({ methodID: v2MethodId, ...(inputs ? { answer: inputs } : {}) }),
+            body: JSON.stringify({ methodID: v2MethodId, ...(answer ? { answer } : {}) }),
           },
         );
         const response = v2DataRecord(rawResponse);

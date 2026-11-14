@@ -176,6 +176,9 @@ export function isV2AbortedError(rawError: unknown): boolean {
 }
 
 const DEFAULT_AGENT_WARMUP_DELAYS_MS = [50, 100, 150, 250, 400, 500, 500, 500];
+const DEFAULT_INTEGRATION_SETTLE_DELAY_MS = 180;
+const MAX_INTEGRATION_SETTLE_POLLS = 6;
+const v2IntegrationsReady = new WeakMap<object, Promise<void>>();
 
 /**
  * Fetch registered v2 agents, retrying briefly when a newly booted server
@@ -192,6 +195,64 @@ export async function fetchV2Agents(
     items = v2DataArray(await client.json<unknown>("/api/agent"));
   }
   return items;
+}
+
+function v2IntegrationsSignature(items: unknown[]): string {
+  return items
+    .map((raw) => {
+      const entry = rec(raw);
+      const id = typeof entry["id"] === "string" ? entry["id"] : "";
+      return `${id}:${JSON.stringify(entry["methods"] ?? null)}`;
+    })
+    .join("|");
+}
+
+/**
+ * Wait once per v2 server client for `/api/integration` to populate and for
+ * auth plugins (OAuth/form methods) to finish registering before reading or
+ * starting upstream provider auth flows.
+ */
+export async function ensureV2IntegrationsReady(
+  client: { json<T>(path: string): Promise<T> },
+  settleDelayMs = DEFAULT_INTEGRATION_SETTLE_DELAY_MS,
+): Promise<void> {
+  const existing = v2IntegrationsReady.get(client);
+  if (existing) return existing;
+
+  const ready = (async () => {
+    let items: unknown[];
+    try {
+      items = v2DataArray(await client.json<unknown>("/api/integration"));
+    } catch {
+      return;
+    }
+    for (const delay of DEFAULT_AGENT_WARMUP_DELAYS_MS) {
+      if (items.length > 0) break;
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      try {
+        items = v2DataArray(await client.json<unknown>("/api/integration"));
+      } catch {
+        return;
+      }
+    }
+    if (items.length === 0) return;
+
+    let prevSig = v2IntegrationsSignature(items);
+    for (let i = 0; i < MAX_INTEGRATION_SETTLE_POLLS; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, settleDelayMs));
+      try {
+        items = v2DataArray(await client.json<unknown>("/api/integration"));
+      } catch {
+        return;
+      }
+      const nextSig = v2IntegrationsSignature(items);
+      if (nextSig === prevSig) break;
+      prevSig = nextSig;
+    }
+  })();
+
+  v2IntegrationsReady.set(client, ready);
+  return ready;
 }
 
 const v2BinaryCache = new Map<string, { fingerprint: string; promise: Promise<boolean> }>();
