@@ -237,7 +237,7 @@ describe("workspace.create (git)", () => {
     ).rejects.toThrow(/sparseInclude must be a non-empty array/);
   });
 
-  it("appends `.context/` to the worktree's per-worktree info/exclude", async () => {
+  it("appends `.context/` to the repository's (shared) info/exclude", async () => {
     const root = await tmp("git-create-exclude");
     const sourcePath = path.join(root, "source");
     const wsPath = path.join(root, "ws");
@@ -257,6 +257,31 @@ describe("workspace.create (git)", () => {
     const content = await fs.readFile(excludePath, "utf-8");
     const lines = content.split("\n").map((l) => l.trim());
     expect(lines).toContain(".context/");
+  });
+
+  it("creates info/exclude when the source repo has no info/ dir (empty init template)", async () => {
+    const root = await tmp("git-create-exclude-no-info");
+    const sourcePath = path.join(root, "source");
+    const wsPath = path.join(root, "ws");
+    const emptyTemplate = path.join(root, "empty-template");
+    await fs.mkdir(emptyTemplate, { recursive: true });
+    await fs.mkdir(sourcePath, { recursive: true });
+    await git(sourcePath, "init", `--template=${emptyTemplate}`, "-b", "main");
+    await git(sourcePath, "config", "user.email", "test@example.com");
+    await git(sourcePath, "config", "user.name", "Workspace Test");
+    await commitFile(sourcePath, "README.md", "# repo\n", "initial");
+    expect(await pathExists(path.join(sourcePath, ".git", "info"))).toBe(false);
+
+    await workspace.create({
+      kind: "git",
+      source: sourcePath,
+      baseBranch: "main",
+      path: wsPath,
+      branch: "feature/no-info",
+    });
+
+    const content = await fs.readFile(path.join(sourcePath, ".git", "info", "exclude"), "utf-8");
+    expect(content.split("\n").map((l) => l.trim())).toContain(".context/");
   });
 
   it("ensureContextExcluded is idempotent — running create twice (different workspaces) doesn't duplicate the line", async () => {
@@ -297,7 +322,7 @@ describe("workspace.create (git)", () => {
     });
 
     const { git } = await import("../git-helpers.js");
-    const { stdout } = await git(wsPath, "rev-parse", "--git-path", "info/agentex.json");
+    const { stdout } = await git(wsPath, "rev-parse", "--git-path", "agentex.json");
     const metadataPath = stdout.trim();
 
     const content = await fs.readFile(metadataPath, "utf-8");

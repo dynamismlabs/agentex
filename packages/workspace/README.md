@@ -236,9 +236,15 @@ Stored under `refs/worktree/agentex/checkpoints/<label>` (git's per-worktree ref
 
 The allocator's "held" set lives for the lifetime of the `Workspace` instance. Persistence across process restarts is the consumer's responsibility — re-allocate after `workspace.open`, or maintain your own free-port set in your app DB.
 
-### `.context/` is gitignored per-worktree
+### Base metadata is per-worktree
 
-On `workspace.create({ kind: "git" })`, the library appends `.context/` to the worktree's per-worktree `.git/info/exclude`. So `git status` stays clean, checkpoints don't include it, and the user's tracked `.gitignore` is untouched.
+`workspace.create({ kind: "git" })` records `{ baseBranch, baseSha }` in the worktree's own git dir (`<source>/.git/worktrees/<name>/agentex.json`) so `workspace.open(path)` can re-hydrate `ws.git.base` / `ws.git.baseSha` without options. Each sibling worktree of a source keeps its own, and `git worktree remove` deletes it with the worktree. (Up to 0.0.4 it lived in the shared `<source>/.git/info/agentex.json`, so sibling `create`s overwrote each other's. Linked worktrees without per-worktree metadata still fall back to that legacy file when opened.)
+
+All git-dir paths are resolved against the workspace, never the process's working directory, so it's safe to drive workspaces from a host process running inside some other repository or worktree.
+
+### `.context/` is gitignored via `info/exclude`
+
+On `workspace.create({ kind: "git" })`, the library appends `.context/` to the source repo's `.git/info/exclude`. So `git status` stays clean, checkpoints don't include it, and the user's tracked `.gitignore` is untouched. git reads `info/exclude` from the repository's common git dir, so this one file covers every worktree of the source (and the source checkout itself), and the line is written once.
 
 ## Spec
 

@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import { execFileResult, execFileSafe, type ExecFullResult, type ExecResult } from "../util/exec.js";
 
 /**
@@ -17,9 +18,28 @@ import { execFileResult, execFileSafe, type ExecFullResult, type ExecResult } fr
 /*                                    refs                                    */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Absolute path to `cwd`'s git directory: `<repo>/.git` for a normal checkout,
+ * `<common>/worktrees/<name>` for a linked worktree.
+ *
+ * git prints this relative to the directory it ran in (`.git` at a checkout's
+ * root), so it is resolved against `cwd` here — handing the raw output to `fs`
+ * would resolve it against `process.cwd()`, i.e. some other repository.
+ */
 export async function revParseGitDir(cwd: string): Promise<string> {
   const { stdout } = await execFileSafe("git", ["rev-parse", "--git-dir"], { cwd });
-  return stdout.trim();
+  return path.resolve(cwd, stdout.trim());
+}
+
+/**
+ * Absolute path to the git directory shared by every worktree of `cwd`'s
+ * repository (the main checkout's `.git`). Equal to `revParseGitDir(cwd)` for
+ * a normal checkout; differs for a linked worktree. Resolved against `cwd` for
+ * the same reason as `revParseGitDir`.
+ */
+export async function revParseGitCommonDir(cwd: string): Promise<string> {
+  const { stdout } = await execFileSafe("git", ["rev-parse", "--git-common-dir"], { cwd });
+  return path.resolve(cwd, stdout.trim());
 }
 
 export async function revParse(cwd: string, ref: string): Promise<string> {
@@ -27,9 +47,23 @@ export async function revParse(cwd: string, ref: string): Promise<string> {
   return stdout.trim();
 }
 
+/**
+ * Absolute path of `relative` inside `cwd`'s git directory, as git itself
+ * resolves it (`git rev-parse --git-path`). Honors git's per-worktree vs
+ * shared split: in a linked worktree, per-worktree names (`HEAD`, `index`,
+ * anything unknown like `agentex.json`) land in `<common>/worktrees/<name>/`,
+ * while common ones (`info/`, `hooks/`, `config`, `refs/`, …) land in the
+ * shared `<common>/`.
+ *
+ * git prints the result relative to `cwd` for a normal checkout
+ * (`.git/info/exclude`) and absolute for a linked worktree. It is always
+ * resolved against `cwd` here, so callers get an absolute path they can hand
+ * straight to `fs` regardless of the process's working directory. (Not
+ * `--path-format=absolute`: that needs git >= 2.31.)
+ */
 export async function revParseGitPath(cwd: string, relative: string): Promise<string> {
   const { stdout } = await execFileSafe("git", ["rev-parse", "--git-path", relative], { cwd });
-  return stdout.trim();
+  return path.resolve(cwd, stdout.trim());
 }
 
 export async function mergeBase(cwd: string, refA: string, refB: string): Promise<string> {

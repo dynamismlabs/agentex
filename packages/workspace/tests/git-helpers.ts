@@ -96,3 +96,15 @@ export async function pushBranch(
 }
 
 export { git };
+
+/**
+ * `git worktree add <worktreePath> -b <branch>` off `repoPath`'s HEAD — a
+ * linked worktree whose `.git` is a pointer file, not a directory.
+ */
+export async function addLinkedWorktree(
+  repoPath: string,
+  worktreePath: string,
+  branch: string,
+): Promise<void> {
+  await git(repoPath, "worktree", "add", worktreePath, "-b", branch);
+}
