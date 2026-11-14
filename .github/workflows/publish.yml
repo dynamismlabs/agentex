@@ -1,0 +1,153 @@
+name: Publish
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'packages/*/package.json'
+  workflow_dispatch:
+    inputs:
+      package:
+        description: 'Package to publish if its current version is not yet on npm'
+        required: true
+        type: choice
+        default: '@agentex/agent'
+        options:
+          - '@agentex/agent'
+          - '@agentex/workspace'
+          - '@agentex/github'
+          - '@agentex/gateway'
+          - 'all-unpublished'
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      packages: ${{ steps.changed.outputs.packages }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: changed
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          DISPATCH_PACKAGE: ${{ inputs.package }}
+        run: |
+          packages=$(node <<'EOF'
+          const fs = require("node:fs");
+          const { execFileSync } = require("node:child_process");
+
+          const dirs = [
+            "packages/workspace",
+            "packages/github",
+            "packages/agent",
+            "packages/gateway",
+          ];
+
+          function isPublished(name, version) {
+            try {
+              execFileSync("npm", ["view", `${name}@${version}`, "version"], {
+                stdio: "ignore",
+              });
+              return true;
+            } catch {
+              return false;
+            }
+          }
+
+          function previousVersion(dir, beforeSha) {
+            const base =
+              beforeSha && !/^0+$/.test(beforeSha) ? beforeSha : "HEAD~1";
+            try {
+              const raw = execFileSync("git", ["show", `${base}:${dir}/package.json`], {
+                encoding: "utf8",
+                stdio: ["ignore", "pipe", "ignore"],
+              });
+              return JSON.parse(raw).version || null;
+            } catch {
+              return null;
+            }
+          }
+
+          const eventName = process.env.EVENT_NAME;
+          const beforeSha = process.env.BEFORE_SHA || "";
+          const dispatchPkg = process.env.DISPATCH_PACKAGE || "";
+          const selected = [];
+
+          for (const dir of dirs) {
+            const pkg = JSON.parse(fs.readFileSync(`${dir}/package.json`, "utf8"));
+            if (pkg.private || !pkg.name || !pkg.version) continue;
+
+            if (eventName === "workflow_dispatch") {
+              if (dispatchPkg !== "all-unpublished" && pkg.name !== dispatchPkg) {
+                continue;
+              }
+            } else {
+              const prev = previousVersion(dir, beforeSha);
+              if (prev === pkg.version) continue;
+            }
+
+            if (!isPublished(pkg.name, pkg.version)) {
+              selected.push(pkg.name);
+            }
+          }
+
+          process.stdout.write(JSON.stringify(selected));
+          EOF
+          )
+          echo "packages=${packages}" >> "$GITHUB_OUTPUT"
+          echo "Detected packages to publish: ${packages}"
+
+  publish:
+    needs: detect
+    if: needs.detect.outputs.packages != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck and build workspace
+        run: pnpm -r typecheck && pnpm -r build
+
+      - name: Run tests for packages to publish
+        env:
+          PUBLISH_PACKAGES: ${{ needs.detect.outputs.packages }}
+        run: |
+          node -e '
+          const { execFileSync } = require("node:child_process");
+          const pkgs = JSON.parse(process.env.PUBLISH_PACKAGES);
+          for (const name of pkgs) {
+            execFileSync("pnpm", ["--filter", name, "test"], { stdio: "inherit" });
+          }
+          '
+
+      - name: Publish changed packages
+        env:
+          PUBLISH_PACKAGES: ${{ needs.detect.outputs.packages }}
+        run: |
+          node -e '
+          const { execFileSync } = require("node:child_process");
+          const pkgs = JSON.parse(process.env.PUBLISH_PACKAGES);
+          for (const name of pkgs) {
+            execFileSync(
+              "pnpm",
+              ["--filter", name, "publish", "--access", "public", "--no-git-checks"],
+              { stdio: "inherit" },
+            );
+          }
+          '
