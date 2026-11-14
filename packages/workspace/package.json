@@ -1,6 +1,6 @@
 {
   "name": "@agentex/workspace",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "description": "Isolation and lifecycle primitives for agent workspaces (bare directories and git worktrees)",
   "repository": {
     "type": "git",
