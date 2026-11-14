@@ -1354,6 +1354,11 @@ describe("OpenCode v2 OAuth error & expiry coverage", () => {
           }));
           return;
         }
+        if (url === "/api/integration/github-copilot/connect/oauth/att_gh" && req.method === "GET") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ data: { status: "complete" } }));
+          return;
+        }
         if (url === "/api/integration/azure/connect/key" && req.method === "POST") {
           keyPosts.push(JSON.parse(bodyText));
           res.writeHead(204).end();
@@ -1366,6 +1371,14 @@ describe("OpenCode v2 OAuth error & expiry coverage", () => {
     const bin = createFakeV2Script(baseUrl);
     const cwd = makeTempDir("oc-cold-");
     const ctx = { cwd, config: { command: bin } };
+    let activeFlowId: string | null = null;
+    cleanups.push(async () => {
+      if (activeFlowId) {
+        const id = activeFlowId;
+        activeFlowId = null;
+        await openCodeUpstreamProviders.completeOAuth(id, undefined, ctx).catch(() => {});
+      }
+    });
 
     // Calling beginOAuth directly on a cold server must wait past empty & transient plugin states.
     const flow = await openCodeUpstreamProviders.beginOAuth(
@@ -1374,8 +1387,11 @@ describe("OpenCode v2 OAuth error & expiry coverage", () => {
       { deploymentType: "GitHub Enterprise" },
       ctx,
     );
+    activeFlowId = flow.id;
     expect(flow.url).toBe("https://github.com/login/device");
     expect(oauthPosts).toEqual([{ methodID: "device", answer: { deploymentType: "enterprise" } }]);
+    await openCodeUpstreamProviders.completeOAuth(flow.id, undefined, ctx);
+    activeFlowId = null;
 
     const list = await openCodeUpstreamProviders.list(ctx);
     expect(list.map((p) => p.id)).toEqual(["opencode", "github-copilot", "azure"]);
@@ -1454,6 +1470,11 @@ describe("OpenCode v2 OAuth error & expiry coverage", () => {
           }));
           return;
         }
+        if (url === "/api/integration/github-copilot/connect/oauth/att_delayed" && req.method === "GET") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ data: { status: "complete" } }));
+          return;
+        }
         res.writeHead(404).end();
       },
     });
@@ -1461,11 +1482,22 @@ describe("OpenCode v2 OAuth error & expiry coverage", () => {
     const bin = createFakeV2Script(baseUrl);
     const cwd = makeTempDir("oc-delayed-oauth-");
     const ctx = { cwd, config: { command: bin } };
+    let activeFlowId: string | null = null;
+    cleanups.push(async () => {
+      if (activeFlowId) {
+        const id = activeFlowId;
+        activeFlowId = null;
+        await openCodeUpstreamProviders.completeOAuth(id, undefined, ctx).catch(() => {});
+      }
+    });
 
     const flow = await openCodeUpstreamProviders.beginOAuth("github-copilot", "device", undefined, ctx);
+    activeFlowId = flow.id;
     expect(flow.url).toBe("https://github.com/login/device");
     expect(flow.instructions).toBe("Delayed registration ok");
     expect(oauthPosts).toEqual([{ methodID: "device" }]);
+    await openCodeUpstreamProviders.completeOAuth(flow.id, undefined, ctx);
+    activeFlowId = null;
   });
 });
 
