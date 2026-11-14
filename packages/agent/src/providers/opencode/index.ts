@@ -48,7 +48,7 @@ export const opencodeProvider: ProviderModule = {
   upstreamProviders: {
     list: (ctx) => import("./manager.js").then((m) => m.openCodeUpstreamProviders.list(ctx)),
     authMethods: (providerId, ctx) => import("./manager.js").then((m) => m.openCodeUpstreamProviders.authMethods(providerId, ctx)),
-    setApiKey: (providerId, key, ctx) => import("./manager.js").then((m) => m.openCodeUpstreamProviders.setApiKey(providerId, key, ctx)),
+    setApiKey: (providerId, key, ctx, inputs) => import("./manager.js").then((m) => m.openCodeUpstreamProviders.setApiKey(providerId, key, ctx, inputs)),
     beginOAuth: (providerId, methodId, inputs, ctx) => import("./manager.js").then((m) => m.openCodeUpstreamProviders.beginOAuth(providerId, methodId, inputs, ctx)),
     completeOAuth: (flowId, code, ctx) => import("./manager.js").then((m) => m.openCodeUpstreamProviders.completeOAuth(flowId, code, ctx)),
     canDisconnect: (providerId, ctx) => import("./manager.js").then((m) => m.openCodeUpstreamProviders.canDisconnect(providerId, ctx)),

@@ -1,4 +1,5 @@
 import type { BaseStreamEventFields, StreamEvent, TokenUsage } from "../../types.js";
+import { isV2AbortedError } from "./v2.js";
 
 function str(v: unknown): string | null {
   return typeof v === "string" && v.length > 0 ? v : null;
@@ -113,7 +114,7 @@ export function terminalOutcome(info: unknown, hasVisibleText: boolean): Termina
     // A user interrupt (through opencode's own UI, on a session this process is
     // attached to) is recorded as a MessageAbortedError. Report it as `aborted`
     // to match self-aborts and Codex, not a generic error with a JSON blob.
-    if (rec(rawError)?.["name"] === "MessageAbortedError") {
+    if (isV2AbortedError(rawError)) {
       return { status: "aborted", errorCode: "aborted", errorMessage: "The turn was interrupted.", incomplete: false };
     }
     return { status: "failed", errorCode: "agent_error", errorMessage: JSON.stringify(rawError), incomplete: false };

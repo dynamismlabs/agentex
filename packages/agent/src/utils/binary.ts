@@ -35,7 +35,9 @@ const COMMON_PATHS_UNIX: Record<string, string[]> = {
     path.join(os.homedir(), ".npm-global", "bin", "cursor-agent"),
   ],
   opencode: [
+    path.join(os.homedir(), ".opencode", "bin", "opencode"),
     path.join(os.homedir(), ".local", "bin", "opencode"),
+    "/opt/homebrew/bin/opencode",
     "/usr/local/bin/opencode",
     path.join(os.homedir(), ".npm-global", "bin", "opencode"),
   ],

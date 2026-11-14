@@ -1747,7 +1747,12 @@ export interface ProviderAuthFlow {
 export interface UpstreamProviderManager {
   list(ctx?: ProviderRuntimeContext): Promise<UpstreamProvider[]>;
   authMethods(providerId: string, ctx?: ProviderRuntimeContext): Promise<ProviderAuthMethod[]>;
-  setApiKey(providerId: string, key: string, ctx?: ProviderRuntimeContext): Promise<void>;
+  setApiKey(
+    providerId: string,
+    key: string,
+    ctx?: ProviderRuntimeContext,
+    inputs?: Record<string, string>,
+  ): Promise<void>;
   beginOAuth(
     providerId: string,
     methodId: string,
