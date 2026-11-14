@@ -150,12 +150,14 @@ describe("runScript", () => {
       run: 'printf "%s" "$AGENTEX_PORT"',
     });
 
-    const [first, ...rest] = await ws.ports.allocate(2);
-    expect(rest.length).toBe(1);
+    const allocated = await ws.ports.allocate(2);
+    expect(allocated.length).toBe(2);
+    const firstHeld = ws.ports.held()[0];
+    expect(allocated).toContain(firstHeld);
 
     const handle = await ws.runScript("run");
     const out = await drainStream(handle.output);
-    expect(out).toBe(String(first));
+    expect(out).toBe(String(firstHeld));
     await handle.kill();
   });
 
