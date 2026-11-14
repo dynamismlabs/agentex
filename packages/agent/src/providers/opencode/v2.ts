@@ -207,6 +207,17 @@ function v2IntegrationsSignature(items: unknown[]): string {
     .join("|");
 }
 
+function hasV2PluginAuthMethods(items: unknown[]): boolean {
+  return items.some((raw) => {
+    const entry = rec(raw);
+    const methods = Array.isArray(entry["methods"]) ? entry["methods"] : [];
+    return methods.some((m) => {
+      const method = rec(m);
+      return method["type"] === "oauth" || (Array.isArray(method["form"]) && method["form"].length > 0);
+    });
+  });
+}
+
 /**
  * Wait once per v2 server client for `/api/integration` to populate and for
  * auth plugins (OAuth/form methods) to finish registering before reading or
@@ -246,7 +257,9 @@ export async function ensureV2IntegrationsReady(
         return;
       }
       const nextSig = v2IntegrationsSignature(items);
-      if (nextSig === prevSig) break;
+      // Do not treat an intermediate fallback catalog (without OAuth/form plugin
+      // methods) as settled after a single interval; slow plugins may still be registering.
+      if (nextSig === prevSig && hasV2PluginAuthMethods(items)) break;
       prevSig = nextSig;
     }
   })();

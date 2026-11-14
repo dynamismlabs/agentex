@@ -135,6 +135,9 @@ async function supportsProviderDelete(ctx: ProviderRuntimeContext): Promise<bool
   }
 }
 
+const V2_AUTH_METHOD_DEADLINE_MS = 2500;
+const V2_AUTH_METHOD_POLL_DELAYS_MS = [100, 150, 200, 300, 400, 500];
+
 async function fetchV2Integration(
   server: OpenCodeServerHandle,
   providerId: string,
@@ -149,10 +152,47 @@ async function fetchV2Integration(
   const integrationPayload = await server.client
     .json<unknown>(`/api/integration/${encodeURIComponent(integrationId)}`)
     .catch(() => null);
+  if (integrationPayload) {
+    return {
+      integrationId,
+      integration: v2DataRecord(integrationPayload),
+    };
+  }
+  const catalogPayload = await server.client.json<unknown>("/api/integration").catch(() => null);
+  const matched = catalogPayload
+    ? v2DataArray(catalogPayload).find((raw) => rec(raw)["id"] === integrationId)
+    : undefined;
   return {
     integrationId,
-    integration: integrationPayload ? v2DataRecord(integrationPayload) : null,
+    integration: matched ? rec(matched) : null,
   };
+}
+
+async function resolveV2IntegrationMethod(
+  server: OpenCodeServerHandle,
+  providerId: string,
+  matchMethod: (entry: { method: ProviderAuthMethod; raw: Record<string, unknown> }) => boolean,
+  deadlineMs = V2_AUTH_METHOD_DEADLINE_MS,
+): Promise<{
+  integrationId: string;
+  integration: Record<string, unknown> | null;
+  match: { method: ProviderAuthMethod; raw: Record<string, unknown> } | undefined;
+}> {
+  const deadline = Date.now() + deadlineMs;
+  await ensureV2IntegrationsReady(server.client);
+  let resolved = await fetchV2Integration(server, providerId);
+  let match = v2InteractiveMethods(providerId, resolved.integration).find(matchMethod);
+  let pollIndex = 0;
+  while (!match && Date.now() < deadline) {
+    const step = V2_AUTH_METHOD_POLL_DELAYS_MS[pollIndex] ?? V2_AUTH_METHOD_POLL_DELAYS_MS[V2_AUTH_METHOD_POLL_DELAYS_MS.length - 1]!;
+    pollIndex += 1;
+    const waitMs = Math.min(step, Math.max(0, deadline - Date.now()));
+    if (waitMs <= 0) break;
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+    resolved = await fetchV2Integration(server, providerId);
+    match = v2InteractiveMethods(providerId, resolved.integration).find(matchMethod);
+  }
+  return { ...resolved, match };
 }
 
 function v2InteractiveMethods(
@@ -380,9 +420,16 @@ export const openCodeUpstreamProviders: UpstreamProviderManager = {
     const runtime = await acquireOpenCodeRuntime(ctx);
     try {
       if (serverApiVersion(runtime.server) === 2) {
-        await ensureV2IntegrationsReady(runtime.server.client);
-        const { integrationId, integration } = await fetchV2Integration(runtime.server, providerId);
-        const keyMethod = v2InteractiveMethods(providerId, integration).find((entry) => entry.raw["type"] === "key");
+        const hasInputs = Boolean(inputs && Object.keys(inputs).length > 0);
+        const { integrationId, match: keyMethod } = await resolveV2IntegrationMethod(
+          runtime.server,
+          providerId,
+          (entry) => {
+            if (entry.raw["type"] !== "key") return false;
+            if (!hasInputs) return true;
+            return Array.isArray(entry.raw["form"]) && entry.raw["form"].length > 0;
+          },
+        );
         const answer = buildV2FormAnswer(keyMethod?.raw["form"], inputs);
         await runtime.server.client.ok(`/api/integration/${encodeURIComponent(integrationId)}/connect/key`, {
           method: "POST",
@@ -413,12 +460,13 @@ export const openCodeUpstreamProviders: UpstreamProviderManager = {
       let attemptId: string | undefined;
 
       if (apiVersion === 2) {
-        await ensureV2IntegrationsReady(runtime.server.client);
-        const resolved = await fetchV2Integration(runtime.server, providerId);
-        integrationId = resolved.integrationId;
-        const match = v2InteractiveMethods(providerId, resolved.integration).find(
+        const resolved = await resolveV2IntegrationMethod(
+          runtime.server,
+          providerId,
           (entry) => entry.raw["type"] === "oauth" && (entry.method.id === methodId || entry.raw["id"] === methodId),
         );
+        integrationId = resolved.integrationId;
+        const match = resolved.match;
         const v2MethodId = typeof match?.raw["id"] === "string" ? match.raw["id"] : "";
         if (!v2MethodId) {
           throw new Error("OpenCode authentication method is unavailable");

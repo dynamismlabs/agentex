@@ -1408,6 +1408,65 @@ describe("OpenCode v2 OAuth error & expiry coverage", () => {
     await openCodeUpstreamProviders.setApiKey("azure", "az-secret", ctx, { resourceName: "my-azure-res" });
     expect(keyPosts).toEqual([{ key: "az-secret", answer: { resourceName: "my-azure-res" } }]);
   });
+
+  it("keeps polling past an unchanged intermediate key-only catalog when OAuth registration finishes at 350 ms", async () => {
+    const startedAt = Date.now();
+    const oauthPosts: unknown[] = [];
+
+    const currentIntegration = () => {
+      const oauthReady = Date.now() - startedAt >= 350;
+      return {
+        id: "github-copilot",
+        name: "GitHub Copilot",
+        methods: oauthReady
+          ? [{ id: "device", type: "oauth", label: "Login with GitHub Copilot" }]
+          : [
+              { type: "key", label: "API Key" },
+              { type: "env", names: ["GITHUB_TOKEN"] },
+            ],
+        connections: [],
+      };
+    };
+
+    const { baseUrl } = await startFakeOpenCodeV2Server({
+      handle: (req, res, bodyText) => {
+        const url = req.url ?? "/";
+        if (url === "/api/integration") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ data: [currentIntegration()] }));
+          return;
+        }
+        if (url === "/api/integration/github-copilot") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ data: currentIntegration() }));
+          return;
+        }
+        if (url === "/api/integration/github-copilot/connect/oauth" && req.method === "POST") {
+          oauthPosts.push(JSON.parse(bodyText));
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({
+            data: {
+              attemptID: "att_delayed",
+              url: "https://github.com/login/device",
+              instructions: "Delayed registration ok",
+              mode: "auto",
+            },
+          }));
+          return;
+        }
+        res.writeHead(404).end();
+      },
+    });
+
+    const bin = createFakeV2Script(baseUrl);
+    const cwd = makeTempDir("oc-delayed-oauth-");
+    const ctx = { cwd, config: { command: bin } };
+
+    const flow = await openCodeUpstreamProviders.beginOAuth("github-copilot", "device", undefined, ctx);
+    expect(flow.url).toBe("https://github.com/login/device");
+    expect(flow.instructions).toBe("Delayed registration ok");
+    expect(oauthPosts).toEqual([{ methodID: "device" }]);
+  });
 });
 
 describe("OpenCode v2 parse & execute", () => {
