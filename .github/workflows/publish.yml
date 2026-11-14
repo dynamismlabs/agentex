@@ -140,12 +140,31 @@ jobs:
           PUBLISH_PACKAGES: ${{ needs.detect.outputs.packages }}
         run: |
           node -e '
+          const fs = require("node:fs");
+          const os = require("node:os");
+          const path = require("node:path");
           const { execFileSync } = require("node:child_process");
           const pkgs = JSON.parse(process.env.PUBLISH_PACKAGES);
           for (const name of pkgs) {
+            const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agentex-pack-"));
+            execFileSync("pnpm", ["--filter", name, "pack", "--pack-destination", dir], {
+              stdio: "inherit",
+            });
+            const tarballs = fs.readdirSync(dir).filter((f) => f.endsWith(".tgz"));
+            if (tarballs.length !== 1) {
+              throw new Error(`Expected 1 tarball for ${name}, found ${tarballs.length}`);
+            }
             execFileSync(
-              "pnpm",
-              ["--filter", name, "publish", "--access", "public", "--no-git-checks"],
+              "npm",
+              [
+                "publish",
+                path.join(dir, tarballs[0]),
+                "--access",
+                "public",
+                "--provenance",
+                "--loglevel",
+                "verbose",
+              ],
               { stdio: "inherit" },
             );
           }
