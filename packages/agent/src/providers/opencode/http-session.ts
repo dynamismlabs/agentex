@@ -20,7 +20,7 @@ import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { uuidv7 } from "../../utils/uuid.js";
 import { acquireOpenCodeServer, type OpenCodeServerHandle } from "./server.js";
-import type { OpenCodeClient } from "./client.js";
+import { OpenCodeHttpError, type OpenCodeClient } from "./client.js";
 import { createSessionRecord } from "../../sessions/record.js";
 import { opencodeSessionCodec } from "./codec.js";
 import { prepareOpenCodeSkillConfig } from "./skill-config.js";
@@ -586,17 +586,35 @@ class OpenCodeSession implements AgentSession {
             };
         this._inputReplies.set(id, reply);
       }
-      await this.client.ok(reply.path, {
-        method: reply.method ?? "POST",
-        body: JSON.stringify(reply.body ?? {}),
-      });
-      this._handledInput.add(id);
-      this._inputReplies.delete(id);
-    } catch {
-      // Keep the cached host decision so reconciliation retries only the reply.
+      await this.deliverInputReply(id, reply);
     } finally {
       this._inputInFlight.delete(id);
       this.restoreAfterInput();
+    }
+  }
+
+  private async deliverInputReply(
+    id: string,
+    reply: { path: string; method?: string; body?: Record<string, unknown> },
+  ): Promise<void> {
+    if (!this.client) return;
+    try {
+      await this.client.ok(reply.path, {
+        method: reply.method ?? "POST",
+        ...(reply.body ? { body: JSON.stringify(reply.body) } : {}),
+      });
+      this._handledInput.add(id);
+      this._inputReplies.delete(id);
+    } catch (err) {
+      if (err instanceof OpenCodeHttpError) {
+        if (err.status === 404 || err.status === 409 || err.status === 410) {
+          this._handledInput.add(id);
+          this._inputReplies.delete(id);
+        } else if (err.status >= 400 && err.status < 500 && err.status !== 408 && err.status !== 429) {
+          this._inputReplies.delete(id);
+        }
+      }
+      // Keep the cached host decision on transient errors so reconciliation retries only the reply.
     }
   }
 
@@ -642,14 +660,7 @@ class OpenCodeSession implements AgentSession {
         }
         this._inputReplies.set(id, reply);
       }
-      await this.client.ok(reply.path, {
-        method: reply.method ?? "POST",
-        ...(reply.body ? { body: JSON.stringify(reply.body) } : {}),
-      });
-      this._handledInput.add(id);
-      this._inputReplies.delete(id);
-    } catch {
-      // Keep the cached host decision so reconciliation retries only the reply.
+      await this.deliverInputReply(id, reply);
     } finally {
       this._inputInFlight.delete(id);
       this.restoreAfterInput();
@@ -680,7 +691,7 @@ class OpenCodeSession implements AgentSession {
           const questionText = str(field["title"]) ?? str(field["description"]) ?? key;
           const labelToValue = new Map<string, string>();
           let options: Array<{ label: string; description: string }> = [];
-          if (kind === "multiselect" && Array.isArray(field["options"])) {
+          if ((kind === "multiselect" || kind === "string") && Array.isArray(field["options"])) {
             options = field["options"]
               .map((rawOpt) => {
                 const opt = rec(rawOpt) ?? {};
@@ -737,9 +748,15 @@ class OpenCodeSession implements AgentSession {
                 answer[meta.key] = meta.kind === "integer" ? Math.trunc(parsedNum) : parsedNum;
               }
             } else {
-              const strVal = Array.isArray(raw) ? raw.join(", ") : raw;
-              if (typeof strVal === "string") answer[meta.key] = strVal;
-              else if (strVal !== undefined) answer[meta.key] = String(strVal);
+              const strVal = Array.isArray(raw)
+                ? (raw.length === 1 ? raw[0] : raw.join(", "))
+                : raw;
+              if (typeof strVal === "string") {
+                answer[meta.key] = meta.labelToValue.get(strVal) ?? strVal;
+              } else if (strVal !== undefined) {
+                const asString = String(strVal);
+                answer[meta.key] = meta.labelToValue.get(asString) ?? asString;
+              }
             }
           }
           reply = {
@@ -750,14 +767,7 @@ class OpenCodeSession implements AgentSession {
         }
         this._inputReplies.set(id, reply);
       }
-      await this.client.ok(reply.path, {
-        method: reply.method ?? "POST",
-        ...(reply.body ? { body: JSON.stringify(reply.body) } : {}),
-      });
-      this._handledInput.add(id);
-      this._inputReplies.delete(id);
-    } catch {
-      // Keep the cached host decision so reconciliation retries only the reply.
+      await this.deliverInputReply(id, reply);
     } finally {
       this._inputInFlight.delete(id);
       this.restoreAfterInput();
@@ -1003,18 +1013,39 @@ class OpenCodeSession implements AgentSession {
     const promptPayload = await promptRes.json().catch(() => null);
     const promptId = str(v2DataRecord(promptPayload)["id"]);
 
+    const waitController = new AbortController();
+    const onTurnAbort = (): void => waitController.abort(signal.reason);
+    if (signal.aborted) {
+      waitController.abort(signal.reason);
+    } else {
+      signal.addEventListener("abort", onTurnAbort, { once: true });
+    }
+
     const waitFallback = (async (): Promise<V2TurnOutcome> => {
       try {
         const res = await this.client!.request(`/api/experimental/session/${encodedId}/wait`, {
           method: "POST",
-          signal,
+          signal: waitController.signal,
         });
         if (!res.ok) return waiterPromise;
         return await new Promise<V2TurnOutcome>((resolve) => {
-          const timer = setTimeout(() => resolve({ status: "idle" }), 100);
+          const timer = setTimeout(() => {
+            waitController.signal.removeEventListener("abort", onWaitAbort);
+            resolve({ status: "idle" });
+          }, 100);
           timer.unref?.();
+          const onWaitAbort = (): void => {
+            clearTimeout(timer);
+            resolve({ status: "idle" });
+          };
+          if (waitController.signal.aborted) {
+            onWaitAbort();
+            return;
+          }
+          waitController.signal.addEventListener("abort", onWaitAbort, { once: true });
           void waiterPromise.then((value) => {
             clearTimeout(timer);
+            waitController.signal.removeEventListener("abort", onWaitAbort);
             resolve(value);
           });
         });
@@ -1023,36 +1054,59 @@ class OpenCodeSession implements AgentSession {
       }
     })();
 
+    let onRaceAbort: (() => void) | null = null;
     const abortedPromise = new Promise<never>((_, reject) => {
-      if (signal.aborted) {
+      const rejectAbort = (): void => {
         reject(signal.reason instanceof Error ? signal.reason : new Error(String(signal.reason ?? "aborted")));
+      };
+      if (signal.aborted) {
+        rejectAbort();
         return;
       }
-      signal.addEventListener(
-        "abort",
-        () => reject(signal.reason instanceof Error ? signal.reason : new Error(String(signal.reason ?? "aborted"))),
-        { once: true },
-      );
+      onRaceAbort = rejectAbort;
+      signal.addEventListener("abort", onRaceAbort, { once: true });
     });
 
-    const waitOutcome = await Promise.race([waiterPromise, waitFallback, abortedPromise]);
+    let waitOutcome: V2TurnOutcome;
+    try {
+      waitOutcome = await Promise.race([waiterPromise, waitFallback, abortedPromise]);
+    } finally {
+      waitController.abort("settled");
+      signal.removeEventListener("abort", onTurnAbort);
+      if (onRaceAbort) signal.removeEventListener("abort", onRaceAbort);
+    }
 
     const msgRes = await this.client!.request(`/api/session/${encodedId}/message?limit=20&order=desc`, { signal });
     const rawList = msgRes.ok ? v2DataArray(await msgRes.json().catch(() => [])) : [];
     let rawAssistant: Record<string, unknown> | null = null;
+    let rawIdle: Record<string, unknown> | null = null;
     for (const item of rawList) {
       const entry = rec(item);
       if (!entry) continue;
       if (promptId && str(entry["id"]) === promptId) break;
-      if (entry["type"] === "assistant") {
-        rawAssistant = entry;
-        break;
+      if (!rawIdle && entry["type"] === "idle") {
+        rawIdle = entry;
       }
+      if (!rawAssistant && entry["type"] === "assistant") {
+        rawAssistant = entry;
+      }
+      if (rawIdle && rawAssistant) break;
     }
 
+    const idleOutcome = rawIdle ? str(rawIdle["outcome"]) : null;
+    const effectiveWaitOutcome: V2TurnOutcome =
+      waitOutcome.status === "idle" && idleOutcome
+        ? idleOutcome === "failed"
+          ? { status: "failed", error: rawIdle?.["error"] ?? { type: "idle_failed", message: "OpenCode turn failed" } }
+          : idleOutcome === "interrupted"
+            ? { status: "interrupted", reason: str(rawIdle?.["reason"]) ?? undefined }
+            : { status: "succeeded" }
+        : waitOutcome;
+
     if (!rawAssistant) {
-      if (waitOutcome.status === "failed") {
-        const msg = v2ErrorMessage(waitOutcome.error) || JSON.stringify(waitOutcome.error ?? "OpenCode turn failed");
+      if (effectiveWaitOutcome.status === "failed") {
+        const msg = v2ErrorMessage(effectiveWaitOutcome.error)
+          || JSON.stringify(effectiveWaitOutcome.error ?? "OpenCode turn failed");
         return {
           outcome: {
             summary: null,
@@ -1061,10 +1115,10 @@ class OpenCodeSession implements AgentSession {
             errorCode: "agent_error",
             errorMessage: msg,
           },
-          terminalRaw: { error: waitOutcome.error },
+          terminalRaw: { error: effectiveWaitOutcome.error, ...(rawIdle ? { idle: rawIdle } : {}) },
         };
       }
-      if (waitOutcome.status === "interrupted") {
+      if (effectiveWaitOutcome.status === "interrupted") {
         return {
           outcome: {
             summary: null,
@@ -1073,22 +1127,40 @@ class OpenCodeSession implements AgentSession {
             errorCode: "aborted",
             errorMessage: "The turn was interrupted.",
           },
-          terminalRaw: { interrupted: true, reason: waitOutcome.reason },
+          terminalRaw: { interrupted: true, reason: effectiveWaitOutcome.reason, ...(rawIdle ? { idle: rawIdle } : {}) },
+        };
+      }
+      if (effectiveWaitOutcome.status === "idle") {
+        const msg = "OpenCode turn became idle without a recorded completion or assistant response.";
+        return {
+          outcome: {
+            summary: null,
+            costUsd: null,
+            status: "failed",
+            errorCode: "incomplete_turn",
+            errorMessage: msg,
+          },
+          terminalRaw: { idle: true },
         };
       }
     }
 
     const envelope = rawAssistant ? normalizeV2MessageToEnvelope(rawAssistant) : null;
     const baseInfo = envelope?.info ?? {};
-    const effectiveInfo = !baseInfo["error"] && waitOutcome.status === "failed" && waitOutcome.error != null
-      ? { ...baseInfo, error: waitOutcome.error }
+    const effectiveInfo = !baseInfo["error"] && effectiveWaitOutcome.status === "failed" && effectiveWaitOutcome.error != null
+      ? { ...baseInfo, error: effectiveWaitOutcome.error }
       : baseInfo;
     const usage = usageFromMessage(effectiveInfo);
     const summary = envelope ? (assistantTextFromParts(envelope.parts) || null) : null;
     const costUsd = num(effectiveInfo["cost"]);
-    const terminalRaw: Record<string, unknown> = { info: effectiveInfo, parts: envelope?.parts ?? [], v2: rawAssistant };
+    const terminalRaw: Record<string, unknown> = {
+      info: effectiveInfo,
+      parts: envelope?.parts ?? [],
+      v2: rawAssistant,
+      ...(rawIdle ? { idle: rawIdle } : {}),
+    };
 
-    if (waitOutcome.status === "interrupted" && effectiveInfo["error"] == null) {
+    if (effectiveWaitOutcome.status === "interrupted" && effectiveInfo["error"] == null) {
       return {
         outcome: {
           summary,
@@ -1097,6 +1169,21 @@ class OpenCodeSession implements AgentSession {
           status: "aborted",
           errorCode: "aborted",
           errorMessage: "The turn was interrupted.",
+        },
+        terminalRaw,
+      };
+    }
+
+    if (effectiveWaitOutcome.status === "failed" && effectiveInfo["error"] != null && !effectiveInfo["finish"]) {
+      const msg = v2ErrorMessage(effectiveInfo["error"]) || JSON.stringify(effectiveInfo["error"]);
+      return {
+        outcome: {
+          summary,
+          ...(usage ? { usage } : {}),
+          costUsd,
+          status: "failed",
+          errorCode: "agent_error",
+          errorMessage: msg,
         },
         terminalRaw,
       };

@@ -1,13 +1,17 @@
 import type { AgentMode, ListModesOptions } from "../../types.js";
 import { acquireOpenCodeRuntime } from "./runtime.js";
-import { rec, serverApiVersion, v2DataArray } from "./v2.js";
+import { fetchV2Agents, rec, serverApiVersion } from "./v2.js";
 
 export async function listOpenCodeModes(options: ListModesOptions = {}): Promise<AgentMode[]> {
   const runtime = await acquireOpenCodeRuntime(options);
   try {
     const isV2 = serverApiVersion(runtime.server) === 2;
-    const payload = await runtime.server.client.json<unknown>(isV2 ? "/api/agent" : "/agent");
-    const items = isV2 ? v2DataArray(payload) : (Array.isArray(payload) ? payload : []);
+    const items = isV2
+      ? await fetchV2Agents(runtime.server.client)
+      : await (async () => {
+          const payload = await runtime.server.client.json<unknown>("/agent");
+          return Array.isArray(payload) ? payload : [];
+        })();
     return items.map((raw) => {
       const agent = rec(raw);
       const id = isV2
@@ -28,7 +32,7 @@ export async function listOpenCodeModes(options: ListModesOptions = {}): Promise
         mode,
         hidden,
       };
-    }).filter((agent) => agent.id && !agent.hidden && agent.mode !== "subagent")
+    }).filter((agent) => agent.id && (!isV2 || !agent.hidden) && agent.mode !== "subagent")
       .map(({ mode: _mode, hidden: _hidden, ...agent }) => agent);
   } finally {
     runtime.server.release();

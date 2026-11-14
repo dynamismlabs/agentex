@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { stat } from "node:fs/promises";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -103,7 +104,7 @@ export function normalizeV2MessageToEnvelope(
         role: "user",
         time: msg["time"],
       },
-      parts: text ? [{ id: `${msgId}:part:0`, type: "text", text }] : [],
+      parts: text ? [{ id: `${msgId}:part:0`, messageID: msgId, type: "text", text }] : [],
     };
   }
 
@@ -147,9 +148,9 @@ export function normalizeV2MessageToEnvelope(
     const kind = entry["type"];
     const fallbackPartId = `${msgId}:part:${i}`;
     if (kind === "text" && typeof entry["text"] === "string") {
-      parts.push({ id: fallbackPartId, type: "text", text: entry["text"] });
+      parts.push({ id: fallbackPartId, messageID: msgId, type: "text", text: entry["text"] });
     } else if (kind === "reasoning" && typeof entry["text"] === "string") {
-      parts.push({ id: fallbackPartId, type: "reasoning", text: entry["text"] });
+      parts.push({ id: fallbackPartId, messageID: msgId, type: "reasoning", text: entry["text"] });
     } else if (kind === "tool") {
       const id = typeof entry["id"] === "string" && entry["id"] ? entry["id"] : fallbackPartId;
       const name = typeof entry["name"] === "string" ? entry["name"] : "tool";
@@ -157,6 +158,7 @@ export function normalizeV2MessageToEnvelope(
         type: "tool",
         id,
         callID: id,
+        messageID: msgId,
         tool: name,
         state: normalizeV2ToolState(entry["state"]),
       });
@@ -173,7 +175,26 @@ export function isV2AbortedError(rawError: unknown): boolean {
   return name === "MessageAbortedError" || type === "aborted" || type === "interrupted";
 }
 
-const v2BinaryCache = new Map<string, Promise<boolean>>();
+const DEFAULT_AGENT_WARMUP_DELAYS_MS = [50, 100, 150, 250, 400, 500, 500, 500];
+
+/**
+ * Fetch registered v2 agents, retrying briefly when a newly booted server
+ * still returns an empty list before built-in plugins finish registering.
+ */
+export async function fetchV2Agents(
+  client: { json<T>(path: string): Promise<T> },
+  delaysMs: readonly number[] = DEFAULT_AGENT_WARMUP_DELAYS_MS,
+): Promise<unknown[]> {
+  let items = v2DataArray(await client.json<unknown>("/api/agent"));
+  for (const delay of delaysMs) {
+    if (items.length > 0) break;
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    items = v2DataArray(await client.json<unknown>("/api/agent"));
+  }
+  return items;
+}
+
+const v2BinaryCache = new Map<string, { fingerprint: string; promise: Promise<boolean> }>();
 
 export function parseMajorVersion(output: string): number | null {
   const match = output.match(/\bv?(\d+)\.\d+\.\d+\b/) ?? output.match(/\bv?(\d+)\.\d+\b/);
@@ -182,21 +203,44 @@ export function parseMajorVersion(output: string): number | null {
   return Number.isFinite(major) ? major : null;
 }
 
+async function probeBinaryVersion(command: string, prefixArgs: string[]): Promise<boolean | null> {
+  try {
+    const { stdout, stderr } = await execFileAsync(command, [...prefixArgs, "--version"], { timeout: 3000 });
+    const major = parseMajorVersion(`${stdout}\n${stderr}`);
+    return major === null ? null : major >= 2;
+  } catch {
+    return null;
+  }
+}
+
 export async function isOpenCodeV2Binary(command: string, prefixArgs: string[] = []): Promise<boolean> {
   const cacheKey = `${command}\0${prefixArgs.join("\0")}`;
-  const cached = v2BinaryCache.get(cacheKey);
-  if (cached) return cached;
+  let fingerprint: string | null = null;
+  try {
+    const st = await stat(command);
+    fingerprint = `${st.mtimeMs}:${st.size}`;
+  } catch {
+    // Non-path commands (resolved via PATH) cannot be fingerprinted reliably.
+    v2BinaryCache.delete(cacheKey);
+    return (await probeBinaryVersion(command, prefixArgs)) ?? false;
+  }
 
-  const probe = (async () => {
-    try {
-      const { stdout, stderr } = await execFileAsync(command, [...prefixArgs, "--version"], { timeout: 3000 });
-      const major = parseMajorVersion(`${stdout}\n${stderr}`);
-      return major !== null && major >= 2;
-    } catch {
+  const cached = v2BinaryCache.get(cacheKey);
+  if (cached && cached.fingerprint === fingerprint) return cached.promise;
+
+  const entry: { fingerprint: string; promise: Promise<boolean> } = {
+    fingerprint,
+    promise: Promise.resolve(false),
+  };
+  entry.promise = (async () => {
+    const result = await probeBinaryVersion(command, prefixArgs);
+    if (result === null) {
+      if (v2BinaryCache.get(cacheKey) === entry) v2BinaryCache.delete(cacheKey);
       return false;
     }
+    return result;
   })();
 
-  v2BinaryCache.set(cacheKey, probe);
-  return probe;
+  v2BinaryCache.set(cacheKey, entry);
+  return entry.promise;
 }

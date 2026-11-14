@@ -11,13 +11,13 @@ import { probeOpenCodeCapabilities } from "../../../src/providers/opencode/probe
 import { listOpenCodeModels, openCodeV2ModelsFromPayload } from "../../../src/providers/opencode/discovery.js";
 import { listOpenCodeModes } from "../../../src/providers/opencode/modes.js";
 import { openCodeUpstreamProviders } from "../../../src/providers/opencode/manager.js";
-import { collectHistory, attachOpenCodeHistory } from "../../../src/providers/opencode/history.js";
+import { collectHistory, attachOpenCodeHistory, historicalEvents, OpenCodeHistoryResyncLimitError } from "../../../src/providers/opencode/history.js";
 import { discoverOpenCodeSavedSessions, openCodeSavedHistory, readOpenCodeSavedSession } from "../../../src/providers/opencode/saved-history.js";
 import { createOpenCodeSession } from "../../../src/providers/opencode/http-session.js";
 import { terminalOutcome } from "../../../src/providers/opencode/event-parse.js";
 import { parseOpenCodeJsonl, parseOpenCodeStreamLine } from "../../../src/providers/opencode/parse.js";
 import { executeOpenCodeProvider } from "../../../src/providers/opencode/execute.js";
-import { normalizeV2MessageToEnvelope, parseMajorVersion } from "../../../src/providers/opencode/v2.js";
+import { isOpenCodeV2Binary, normalizeV2MessageToEnvelope, parseMajorVersion } from "../../../src/providers/opencode/v2.js";
 
 const tempDirs: string[] = [];
 const cleanups: Array<() => Promise<void> | void> = [];
@@ -175,6 +175,75 @@ describe("OpenCode v2 server, probe, discovery & modes", () => {
 
     expect(server.apiVersion).toBe(2);
     expect(server.serverVersion).toBe("2.3.0");
+  });
+
+  it("invalidates version detection after binary replacement and does not cache transient failures", async () => {
+    const dir = makeTempDir("oc-ver-cache-");
+    const bin = path.join(dir, "opencode");
+
+    // Simulate a transient failure first (failing exit code), then fix binary to 1.3.2, then upgrade to 2.3.0.
+    writeExecutable(bin, "#!/bin/sh\nexit 1\n");
+    await expect(isOpenCodeV2Binary(bin)).resolves.toBe(false);
+
+    // Bump mtime + replace with 1.3.2.
+    writeExecutable(bin, "#!/bin/sh\necho 1.3.2\n");
+    fs.utimesSync(bin, new Date(Date.now() + 1000), new Date(Date.now() + 1000));
+    await expect(isOpenCodeV2Binary(bin)).resolves.toBe(false);
+
+    // Replace same path with 2.3.0 and distinct mtime/size.
+    writeExecutable(bin, "#!/bin/sh\necho opencode v2.3.0\n");
+    fs.utimesSync(bin, new Date(Date.now() + 2000), new Date(Date.now() + 2000));
+    await expect(isOpenCodeV2Binary(bin)).resolves.toBe(true);
+  });
+
+  it("retries cold empty /api/agent responses during mode listing and capability probing", async () => {
+    let agentCalls = 0;
+    const { baseUrl } = await startFakeOpenCodeV2Server({
+      handle: (req, res) => {
+        if (req.url === "/openapi.json") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({
+            paths: {
+              "/api/session": { get: {}, post: {} },
+              "/api/session/{sessionID}": { get: {} },
+              "/api/session/{sessionID}/prompt": { post: {} },
+              "/api/session/{sessionID}/message": { get: {} },
+              "/api/session/{sessionID}/agent": { post: {} },
+              "/api/session/{sessionID}/permission": { get: {} },
+              "/api/session/{sessionID}/permission/{requestID}/reply": { post: {} },
+              "/api/session/{sessionID}/form": { get: {} },
+              "/api/session/{sessionID}/form/{formID}/reply": { post: {} },
+              "/api/model": { get: {} },
+            },
+          }));
+          return;
+        }
+        if (req.url === "/api/agent") {
+          agentCalls += 1;
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({
+            data: agentCalls >= 3
+              ? [
+                  { id: "build", name: "Build", mode: "primary", hidden: false },
+                  { id: "plan", name: "Plan", mode: "primary", hidden: false },
+                ]
+              : [],
+          }));
+          return;
+        }
+        res.writeHead(404).end();
+      },
+    });
+
+    const bin = createFakeV2Script(baseUrl);
+    const cwd = makeTempDir("oc-cold-agents-");
+    const modes = await listOpenCodeModes({ cwd, config: { command: bin } });
+    expect(modes.map((m) => m.id)).toEqual(["build", "plan"]);
+
+    agentCalls = 0;
+    const report = await probeOpenCodeCapabilities({ cwd, config: { command: bin } });
+    expect(report.capabilities.modes?.supported).toBe(true);
+    expect(report.capabilities.planMode?.supported).toBe(true);
   });
 
   it("probes v2 capabilities, models, and modes", async () => {
@@ -441,7 +510,7 @@ describe("OpenCode v2 history & saved-history", () => {
     });
     expect(userEnv).toEqual({
       info: { id: "msg_u1", role: "user", time: { created: 1000 } },
-      parts: [{ id: "msg_u1:part:0", type: "text", text: "Hello" }],
+      parts: [{ id: "msg_u1:part:0", messageID: "msg_u1", type: "text", text: "Hello" }],
     });
 
     const assistantEnv = normalizeV2MessageToEnvelope({
@@ -464,15 +533,25 @@ describe("OpenCode v2 history & saved-history", () => {
         { type: "text", text: "All done." },
       ],
     });
-    expect(assistantEnv?.parts[0]).toEqual({ id: "msg_a1:part:0", type: "reasoning", text: "Thinking..." });
+    expect(assistantEnv?.parts[0]).toEqual({ id: "msg_a1:part:0", messageID: "msg_a1", type: "reasoning", text: "Thinking..." });
     expect(assistantEnv?.parts[1]).toEqual({
       type: "tool",
       id: "call_1",
       callID: "call_1",
+      messageID: "msg_a1",
       tool: "bash",
       state: { status: "completed", input: { command: "pwd" }, output: "/tmp" },
     });
-    expect(assistantEnv?.parts[2]).toEqual({ id: "msg_a1:part:2", type: "text", text: "All done." });
+    expect(assistantEnv?.parts[2]).toEqual({ id: "msg_a1:part:2", messageID: "msg_a1", type: "text", text: "All done." });
+
+    const replayed = historicalEvents(assistantEnv!, "ses_1", { apiVersion: 2 });
+    expect(replayed.map((r) => [r.event.type, r.event.eventId, r.event.messageId])).toEqual([
+      ["thinking", "msg_a1:part:0", "msg_a1"],
+      ["tool_call", "call_1:call", "msg_a1"],
+      ["tool_result", "call_1:result", "msg_a1"],
+      ["assistant", "msg_a1:part:2", "msg_a1"],
+      ["result", "msg_a1:result", "msg_a1"],
+    ]);
 
     expect(normalizeV2MessageToEnvelope({ id: "msg_meta", type: "agent-switched" })).toBeNull();
     expect(terminalOutcome({ error: { type: "interrupted", message: "Stopped" } }, false).status).toBe("aborted");
@@ -566,21 +645,25 @@ describe("OpenCode v2 history & saved-history", () => {
     expect(savedYields.map((y) => y.event.type)).toEqual(["user", "assistant", "result"]);
     vi.unstubAllGlobals();
 
-    // attachOpenCodeHistory exercises apiVersion: 2 server path cleanly.
+    // attachOpenCodeHistory exercises apiVersion: 2 server path cleanly, including trailing `idle` records.
+    let idleOutcome: "succeeded" | "failed" = "succeeded";
     const { baseUrl } = await startFakeOpenCodeV2Server({
       handle: (req, res) => {
         if ((req.url ?? "").startsWith("/api/session/ses_1/message")) {
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify({
-            data: [{
-              id: "m2",
-              type: "assistant",
-              agent: "build",
-              model: { id: "claude-sonnet-4-5", providerID: "anthropic" },
-              time: { created: 1002 },
-              finish: "stop",
-              content: [{ type: "text", text: "Attached" }],
-            }],
+            data: [
+              { id: "m_idle", type: "idle", outcome: idleOutcome, time: { created: 1003 } },
+              {
+                id: "m2",
+                type: "assistant",
+                agent: "build",
+                model: { id: "claude-sonnet-4-5", providerID: "anthropic" },
+                time: { created: 1002 },
+                finish: "stop",
+                content: [{ type: "text", text: "Attached" }],
+              },
+            ],
           }));
           return;
         }
@@ -600,6 +683,37 @@ describe("OpenCode v2 history & saved-history", () => {
     );
     expect(attachment.lastTurn).toBe("completed");
     await attachment.close();
+
+    idleOutcome = "failed";
+    const failedAttachment = await attachOpenCodeHistory(
+      createSessionRecord({
+        providerType: "opencode",
+        params: { sessionId: "ses_1", cwd },
+        cwd,
+        displayId: "ses_1",
+      }),
+      { config: { command: bin } },
+    );
+    expect(failedAttachment.lastTurn).toBe("interrupted");
+    await failedAttachment.close();
+  });
+
+  it("throws OpenCodeHistoryResyncLimitError when 100 v2 pages contain filtered idle items and cursor.next persists", async () => {
+    let page = 0;
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      page += 1;
+      return Response.json({
+        data: Array.from({ length: 100 }, (_, i) =>
+          i === 0 ? { id: `idle-${page}`, type: "idle", outcome: "succeeded" } : { id: `m-${page}-${i}`, type: "user", text: `msg ${page}/${i}` },
+        ),
+        cursor: { next: `page-${page + 1}` },
+      });
+    }));
+
+    const client = new OpenCodeClient("http://127.0.0.1:9999", "pw");
+    await expect(
+      collectHistory(client, "ses_overflow", undefined, { includeUserMessages: true, apiVersion: 2 }),
+    ).rejects.toBeInstanceOf(OpenCodeHistoryResyncLimitError);
   });
 
   it("sets archived=false on v2 saved history when includeArchived is false", async () => {
@@ -804,6 +918,287 @@ describe("OpenCode v2 HTTP/SSE session", () => {
     await session.interrupt();
     expect(interrupts).toEqual(["ses_v2_live"]);
     await session.close();
+  });
+
+  it("handles /wait fallback idle failures/interrupts, aborts losing /wait requests, supports fixed-choice string forms, resumes model/agent, and aborts mid-turn", async () => {
+    let scenario: "wait_idle_failed" | "wait_aborted_on_sse" | "string_form_and_interrupt" = "wait_idle_failed";
+    let waitClosed = false;
+    let formAttempt = 0;
+    let formPending = false;
+    const stringForm = {
+      id: "frm_str_1",
+      sessionID: "ses_edge",
+      title: "Env",
+      fields: [
+        {
+          key: "env",
+          title: "Choose environment",
+          type: "string",
+          options: [{ value: "prod", label: "Production" }],
+          custom: false,
+        },
+      ],
+    };
+    const seenFormRequests: Array<{ options: unknown; answer: unknown }> = [];
+    const formBodies: unknown[] = [];
+    const modelUpdates: unknown[] = [];
+    const agentUpdates: unknown[] = [];
+    const promptsReceived: unknown[] = [];
+
+    const { baseUrl } = await startFakeOpenCodeV2Server({
+      handle: (req, res, bodyText, emitSse) => {
+        const url = req.url ?? "/";
+        if (url === "/api/session" && req.method === "POST") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ data: { id: "ses_edge" } }));
+          return;
+        }
+        if (url === "/api/session/ses_edge/model" && req.method === "POST") {
+          modelUpdates.push(JSON.parse(bodyText));
+          res.writeHead(204).end();
+          return;
+        }
+        if (url === "/api/session/ses_edge/agent" && req.method === "POST") {
+          agentUpdates.push(JSON.parse(bodyText));
+          res.writeHead(204).end();
+          return;
+        }
+        if (url === "/api/session/ses_edge/permission") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ data: [] }));
+          return;
+        }
+        if (url === "/api/session/ses_edge/form") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ data: formPending ? [stringForm] : [] }));
+          return;
+        }
+        if (url === "/api/session/ses_edge/prompt" && req.method === "POST") {
+          promptsReceived.push(JSON.parse(bodyText));
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ data: { id: "msg_prompt_edge", type: "user" } }));
+          if (scenario === "wait_aborted_on_sse") {
+            setTimeout(() => {
+              emitSse({
+                id: "e_text",
+                created: 1,
+                type: "session.text.delta",
+                data: { sessionID: "ses_edge", assistantMessageID: "msg_asst_edge", ordinal: 0, delta: "Fast" },
+              });
+              emitSse({ id: "e_done", created: 2, type: "session.execution.succeeded", data: { sessionID: "ses_edge" } });
+            }, 10);
+          } else if (scenario === "string_form_and_interrupt") {
+            formPending = true;
+            setTimeout(() => {
+              emitSse({
+                id: "e_form",
+                created: 1,
+                type: "form.created",
+                data: { form: stringForm },
+              });
+            }, 10);
+          }
+          return;
+        }
+        if (url === "/api/session/ses_edge/form/frm_str_1/reply" && req.method === "POST") {
+          formAttempt += 1;
+          formBodies.push(JSON.parse(bodyText));
+          if (formAttempt === 1) {
+            res.writeHead(400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ message: "bad input" }));
+            return;
+          }
+          formPending = false;
+          res.writeHead(204).end();
+          return;
+        }
+        if (url === "/api/session/ses_edge/interrupt" && req.method === "POST") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ interrupted: true }));
+          setTimeout(() => {
+            emitSse({ id: "e_int", created: 2, type: "session.execution.interrupted", data: { sessionID: "ses_edge", reason: "user" } });
+          }, 10);
+          return;
+        }
+        if (url === "/api/experimental/session/ses_edge/wait") {
+          if (scenario === "wait_idle_failed") {
+            res.writeHead(204).end();
+          } else {
+            res.on("close", () => { waitClosed = true; });
+          }
+          return;
+        }
+        if (url.startsWith("/api/session/ses_edge/message")) {
+          res.writeHead(200, { "content-type": "application/json" });
+          if (scenario === "wait_idle_failed") {
+            res.end(JSON.stringify({
+              data: [
+                { id: "m_idle", type: "idle", outcome: "failed", error: { type: "provider.error", message: "Compaction failed" } },
+                { id: "msg_prompt_edge", type: "user", text: "hi" },
+              ],
+            }));
+            return;
+          }
+          if (scenario === "wait_aborted_on_sse") {
+            res.end(JSON.stringify({
+              data: [
+                {
+                  id: "msg_asst_edge",
+                  type: "assistant",
+                  agent: "build",
+                  model: { id: "claude-sonnet-4-5", providerID: "anthropic" },
+                  time: { created: 10 },
+                  finish: "stop",
+                  content: [{ type: "text", text: "Fast" }],
+                },
+                { id: "msg_prompt_edge", type: "user", text: "hi" },
+              ],
+            }));
+            return;
+          }
+          res.end(JSON.stringify({ data: [] }));
+          return;
+        }
+        res.writeHead(404).end();
+      },
+    });
+
+    const bin = createFakeV2Script(baseUrl);
+    const cwd = makeTempDir("oc-edge-");
+
+    // 1. /wait 204 fallback without SSE terminal must report idle.outcome=failed rather than completed.
+    const s1 = await createOpenCodeSession({ cwd, config: { command: bin } });
+    const h1 = await s1.send("hi");
+    const r1 = await h1.result;
+    expect(r1.status).toBe("failed");
+    expect(r1.errorMessage).toContain("Compaction failed");
+    await s1.close();
+
+    // 2. When SSE finishes first, the losing /wait request is aborted cleanly right away.
+    scenario = "wait_aborted_on_sse";
+    waitClosed = false;
+    const s2 = await createOpenCodeSession({ cwd, config: { command: bin } });
+    const r2 = await (await s2.send("hi")).result;
+    expect(r2.status).toBe("completed");
+    expect(r2.summary).toBe("Fast");
+    await new Promise((r) => setTimeout(r, 30));
+    expect(waitClosed).toBe(true);
+    await s2.close();
+
+    // 3. Resumed session sets model & agent; fixed-choice string form exposes options + maps label->value; 400 clears reply cache; mid-turn interrupt aborts.
+    scenario = "string_form_and_interrupt";
+    const s3 = await createOpenCodeSession({
+      cwd,
+      sessionParams: { sessionId: "ses_edge", cwd },
+      config: { command: bin, model: "anthropic/claude-sonnet-4-5", modelVariant: "high", modeId: "plan" },
+      onUserInputRequest: async (req) => {
+        const qs = req.input["questions"] as Array<{ options: Array<{ label: string }> }>;
+        const chosen = seenFormRequests.length === 0 ? "typo" : "Production";
+        seenFormRequests.push({ options: qs[0]?.options, answer: chosen });
+        return { allow: true, updatedInput: { answers: { "Choose environment": chosen } } };
+      },
+    });
+    expect(modelUpdates).toEqual([{ model: { providerID: "anthropic", id: "claude-sonnet-4-5", variant: "high" } }]);
+    expect(agentUpdates).toEqual([{ agent: "plan" }]);
+
+    const h3 = await s3.send("go");
+    const deadline = Date.now() + 2500;
+    while (formBodies.length < 2 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    expect(seenFormRequests).toHaveLength(2);
+    expect(seenFormRequests[0]?.options).toEqual([{ label: "Production", description: "" }]);
+    expect(formBodies).toEqual([{ answer: { env: "typo" } }, { answer: { env: "prod" } }]);
+    await s3.interrupt();
+    const r3 = await h3.result;
+    expect(r3.status).toBe("aborted");
+    await s3.close();
+  });
+});
+
+describe("OpenCode v2 OAuth error & expiry coverage", () => {
+  it("handles code OAuth submission, automatic failure status, and expired flows", async () => {
+    const completedCodes: unknown[] = [];
+    let autoStatus: "failed" | "expired" = "failed";
+
+    const { baseUrl } = await startFakeOpenCodeV2Server({
+      handle: (req, res, bodyText) => {
+        const url = req.url ?? "/";
+        if (url === "/api/provider/anthropic") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ data: { id: "anthropic", integrationID: "anthropic" } }));
+          return;
+        }
+        if (url === "/api/integration/anthropic") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({
+            data: {
+              id: "anthropic",
+              name: "Anthropic",
+              methods: [
+                { id: "code_oauth", type: "oauth", label: "Code OAuth" },
+                { id: "auto_oauth", type: "oauth", label: "Auto OAuth" },
+              ],
+              connections: [],
+            },
+          }));
+          return;
+        }
+        if (url === "/api/integration") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({
+            data: [{
+              id: "anthropic",
+              name: "Anthropic",
+              methods: [
+                { id: "code_oauth", type: "oauth", label: "Code OAuth" },
+                { id: "auto_oauth", type: "oauth", label: "Auto OAuth" },
+              ],
+              connections: [],
+            }],
+          }));
+          return;
+        }
+        if (url === "/api/integration/anthropic/connect/oauth" && req.method === "POST") {
+          const parsed = JSON.parse(bodyText) as { methodID: string };
+          const isCode = parsed.methodID === "code_oauth";
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({
+            data: {
+              attemptID: isCode ? "att_code" : "att_auto",
+              url: "https://auth.example/start",
+              mode: isCode ? "code" : "auto",
+            },
+          }));
+          return;
+        }
+        if (url === "/api/integration/anthropic/connect/oauth/att_code/complete" && req.method === "POST") {
+          completedCodes.push(JSON.parse(bodyText));
+          res.writeHead(204).end();
+          return;
+        }
+        if (url === "/api/integration/anthropic/connect/oauth/att_auto" && req.method === "GET") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ data: { status: autoStatus, message: `oauth ${autoStatus}` } }));
+          return;
+        }
+        res.writeHead(404).end();
+      },
+    });
+
+    const bin = createFakeV2Script(baseUrl);
+    const cwd = makeTempDir("oc-oauth-");
+    const ctx = { cwd, config: { command: bin } };
+
+    const codeFlow = await openCodeUpstreamProviders.beginOAuth("anthropic", "code_oauth", undefined, ctx);
+    expect(codeFlow.completion).toBe("code");
+    await openCodeUpstreamProviders.completeOAuth(codeFlow.id, "auth_code_999", ctx);
+    expect(completedCodes).toEqual([{ code: "auth_code_999" }]);
+
+    const autoFlow = await openCodeUpstreamProviders.beginOAuth("anthropic", "auto_oauth", undefined, ctx);
+    await expect(openCodeUpstreamProviders.completeOAuth(autoFlow.id, undefined, ctx)).rejects.toThrow("oauth failed");
+
+    await expect(openCodeUpstreamProviders.completeOAuth("ocf_missing_or_expired", undefined, ctx)).rejects.toThrow(/expired/i);
   });
 });
 

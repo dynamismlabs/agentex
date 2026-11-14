@@ -189,7 +189,7 @@ function historicalUserEvent(
 export function historicalEvents(
   message: MessageEnvelope,
   sessionId: string,
-  options: { includeUserMessages?: boolean } = {},
+  options: { includeUserMessages?: boolean; apiVersion?: 1 | 2 } = {},
 ): HistoricalEvent[] {
   const info = rec(message.info) ?? {};
   const messageId = string(info["id"]);
@@ -201,15 +201,26 @@ export function historicalEvents(
   }
   if (info["role"] !== "assistant") return [];
   const base: OcBaseInfo = { provider: "opencode", sessionId, timestamp };
+  const isV2 = options.apiVersion === 2;
   const events: HistoricalEvent[] = [];
   for (const rawPart of Array.isArray(message.parts) ? message.parts : []) {
     const part = rec(rawPart);
     const partId = string(part?.["id"]);
     if (!part || !partId) continue;
     if (part["type"] === "tool") {
-      events.push({ event: mapOpenCodeToolCall(part, base), partId });
+      const callId = string(part["callID"]) ?? partId;
+      const callEvent = mapOpenCodeToolCall(part, base);
+      events.push({
+        event: isV2 && callId ? { ...callEvent, eventId: `${callId}:call` } : callEvent,
+        partId,
+      });
       const result = mapOpenCodePart(part, base);
-      if (result?.type === "tool_result") events.push({ event: result, partId });
+      if (result?.type === "tool_result") {
+        events.push({
+          event: isV2 && callId ? { ...result, eventId: `${callId}:result` } : result,
+          partId,
+        });
+      }
       continue;
     }
     const event = mapOpenCodePart(part, base);
@@ -282,6 +293,7 @@ export async function collectHistory(
   let foundMessage = after === null;
   let collectedMessages = 0;
   let collectedBytes = 0;
+  let truncatedAtPageLimit = false;
 
   for (let pageIndex = 0; pageIndex < MAX_PAGES; pageIndex += 1) {
     const query = new URLSearchParams({ limit: String(PAGE_SIZE) });
@@ -322,17 +334,19 @@ export async function collectHistory(
     if (isV2) {
       const next = string(v2Rec(v2Rec(parsed)["cursor"])["next"]);
       if (!next || next === cursor || rawItems.length === 0) break;
+      if (pageIndex === MAX_PAGES - 1) truncatedAtPageLimit = true;
       cursor = next;
     } else {
-      if (page.length < PAGE_SIZE) break;
+      if (rawItems.length < PAGE_SIZE) break;
       const next = response.headers.get("x-next-cursor");
       if (!next || next === cursor) break;
+      if (pageIndex === MAX_PAGES - 1) truncatedAtPageLimit = true;
       cursor = next;
     }
   }
 
   if (!foundMessage) throw new OpenCodeHistoryCheckpointNotFoundError();
-  if (pages.length === MAX_PAGES && pages.at(-1)?.length === PAGE_SIZE) {
+  if (truncatedAtPageLimit) {
     throw new OpenCodeHistoryResyncLimitError();
   }
 
@@ -410,20 +424,44 @@ export async function attachOpenCodeHistory(
   let lastTurn: LastTurnStatus = "unknown";
   try {
     const path = isV2
-      ? `/api/session/${encodeURIComponent(sessionId)}/message?limit=1&order=desc`
+      ? `/api/session/${encodeURIComponent(sessionId)}/message?limit=10&order=desc`
       : `/session/${encodeURIComponent(sessionId)}/message?limit=1`;
     const response = await runtime.server.client.request(path);
     if (response.ok) {
       const payload = await response.json() as unknown;
-      const messages = isV2
-        ? v2DataArray(payload)
-            .map((value) => normalizeV2MessageToEnvelope(value) as MessageEnvelope | null)
-            .filter((value): value is MessageEnvelope => value !== null)
-        : (Array.isArray(payload) ? payload as MessageEnvelope[] : []);
-      const info = messages.at(-1)?.info;
-      lastTurn = info
-        ? (info["finish"] && !info["error"] ? "completed" : "interrupted")
-        : "unknown";
+      if (isV2) {
+        for (const raw of v2DataArray(payload)) {
+          const entry = v2Rec(raw);
+          const msgType = string(entry["type"]);
+          if (msgType === "idle") {
+            const outcome = string(entry["outcome"]);
+            if (outcome === "succeeded") {
+              lastTurn = "completed";
+              break;
+            }
+            if (outcome === "failed" || outcome === "interrupted") {
+              lastTurn = "interrupted";
+              break;
+            }
+            continue;
+          }
+          if (msgType === "assistant") {
+            const info = normalizeV2MessageToEnvelope(entry)?.info;
+            lastTurn = info?.["finish"] && !info["error"] ? "completed" : "interrupted";
+            break;
+          }
+          if (msgType === "user") {
+            lastTurn = "interrupted";
+            break;
+          }
+        }
+      } else {
+        const messages = Array.isArray(payload) ? payload as MessageEnvelope[] : [];
+        const info = messages.at(-1)?.info;
+        lastTurn = info
+          ? (info["finish"] && !info["error"] ? "completed" : "interrupted")
+          : "unknown";
+      }
     }
   } catch {
     lastTurn = "unknown";

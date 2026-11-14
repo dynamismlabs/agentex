@@ -3,7 +3,7 @@ import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { runChildProcess } from "../../utils/process.js";
 import { acquireOpenCodeRuntime } from "./runtime.js";
-import { rec, serverApiVersion, v2DataArray } from "./v2.js";
+import { fetchV2Agents, rec, serverApiVersion } from "./v2.js";
 
 function capability(
   supported: boolean,
@@ -58,10 +58,12 @@ export async function probeOpenCodeCapabilities(
       const apiVersion = serverApiVersion(runtime.server);
       const isV2 = apiVersion === 2;
       const doc = await runtime.server.client.json<Record<string, unknown>>(isV2 ? "/openapi.json" : "/doc");
-      const rawAgents = await runtime.server.client
-        .json<unknown>(isV2 ? "/api/agent" : "/agent")
-        .catch(() => []);
-      const agents = isV2 ? v2DataArray(rawAgents) : (Array.isArray(rawAgents) ? rawAgents : []);
+      const agents = isV2
+        ? await fetchV2Agents(runtime.server.client).catch(() => [])
+        : await runtime.server.client
+            .json<unknown>("/agent")
+            .then((raw) => (Array.isArray(raw) ? raw : []))
+            .catch(() => []);
       const paths = rec(doc["paths"]);
       const has = (path: string, method: string) => Boolean(rec(paths[path])[method]);
       const supportsDisconnect = isV2
