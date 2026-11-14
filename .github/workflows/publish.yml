@@ -121,8 +121,8 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Typecheck and build workspace
-        run: pnpm -r typecheck && pnpm -r build
+      - name: Build and typecheck workspace
+        run: pnpm -r build && pnpm -r typecheck
 
       - name: Run tests for packages to publish
         env:
