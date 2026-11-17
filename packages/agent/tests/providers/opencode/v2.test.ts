@@ -1114,6 +1114,99 @@ describe("OpenCode v2 HTTP/SSE session", () => {
   });
 });
 
+describe("OpenCode v2 effort without a model", () => {
+  // OpenCode 2 carries the variant only on the model reference, so an effort
+  // with no model must go on the session's own model, else the default.
+  async function fakeServer() {
+    const created: unknown[] = [];
+    const modelUpdates: unknown[] = [];
+    let defaultModel: Record<string, unknown> | null = { id: "claude-sonnet-5-5", modelID: "claude-sonnet-5-5", providerID: "anthropic", type: "chat" };
+    const { baseUrl } = await startFakeOpenCodeV2Server({
+      handle: (req, res, bodyText) => {
+        const url = req.url ?? "/";
+        const json = (body: unknown) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(body)); };
+        if (url === "/api/model/default") return json({ location: { directory: "/x" }, data: defaultModel });
+        if (url === "/api/session" && req.method === "POST") { created.push(JSON.parse(bodyText)); return json({ data: { id: "ses_new" } }); }
+        if (url === "/api/session/ses_old" && req.method === "GET") return json({ data: { id: "ses_old", model: { id: "claude-opus-5-5", providerID: "anthropic", variant: "high" } } });
+        if (url === "/api/session/ses_gone" && req.method === "GET") { res.writeHead(404).end(); return; }
+        if (url === "/api/session/ses_old/model" && req.method === "POST") { modelUpdates.push(JSON.parse(bodyText)); res.writeHead(204).end(); return; }
+        if (/^\/api\/session\/ses_\w+\/(permission|form)$/.test(url)) return json({ data: [] });
+        res.writeHead(404).end();
+      },
+    });
+    return { baseUrl, created, modelUpdates, clearDefault: () => { defaultModel = null; } };
+  }
+
+  it("puts a new session's effort on the default model", async () => {
+    const fake = await fakeServer();
+    const session = await createOpenCodeSession({ cwd: makeTempDir("oc-effort-"), config: { command: createFakeV2Script(fake.baseUrl), effort: "max" } });
+    expect(fake.created).toEqual([{ model: { providerID: "anthropic", id: "claude-sonnet-5-5", variant: "max" } }]);
+    await session.close();
+  });
+
+  it("puts a resumed session's effort on that session's own model", async () => {
+    const fake = await fakeServer();
+    const cwd = makeTempDir("oc-effort-");
+    const session = await createOpenCodeSession({
+      cwd,
+      sessionParams: { sessionId: "ses_old", cwd },
+      config: { command: createFakeV2Script(fake.baseUrl), effort: "low" },
+    });
+    expect(fake.modelUpdates).toEqual([{ model: { providerID: "anthropic", id: "claude-opus-5-5", variant: "low" } }]);
+    await session.close();
+  });
+
+  it("leaves the model alone when no effort or variant is asked for", async () => {
+    const fake = await fakeServer();
+    const session = await createOpenCodeSession({ cwd: makeTempDir("oc-effort-"), config: { command: createFakeV2Script(fake.baseUrl) } });
+    expect(fake.created).toEqual([{}]);
+    await session.close();
+  });
+
+  it("refuses an effort it has no model for, instead of dropping it", async () => {
+    const fake = await fakeServer();
+    fake.clearDefault();
+    await expect(createOpenCodeSession({ cwd: makeTempDir("oc-effort-"), config: { command: createFakeV2Script(fake.baseUrl), effort: "max" } }))
+      .rejects.toThrow(/no model to apply the effort/);
+    expect(fake.created).toEqual([]);
+  });
+
+  it("runs a one-off on the default model, or the resumed session's, with the effort", async () => {
+    const fake = await fakeServer();
+    const dir = makeTempDir("oc-effort-exec-");
+    const argsCapture = path.join(dir, "args.json");
+    const bin = writeExecutable(path.join(dir, "opencode"), `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+if (args[0] === "--version") { console.log("2.3.0"); process.exit(0); }
+if (args[0] === "serve") {
+  console.log("opencode server listening on ${fake.baseUrl}");
+  setInterval(() => {}, 10000);
+  process.on("SIGTERM", () => process.exit(0));
+} else {
+  fs.writeFileSync(${JSON.stringify(argsCapture)}, JSON.stringify(args));
+  console.log(JSON.stringify({ type: "text", sessionID: "ses_run", part: { text: "OK" } }));
+}
+`);
+    const args = () => JSON.parse(fs.readFileSync(argsCapture, "utf8")) as string[];
+
+    const fresh = await executeOpenCodeProvider({ prompt: "hi", cwd: dir, config: { command: bin, effort: "max" } });
+    expect(fresh).toMatchObject({ status: "completed", model: "anthropic/claude-sonnet-5-5" });
+    expect(args()).toEqual(expect.arrayContaining(["--model", "anthropic/claude-sonnet-5-5#max"]));
+
+    await executeOpenCodeProvider({ prompt: "hi", cwd: dir, sessionParams: { sessionId: "ses_old", cwd: dir }, config: { command: bin, effort: "low" } });
+    expect(args()).toEqual(expect.arrayContaining(["--session", "ses_old", "--model", "anthropic/claude-opus-5-5#low"]));
+
+    // A session OpenCode no longer has falls back to the default model.
+    await executeOpenCodeProvider({ prompt: "hi", cwd: dir, sessionParams: { sessionId: "ses_gone", cwd: dir }, config: { command: bin, effort: "low" } });
+    expect(args()).toEqual(expect.arrayContaining(["--model", "anthropic/claude-sonnet-5-5#low"]));
+
+    // Without an effort, the run keeps OpenCode's own choice of model.
+    await executeOpenCodeProvider({ prompt: "hi", cwd: dir, config: { command: bin } });
+    expect(args()).not.toContain("--model");
+  });
+});
+
 describe("OpenCode v2 OAuth error & expiry coverage", () => {
   it("handles code OAuth submission, automatic failure status, and expired flows", async () => {
     const completedCodes: unknown[] = [];

@@ -16,7 +16,9 @@ import {
 } from "./parse.js";
 import { prepareOpenCodeSkillConfig } from "./skill-config.js";
 import { isOpenCodeV2Binary } from "./v2.js";
-import { openCodeVariant } from "./effort.js";
+import { openCodeVariant, resolveOpenCodeV2Model } from "./effort.js";
+import { OpenCodeEffortWithoutModelError } from "../../types.js";
+import { acquireOpenCodeServer } from "./server.js";
 
 export function executeOpenCodeProvider(ctx: ExecutionContext): Promise<ExecutionResult> {
   return observeExecution(ctx, { context: false, rates: false }, executeOpenCodeProviderInner);
@@ -122,16 +124,29 @@ async function executeOpenCodeProviderInner(ctx: ExecutionContext): Promise<Exec
   const isV2 = await isOpenCodeV2Binary(resolvedBinary.bin, resolvedBinary.prefixArgs);
 
   // 5. Build args. Effort reaches OpenCode as the model's variant (effort.ts).
+  // OpenCode 2 takes it only as `model#variant`, so without a model it goes on
+  // the resumed session's model, else the default, rather than being dropped.
   const variant = openCodeVariant(config);
+  let runModel = model;
+  if (isV2 && variant && !runModel) {
+    const server = await acquireOpenCodeServer(resolvedBinary.bin, resolvedBinary.prefixArgs, env, cwd);
+    try {
+      const base = await resolveOpenCodeV2Model(server.client, sessionId);
+      if (!base) throw new OpenCodeEffortWithoutModelError();
+      runModel = `${base.providerID}/${base.id}`;
+    } finally {
+      server.release();
+    }
+  }
   const buildArgs = (resumeSessionId: string | null): string[] => {
     const args = [...resolvedBinary.prefixArgs, "run", "--format", "json"];
     if (isV2) args.push("--standalone");
     if (resumeSessionId) args.push("--session", resumeSessionId);
     if (isV2) {
-      if (model) {
-        const formattedModel = variant && !model.includes("#")
-          ? `${model}#${variant}`
-          : model;
+      if (runModel) {
+        const formattedModel = variant && !runModel.includes("#")
+          ? `${runModel}#${variant}`
+          : runModel;
         args.push("--model", formattedModel);
       }
       if ((config.unattendedPermissionPolicy ?? "allow") === "allow") {
@@ -258,7 +273,7 @@ async function executeOpenCodeProviderInner(ctx: ExecutionContext): Promise<Exec
   const resolvedSessionId = parsed.sessionId;
   const resultSessionParams = resolvedSessionId ? { sessionId: resolvedSessionId, cwd } : null;
   const completedAt = new Date().toISOString();
-  const resolvedModel = model || null;
+  const resolvedModel = runModel || null;
   const status = proc.aborted ? "aborted" as const
     : proc.timedOut ? "timeout" as const
     : (errorCode || errorMessage) ? "failed" as const

@@ -1681,6 +1681,18 @@ export interface ServiceTierState {
   reason: string | null;
 }
 
+/**
+ * OpenCode 2 was asked for an effort or variant with no model to carry it:
+ * none in the config, the resumed session or OpenCode's default. Thrown
+ * before inference instead of running on some other effort.
+ */
+export class OpenCodeEffortWithoutModelError extends Error {
+  constructor() {
+    super("OpenCode has no model to apply the effort or variant to. Set config.model, or choose a default model in OpenCode.");
+    this.name = "OpenCodeEffortWithoutModelError";
+  }
+}
+
 /** Invalid or unavailable explicit speed selection, detected before inference. */
 export class ServiceTierConfigurationError extends Error {
   constructor(readonly code: "unsupported_runtime" | "unsupported_model" | "conflicting_settings" | "unavailable" | "discovery_failed" | "invalid_tier", message: string) {

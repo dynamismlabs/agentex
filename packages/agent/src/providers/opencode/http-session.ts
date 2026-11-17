@@ -24,7 +24,8 @@ import { OpenCodeHttpError, type OpenCodeClient } from "./client.js";
 import { createSessionRecord } from "../../sessions/record.js";
 import { opencodeSessionCodec } from "./codec.js";
 import { prepareOpenCodeSkillConfig } from "./skill-config.js";
-import { openCodeVariant } from "./effort.js";
+import { openCodeVariant, resolveOpenCodeV2Model } from "./effort.js";
+import { OpenCodeEffortWithoutModelError } from "../../types.js";
 import {
   assistantTextFromParts,
   incompleteTurnMessage,
@@ -154,14 +155,21 @@ class OpenCodeSession implements AgentSession {
     return openCodeVariant(this.ctx.config);
   }
 
-  private v2ModelRef(): Record<string, unknown> | null {
-    if (!this.model) return null;
+  /**
+   * The model reference a v2 session starts or resumes with. OpenCode 2 has
+   * the variant only on it, so an effort without a model goes on the session's
+   * own model, else the server's default, rather than being dropped.
+   */
+  private async v2ModelRef(resumeId: string | null): Promise<Record<string, unknown> | null> {
     const variant = this.variant;
-    return {
-      providerID: this.model.providerID,
-      id: this.model.modelID,
-      ...(variant ? { variant } : {}),
-    };
+    const base = this.model
+      ? { providerID: this.model.providerID, id: this.model.modelID }
+      : variant ? await resolveOpenCodeV2Model(this.client!, resumeId) : null;
+    if (!base) {
+      if (variant) throw new OpenCodeEffortWithoutModelError();
+      return null;
+    }
+    return { ...base, ...(variant ? { variant } : {}) };
   }
 
   private selectedAgent(): string | undefined {
@@ -193,7 +201,7 @@ class OpenCodeSession implements AgentSession {
     try {
       const resumeId = readResumeId(this.ctx.sessionParams);
       if (this.isV2) {
-        const modelRef = this.v2ModelRef();
+        const modelRef = await this.v2ModelRef(resumeId);
         const agent = this.selectedAgent();
         if (resumeId) {
           this._sessionId = resumeId;
