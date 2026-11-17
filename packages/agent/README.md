@@ -139,7 +139,7 @@ const cursorModels = cursorRuntime?.capabilities.modelDiscovery?.supported
   : [];
 ```
 
-OpenCode model IDs are fully qualified as `provider/model`. Provider-native variants are returned separately on `ProviderModel.variants` and selected with `config.modelVariant`. Cursor models are returned exactly as the installed CLI reports them. Grok therefore appears through Cursor discovery when the account and CLI expose it. There is no separate Grok provider or hard-coded Grok catalog.
+OpenCode model IDs are fully qualified as `provider/model`. OpenCode has no effort flag: a reasoning model lists its effort levels as variants named after them (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`), each setting only that effort. Those come back on `ProviderModel.supportedEfforts`, weakest first, and `config.effort` sends the level as the variant, so effort works the same as on Claude, Codex and Antigravity, and `sessionEffortChange` matches `sessionVariantChange`. Any other variant, such as one defined in `opencode.json`, stays on `ProviderModel.variants` and is selected with `config.modelVariant`, which wins when both are set. Cursor models are returned exactly as the installed CLI reports them. Grok therefore appears through Cursor discovery when the account and CLI expose it. There is no separate Grok provider or hard-coded Grok catalog.
 
 Cursor's runtime report claims sessions and resume only when the selected CLI advertises `--print`, `--resume`, and `stream-json` as an explicit `--output-format` value. A generic output-format flag is not enough. A real turn still validates that `system:init` arrives before releasing any output. This keeps discovery non-billable without treating a successful model-list command as proof of the execution protocol.
 
@@ -307,8 +307,8 @@ interface ExecutionContext {
 interface ProviderConfig {
   command?: string;                 // Override CLI binary path
   model?: string;
-  modelVariant?: string;            // OpenCode provider-native variant, separate from effort
-  effort?: string;                  // claude/antigravity: --effort; codex: turn effort override
+  modelVariant?: string;            // OpenCode variant that isn't an effort level; wins over effort
+  effort?: string;                  // claude/antigravity: --effort; codex: turn effort override; opencode: the model's variant
   serviceTier?: string;             // codex/claude: inference speed; omit to inherit, "default" for Standard
   unattendedPermissionPolicy?: "allow" | "deny";
   inputRequestTimeoutSec?: number;  // OpenCode permission/question response deadline, default 300

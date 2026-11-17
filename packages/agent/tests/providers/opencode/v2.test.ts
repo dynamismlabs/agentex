@@ -330,6 +330,7 @@ describe("OpenCode v2 server, probe, discovery & modes", () => {
     expect(report.capabilities.savedHistory?.supported).toBe(true);
     expect(report.capabilities.planMode?.supported).toBe(true);
     expect(report.capabilities.modes?.supported).toBe(true);
+    expect(report.capabilities.sessionEffortChange?.supported).toBe(report.capabilities.sessionVariantChange?.supported);
 
     const models = await listOpenCodeModels(ctx);
     expect(models).toEqual([
@@ -338,10 +339,7 @@ describe("OpenCode v2 server, probe, discovery & modes", () => {
         name: "Claude Sonnet 4.5",
         provider: "anthropic",
         providerName: "Anthropic",
-        variants: [
-          { id: "low", name: "low" },
-          { id: "high", name: "high" },
-        ],
+        supportedEfforts: ["low", "high"],
         contextWindow: 200000,
         maxOutputTokens: 64000,
         inputCostPerMillion: 3,
@@ -1085,12 +1083,12 @@ describe("OpenCode v2 HTTP/SSE session", () => {
     expect(waitClosed).toBe(true);
     await s2.close();
 
-    // 3. Resumed session sets model & agent; fixed-choice string form exposes options + maps label->value; 400 clears reply cache; mid-turn interrupt aborts.
+    // 3. Resumed session sets model (its effort as the variant) & agent; fixed-choice string form exposes options + maps label->value; 400 clears reply cache; mid-turn interrupt aborts.
     scenario = "string_form_and_interrupt";
     const s3 = await createOpenCodeSession({
       cwd,
       sessionParams: { sessionId: "ses_edge", cwd },
-      config: { command: bin, model: "anthropic/claude-sonnet-4-5", modelVariant: "high", modeId: "plan" },
+      config: { command: bin, model: "anthropic/claude-sonnet-4-5", effort: "high", modeId: "plan" },
       onUserInputRequest: async (req) => {
         const qs = req.input["questions"] as Array<{ options: Array<{ label: string }> }>;
         const chosen = seenFormRequests.length === 0 ? "typo" : "Production";
@@ -1554,6 +1552,14 @@ console.log(JSON.stringify({ type: "step_finish", sessionID: "ses_exec_v2", part
     expect(args).toContain("anthropic/claude-sonnet-4-5#high");
     expect(args).toContain("--agent");
     expect(args).toContain("plan");
+
+    await executeOpenCodeProvider({
+      prompt: "hello",
+      cwd: dir,
+      model: "anthropic/claude-sonnet-4-5",
+      config: { command: bin, effort: "max" },
+    });
+    expect(JSON.parse(fs.readFileSync(argsCapture, "utf8"))).toContain("anthropic/claude-sonnet-4-5#max");
   });
 
   it("parses real v2 tool_use JSON lines with part.tool, state.input, and state.output", () => {

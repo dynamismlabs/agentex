@@ -24,6 +24,7 @@ import { OpenCodeHttpError, type OpenCodeClient } from "./client.js";
 import { createSessionRecord } from "../../sessions/record.js";
 import { opencodeSessionCodec } from "./codec.js";
 import { prepareOpenCodeSkillConfig } from "./skill-config.js";
+import { openCodeVariant } from "./effort.js";
 import {
   assistantTextFromParts,
   incompleteTurnMessage,
@@ -148,12 +149,18 @@ class OpenCodeSession implements AgentSession {
     return serverApiVersion(this.server) === 2;
   }
 
+  /** Effort reaches OpenCode as the model's variant (effort.ts). */
+  private get variant(): string | undefined {
+    return openCodeVariant(this.ctx.config);
+  }
+
   private v2ModelRef(): Record<string, unknown> | null {
     if (!this.model) return null;
+    const variant = this.variant;
     return {
       providerID: this.model.providerID,
       id: this.model.modelID,
-      ...(this.ctx.config?.modelVariant ? { variant: this.ctx.config.modelVariant } : {}),
+      ...(variant ? { variant } : {}),
     };
   }
 
@@ -895,7 +902,8 @@ class OpenCodeSession implements AgentSession {
 
     const body: Record<string, unknown> = { parts: [{ type: "text", text: message }] };
     if (this.model) body["model"] = this.model;
-    if (this.ctx.config?.modelVariant) body["variant"] = this.ctx.config.modelVariant;
+    const variant = this.variant;
+    if (variant) body["variant"] = variant;
     const agent = this.selectedAgent();
     if (agent) body["agent"] = agent;
 

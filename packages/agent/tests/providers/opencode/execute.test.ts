@@ -95,4 +95,23 @@ describe("executeOpenCodeProvider", () => {
       "--model", "anthropic/claude", "--variant", "high", "--agent", "build",
     ]));
   });
+
+  it("sends effort as the model's variant, and a set modelVariant wins", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "agentex-opencode-effort-"));
+    const argsFor = async (config: Record<string, unknown>, name: string) => {
+      const argsFile = path.join(dir, `${name}.jsonl`);
+      await executeOpenCodeProvider(makeCtx({
+        cwd: dir,
+        model: "anthropic/claude",
+        config: { command: MOCK_OPENCODE, ...config },
+        env: { MOCK_BEHAVIOR: "success", MOCK_DUMP_ARGS_TO: argsFile },
+      }));
+      return JSON.parse((await readFile(argsFile, "utf8")).trim()) as string[];
+    };
+    expect(await argsFor({ effort: "xhigh" }, "effort")).toEqual(expect.arrayContaining(["--variant", "xhigh"]));
+    const both = await argsFor({ effort: "xhigh", modelVariant: "thinking" }, "both");
+    expect(both).toEqual(expect.arrayContaining(["--variant", "thinking"]));
+    expect(both).not.toContain("xhigh");
+    expect(await argsFor({}, "none")).not.toContain("--variant");
+  });
 });

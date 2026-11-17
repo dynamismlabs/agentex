@@ -16,6 +16,7 @@ import {
 } from "./parse.js";
 import { prepareOpenCodeSkillConfig } from "./skill-config.js";
 import { isOpenCodeV2Binary } from "./v2.js";
+import { openCodeVariant } from "./effort.js";
 
 export function executeOpenCodeProvider(ctx: ExecutionContext): Promise<ExecutionResult> {
   return observeExecution(ctx, { context: false, rates: false }, executeOpenCodeProviderInner);
@@ -120,15 +121,16 @@ async function executeOpenCodeProviderInner(ctx: ExecutionContext): Promise<Exec
 
   const isV2 = await isOpenCodeV2Binary(resolvedBinary.bin, resolvedBinary.prefixArgs);
 
-  // 5. Build args
+  // 5. Build args. Effort reaches OpenCode as the model's variant (effort.ts).
+  const variant = openCodeVariant(config);
   const buildArgs = (resumeSessionId: string | null): string[] => {
     const args = [...resolvedBinary.prefixArgs, "run", "--format", "json"];
     if (isV2) args.push("--standalone");
     if (resumeSessionId) args.push("--session", resumeSessionId);
     if (isV2) {
       if (model) {
-        const formattedModel = config.modelVariant && !model.includes("#")
-          ? `${model}#${config.modelVariant}`
+        const formattedModel = variant && !model.includes("#")
+          ? `${model}#${variant}`
           : model;
         args.push("--model", formattedModel);
       }
@@ -137,7 +139,7 @@ async function executeOpenCodeProviderInner(ctx: ExecutionContext): Promise<Exec
       }
     } else {
       if (model) args.push("--model", model);
-      if (config.modelVariant) args.push("--variant", config.modelVariant);
+      if (variant) args.push("--variant", variant);
     }
     const agent = config.planMode ? "plan" : (config.modeId ?? config.mode);
     if (agent) args.push("--agent", agent);

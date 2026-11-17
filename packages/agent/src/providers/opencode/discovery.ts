@@ -2,6 +2,7 @@ import type { ListModelsOptions, ProviderModel } from "../../types.js";
 import { acquireOpenCodeRuntime } from "./runtime.js";
 import { rec, serverApiVersion, v2DataArray } from "./v2.js";
 import { withModelCache } from "../../utils/model-cache.js";
+import { splitOpenCodeVariants } from "./effort.js";
 
 function number(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
@@ -54,13 +55,12 @@ export function openCodeModelsFromPayload(payload: Record<string, unknown>): Pro
       const inputModalities = Array.isArray(modalities["input"])
         ? modalities["input"].filter((item): item is string => typeof item === "string")
         : [];
-      const variants = parseVariants(model["variants"]);
       models.push({
         id: `${providerId}/${modelId}`,
         name: typeof model["name"] === "string" ? model["name"] : modelId,
         provider: providerId,
         providerName,
-        ...(variants.length ? { variants } : {}),
+        ...splitOpenCodeVariants(parseVariants(model["variants"])),
         ...(number(limits["context"]) !== undefined ? { contextWindow: number(limits["context"]) } : {}),
         ...(number(limits["output"]) !== undefined ? { maxOutputTokens: number(limits["output"]) } : {}),
         ...(number(cost["input"]) !== undefined ? { inputCostPerMillion: number(cost["input"]) } : {}),
@@ -104,14 +104,12 @@ export function openCodeV2ModelsFromPayload(
     const inputList = Array.isArray(capabilities["input"])
       ? capabilities["input"].filter((item): item is string => typeof item === "string")
       : [];
-    const variants = parseVariants(model["variants"]);
-
     models.push({
       id: `${providerId}/${modelId}`,
       name: typeof model["name"] === "string" ? model["name"] : modelId,
       provider: providerId,
       providerName: providerNames.get(providerId) ?? providerId,
-      ...(variants.length ? { variants } : {}),
+      ...splitOpenCodeVariants(parseVariants(model["variants"])),
       ...(number(limits["context"]) !== undefined ? { contextWindow: number(limits["context"]) } : {}),
       ...(number(limits["output"]) !== undefined ? { maxOutputTokens: number(limits["output"]) } : {}),
       ...(number(costEntry["input"]) !== undefined ? { inputCostPerMillion: number(costEntry["input"]) } : {}),

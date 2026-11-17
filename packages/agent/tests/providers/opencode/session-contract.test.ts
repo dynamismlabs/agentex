@@ -89,6 +89,16 @@ describe("OpenCode HTTP session contract", () => {
     await session.close();
   });
 
+  it("sends effort as the model's variant", async () => {
+    const fake = fixture();
+    mocks.acquire.mockResolvedValue(fake.handle);
+    const session = await createOpenCodeSession({ config: { model: "anthropic/claude", effort: "max" } });
+    await (await session.send("hello")).result;
+    const message = fake.calls.find((call) => call.kind === "request" && call.path.includes("/message"));
+    expect(JSON.parse(String(message?.init?.body))).toMatchObject({ variant: "max" });
+    await session.close();
+  });
+
   it("emits one terminal failure without exposing an upstream response body", async () => {
     const fake = fixture({ messageStatus: 500 });
     mocks.acquire.mockResolvedValue(fake.handle);
