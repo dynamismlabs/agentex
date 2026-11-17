@@ -121,7 +121,8 @@ export interface ProviderCapabilities {
   savedHistory?: boolean;
   /** A persisted provider session can be resumed. */
   resume?: boolean;
-  /** Models expose provider-native variants independently from effort. */
+  /** Models expose provider-native variants independently from effort.
+   *  OpenCode reports its effort-level variants as `supportedEfforts` instead. */
   modelVariants?: boolean;
   /** Accepts config.serviceTier. Runtime/model/account availability is separate. */
   serviceTiers?: boolean;
@@ -707,10 +708,13 @@ export interface ProviderEndpointConfig {
 export interface ProviderConfig {
   command?: string;
   model?: string;
-  /** Provider-native model variant, independent from reasoning effort. */
+  /** Provider-native model variant, independent from reasoning effort. OpenCode
+   *  only: a variant of the model's own that isn't an effort level (those are
+   *  `ProviderModel.supportedEfforts`). Wins over `effort` when both are set. */
   modelVariant?: string;
   /** Provider reasoning effort. Claude and Antigravity map this to `--effort`;
-   *  Codex sends it as the app-server `turn/start.effort` override. */
+   *  Codex sends it as the app-server `turn/start.effort` override; OpenCode
+   *  sends it as the model's variant of that name. */
   effort?: string;
   /** Provider-native inference speed, independent of model and effort.
    * Codex: catalog ids ("priority", "ultrafast"), with "fast" as an alias.
@@ -1675,6 +1679,18 @@ export interface ServiceTierState {
   effective: string | null;
   /** Provider fallback notification or explanation, when observed. */
   reason: string | null;
+}
+
+/**
+ * OpenCode 2 was asked for an effort or variant with no model to carry it:
+ * none in the config, the resumed session or OpenCode's default. Thrown
+ * before inference instead of running on some other effort.
+ */
+export class OpenCodeEffortWithoutModelError extends Error {
+  constructor() {
+    super("OpenCode has no model to apply the effort or variant to. Set config.model, or choose a default model in OpenCode.");
+    this.name = "OpenCodeEffortWithoutModelError";
+  }
 }
 
 /** Invalid or unavailable explicit speed selection, detected before inference. */

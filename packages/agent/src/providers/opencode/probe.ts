@@ -106,6 +106,7 @@ export async function probeOpenCodeCapabilities(
         modes: capability(agents.length > 0),
         sessionModelChange: capability(isV2 ? has("/api/session/{sessionID}/model", "post") : true),
         sessionVariantChange: capability(isV2 ? has("/api/session/{sessionID}/model", "post") : true),
+        sessionEffortChange: capability(isV2 ? has("/api/session/{sessionID}/model", "post") : true),
         sessionModeChange: capability(
           isV2 ? agents.length > 0 && has("/api/session/{sessionID}/agent", "post") : agents.length > 0,
         ),

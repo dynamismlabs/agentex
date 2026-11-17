@@ -32,7 +32,8 @@ export const opencodeProvider: ProviderModule = {
     upstreamProviderDisconnect: true,
     sessionModelChange: true,
     sessionVariantChange: true,
-    sessionEffortChange: false,
+    // Effort is sent as the variant (effort.ts), so it changes the same way.
+    sessionEffortChange: true,
     sessionModeChange: true,
   },
   // One-shot `opencode run` for execute(); live HTTP/SSE sessions via the
