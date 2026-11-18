@@ -13,6 +13,8 @@ export interface RunProcessOptions {
   maxCaptureBytes?: number;
   onOutput?: (stream: "stdout" | "stderr", chunk: string) => void | Promise<void>;
   onStart?: (pid: number) => void;
+  /** Runs when the process exits, before any inherited pipes finish draining. */
+  onExit?: (pid: number) => void;
   /** AbortSignal to cancel the process. */
   signal?: AbortSignal;
 }
@@ -100,6 +102,10 @@ export function runChildProcess(opts: RunProcessOptions): Promise<RunProcessResu
     if (opts.onStart && child.pid != null) {
       opts.onStart(child.pid);
     }
+
+    const pid = child.pid;
+    const onExit = opts.onExit;
+    if (onExit && pid !== undefined) child.once("exit", () => onExit(pid));
 
     // A command can exit without consuming its input. Handle the pipe error
     // before writing so that a fast exit cannot crash the host with EPIPE;

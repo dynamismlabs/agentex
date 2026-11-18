@@ -46,6 +46,7 @@ export const antigravityProvider: ProviderModule = {
     (await import("./session.js")).createAntigravitySession(ctx),
   resolveAuth: (ctx) => resolveAuthForProvider("antigravity", ctx),
   sessionCodec: antigravitySessionCodec,
+  readRateLimits: (ctx) => import("../../telemetry/rate-limit-read.js").then((m) => m.readNativeRateLimits("antigravity", ctx)),
   listModels: (options) => import("./discovery.js").then((m) => m.listAntigravityModels(options)),
   listModes: (options) => import("./discovery.js").then((m) => m.listAntigravityModes(options)),
   probeCapabilities: (ctx) => import("./probe.js").then((m) => m.probeAntigravityCapabilities(ctx)),

@@ -7,9 +7,10 @@ import { findBinary } from "../utils/binary.js";
 import { fileIdentity, nativeAuthFileIdentity } from "../utils/native-auth-identity.js";
 
 export type NativeTelemetryProvider = "claude" | "codex";
+export type AccountRateLimitProvider = NativeTelemetryProvider | "antigravity";
 const keySalt = randomBytes(32);
 
-export async function telemetryRuntime(provider: NativeTelemetryProvider, ctx: ProviderRuntimeContext) {
+export async function telemetryRuntime<P extends AccountRateLimitProvider>(provider: P, ctx: ProviderRuntimeContext) {
   const config = structuredClone(ctx.config ?? {});
   const cwd = resolve(ctx.cwd ?? process.cwd());
   const env = buildEnv(ctx.env); ensurePathInEnv(env);
@@ -17,12 +18,14 @@ export async function telemetryRuntime(provider: NativeTelemetryProvider, ctx: P
   Object.assign(env, endpoint.env); for (const key of endpoint.unset) delete env[key];
   // Detect native file-backed auth changes without reading or retaining tokens.
   let binary;
-  try { binary = await findBinary(provider, config.command); } catch { /* Reported by the operation, without native startup. */ }
+  try { binary = await findBinary(provider === "antigravity" ? "agy" : provider, config.command); } catch { /* Reported by the operation, without native startup. */ }
   const [authFiles, runtimeFiles] = await Promise.all([
     nativeAuthFileIdentity(provider, cwd, env),
     Promise.all(binary ? [binary.bin, ...binary.prefixArgs].map((path) => fileIdentity(resolve(path))) : []),
   ]);
-  const key = createHmac("sha256", keySalt).update(canonical({ provider, cwd, env, config, binary, authFiles, runtimeFiles })).digest("hex");
+  // Antigravity reads run in a private folder, so the caller's cwd doesn't change the result.
+  const scope = { provider, cwd: provider === "antigravity" ? null : cwd, env, config, binary, authFiles, runtimeFiles };
+  const key = createHmac("sha256", keySalt).update(canonical(scope)).digest("hex");
   return { provider, config, cwd, env, binary, endpointArgs: endpoint.args, key };
 }
 
@@ -37,4 +40,4 @@ function canonical(value: unknown): string {
 export const claudeTelemetryArgs = ["--print", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
   "--no-session-persistence", "--setting-sources", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}'];
 
-export type TelemetryRuntime = Awaited<ReturnType<typeof telemetryRuntime>>;
+export type TelemetryRuntime<P extends AccountRateLimitProvider = NativeTelemetryProvider> = Awaited<ReturnType<typeof telemetryRuntime<P>>>;

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { copyFile, chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, chmod, mkdtemp, mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getProvider } from "../../src/registry.js";
 import { acpProvider } from "../../src/providers/acp/index.js";
@@ -11,7 +11,7 @@ import type { RateLimitReadContext } from "../../src/types.js";
 const fixture = fileURLToPath(new URL("../fixtures/mock-sessionless-telemetry.mjs", import.meta.url));
 const dirs: string[] = [];
 afterEach(async () => { await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true }))); });
-async function setup(protocol: "claude" | "codex", env: Record<string, string> = {}) {
+async function setup(protocol: "claude" | "codex" | "antigravity", env: Record<string, string> = {}) {
   const cwd = await mkdtemp(join(tmpdir(), "agentex-rate-read-")); dirs.push(cwd);
   const log = join(cwd, "requests.jsonl");
   const ctx: RateLimitReadContext = { cwd, config: { command: fixture }, env: { MOCK_PROTOCOL: protocol, MOCK_LOG: log, ...env } };
@@ -116,7 +116,7 @@ describe("explicit sessionless account reads", () => {
     expect((await f.read({ signal: controller.signal })).status).toBe("unavailable");
     expect((await f.read({ config: { ...f.ctx.config, endpoint: { baseUrl: "http://127.0.0.1:1234", apiKey: "secret" } } })).status).toBe("unsupported");
     expect(await f.logs()).toEqual([]);
-    for (const type of ["cursor", "opencode", "antigravity", "pi", "process", "openclaw", "gemini", "copilot"]) expect(getProvider(type).readRateLimits).toBeUndefined();
+    for (const type of ["cursor", "opencode", "pi", "process", "openclaw", "gemini", "copilot"]) expect(getProvider(type).readRateLimits).toBeUndefined();
     expect(acpProvider.readRateLimits).toBeUndefined(); expect(httpAgentProvider.readRateLimits).toBeUndefined();
   });
   it.each(["claude", "codex"] as const)("%s reports non-service auth as unsupported", async (protocol) => {
@@ -156,5 +156,135 @@ describe("explicit sessionless account reads", () => {
     const f = await setup("claude");
     for (const timeoutMs of [0, -1, NaN, Infinity]) await expect(f.read({ timeoutMs })).rejects.toThrow("positive finite");
     expect(await f.logs()).toEqual([]);
+  });
+});
+
+
+describe("Antigravity account capacity", () => {
+  type Bucket = Record<string, unknown>;
+  const report = (groups: { name: string; buckets: Bucket[] }[], options: { turns?: number; text?: string } = {}) => JSON.stringify({
+    status: "SUCCESS", num_turns: options.turns ?? 0, response: options.text ?? "", command: { name: "usage", data: { groups } },
+  });
+
+  it("normalizes independent model pools and retains reset times without inferring enforcement", async () => {
+    const f = await setup("antigravity");
+    const result = await f.read({ config: { command: fixture, extraArgs: ["--continue"] } });
+    expect(result).toMatchObject({ support: "supported", status: "fresh", refreshSupported: true, value: { mode: "replace", snapshot: { provider: "antigravity" } } });
+    const { buckets, observedAt } = result.value!.snapshot;
+    expect(buckets).toMatchObject([
+      { id: "gemini-5h", label: "Gemini Models", usedPercent: 0, durationMs: 18_000_000, resetAt: "2030-01-01T00:00:00.000Z", observedAt },
+      { id: "gemini-weekly", label: "Gemini Models", usedPercent: 80, durationMs: 604_800_000, observedAt },
+      // The used-up pool's zero fraction is missing. Its text report says 0% remain.
+      { id: "3p-weekly", label: "Claude and GPT models", usedPercent: 100, durationMs: 604_800_000, resetAt: "2030-01-01T00:00:00.000Z", observedAt },
+    ]);
+    expect(buckets).toHaveLength(3);
+    expect(buckets[0]?.applicability).toEqual({ kind: "provider_pool", pool: "Gemini Models" });
+    expect(buckets[2]?.enforcement).toBeUndefined();
+    const logs = await f.logs();
+    expect(logs.some((x) => x.event === "unexpected")).toBe(false);
+    await f.closed();
+  });
+
+  it("runs agy in a private empty folder without auto-update, shared across caller folders", async () => {
+    const f = await setup("antigravity", { MOCK_DELAY: "150" });
+    const other = join(f.cwd, "other"); await mkdir(other);
+    const [a, b] = await Promise.all([f.read(), f.read({ cwd: other })]);
+    expect([a.status, b.status]).toEqual(["fresh", "fresh"]);
+    const logs = await f.logs();
+    const agy = logs.filter((x) => x.event === "agy");
+    expect(agy.map((x) => x.mode)).toEqual(["version", "control"]);
+    expect(agy.every((x) => x.autoUpdate === "true")).toBe(true);
+    const folder = agy[1]!.cwd as string;
+    expect(basename(folder)).toMatch(/^agentex-agy-quota-/);
+    expect(folder).not.toBe(await realpath(f.cwd)); expect(folder).not.toBe(await realpath(other));
+    await expect(stat(folder)).rejects.toThrow();
+    await f.closed();
+  });
+
+  it("takes a missing fraction from the text report and never guesses one", async () => {
+    const f = await setup("antigravity");
+    const read = async (MOCK_RATES: string) => f.read({ env: { ...f.ctx.env, MOCK_RATES } });
+    const buckets = async (MOCK_RATES: string) => (await read(MOCK_RATES)).value?.snapshot.buckets;
+    const weekly = { id: "weekly", name: "Weekly Limit Remaining", window: "weekly", reset_time: "2030-01-01T00:00:00Z" };
+
+    expect(await buckets(report([{ name: "Gemini", buckets: [{ ...weekly, remaining_fraction: 0 }] }]))).toMatchObject([{ usedPercent: 100 }]);
+    const precise = await buckets(report([{ name: "Gemini", buckets: [
+      { ...weekly, id: "partial", remaining_fraction: 0.6752 },
+      { ...weekly, id: "above-zero", remaining_fraction: 0.99999 },
+      { ...weekly, id: "below-warning", remaining_fraction: 0.20004 },
+    ] }]));
+    expect(precise?.[0]?.usedPercent).toBeCloseTo(32.48);
+    expect(precise?.[1]?.usedPercent).toBeCloseTo(0.001, 6);
+    expect(precise?.[2]?.usedPercent).toBeCloseTo(79.996, 6);
+    expect(await buckets(report([{ name: "Gemini", buckets: [weekly] }], { text: "Gemini\tWeekly Limit Remaining\t37%\t2030-01-01T00:00:00Z\n" })))
+      .toMatchObject([{ usedPercent: 63 }]);
+
+    // No figure anywhere: the allowance stays with its reset, without a percentage.
+    for (const text of ["", "Gemini\tWeekly Limit Remaining\t0%\tx\nGemini\tWeekly Limit Remaining\t90%\tx\n", "Gemini\tWeekly Limit Remaining\tsoon\tx\n"]) {
+      const [kept] = (await buckets(report([{ name: "Gemini", buckets: [weekly] }], { text })))!;
+      expect(kept).toMatchObject({ id: "weekly", durationMs: 604_800_000, resetAt: "2030-01-01T00:00:00.000Z" });
+      expect(kept).not.toHaveProperty("usedPercent");
+    }
+    // Balances and window-less buckets without a fraction cannot become an allowance.
+    expect(await read(report([{ name: "Credits", buckets: [{ id: "credits", name: "Credits", remaining_amount: 50 }] }]))).toMatchObject({ status: "unavailable", value: null });
+    expect(await read(report([{ name: "Gemini", buckets: [{ id: "x", name: "Other" }, { ...weekly, remaining_fraction: 1.5 }] }]))).toMatchObject({ status: "unavailable", value: null });
+    await f.closed();
+  });
+
+  it.each(["1.1.10", "1.1.11-beta.1", "unknown"])("skips /usage on unverified version %s", async (version) => {
+    const f = await setup("antigravity", { MOCK_AGY_VERSION: version });
+    expect(await f.read()).toMatchObject({ status: "unsupported", value: null });
+    expect((await f.logs()).filter((x) => x.event === "start").map((x) => x.mode)).toEqual(["version"]);
+    await f.closed();
+  });
+
+  it("returns safe diagnostics for signed-out, unreported and malformed reports", async () => {
+    const f = await setup("antigravity", { MOCK_AGY_SIGNED_OUT: "1" });
+    const signedOut = await f.read();
+    expect(signedOut).toMatchObject({ status: "unsupported", value: null, reason: expect.stringContaining("sign-in") });
+    expect(JSON.stringify(signedOut)).not.toContain("raw-secret-token");
+    const read = (env: Record<string, string>) => f.read({ env: { ...f.ctx.env, MOCK_AGY_SIGNED_OUT: "", ...env } });
+    // Exit 2: API-key sign-in has no account quota, or the CLI lacks a flag. Neither heals on retry.
+    expect(await read({ MOCK_AGY_EXIT: "2" })).toMatchObject({ status: "unsupported", refreshSupported: false, value: null });
+    expect(await read({ MOCK_AGY_EXIT: "1" })).toMatchObject({ status: "unavailable", value: null });
+    expect(await read({ MOCK_RATES: "not JSON" })).toMatchObject({ status: "unavailable", value: null });
+    expect(await read({ MOCK_RATES: report([], { turns: 1 }) })).toMatchObject({ status: "unavailable", value: null });
+    expect(await read({ MOCK_RATES: report([]) })).toMatchObject({ status: "fresh", value: { snapshot: { buckets: [] } } });
+    expect(await read({ MOCK_RATES: report([{ name: "Gemini", buckets: [{ id: "weekly", remaining_fraction: 0.5, reset_time: "2000-01-01T00:00:00Z" }] }]) })).toMatchObject({
+      status: "stale", value: { snapshot: { buckets: [{ usedPercent: 50, stale: true }] } },
+    });
+    await f.closed();
+  });
+
+  it.skipIf(process.platform === "win32").each(["ignore", "stderr"])("ends an MCP process agy leaves running with %s stdio", async (stdio) => {
+    const f = await setup("antigravity", { MOCK_AGY_CHILD: stdio });
+    expect((await f.read({ timeoutMs: 2_000 })).status).toBe("fresh");
+    const child = (await f.logs()).find((x) => x.event === "child");
+    expect(child?.pid).toEqual(expect.any(Number));
+    await vi.waitFor(() => expect(() => process.kill(child.pid, 0)).toThrow(), { timeout: 3_000 });
+    await f.closed();
+  });
+
+  it("shares the version and usage reads, with independent caller cancellation", async () => {
+    const f = await setup("antigravity", { MOCK_DELAY: "250" });
+    const controller = new AbortController();
+    const cancelled = f.read({ signal: controller.signal });
+    const surviving = f.read();
+    await vi.waitFor(async () => expect((await f.logs()).some((x) => x.method === "usage")).toBe(true));
+    controller.abort();
+    expect(await cancelled).toMatchObject({ status: "unavailable", reason: expect.stringContaining("cancelled") });
+    expect((await surviving).status).toBe("fresh");
+    expect((await f.logs()).filter((x) => x.event === "start")).toHaveLength(2);
+    await f.closed();
+  });
+
+  it("closes a stalled usage process before the final caller returns", async () => {
+    const f = await setup("antigravity", { MOCK_DELAY: "5000" });
+    const controller = new AbortController();
+    const result = f.read({ signal: controller.signal });
+    await vi.waitFor(async () => expect((await f.logs()).some((x) => x.method === "usage")).toBe(true));
+    controller.abort();
+    expect(await result).toMatchObject({ status: "unavailable" });
+    await f.closed();
   });
 });
