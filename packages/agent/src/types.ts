@@ -378,7 +378,7 @@ export interface ProviderModule {
   /**
    * Explicit, bounded sessionless capacity read. Never sends an inference
    * prompt or creates conversation history. Matching concurrent reads share
-   * one native process; completed observations are not cached by Agent Ex.
+   * one in-flight operation; completed observations are not cached by Agent Ex.
    * A successful value is an authoritative replace update, independent of
    * probeCapabilities and existing session snapshot/refresh surfaces.
    * Honors cwd, env and config.command; custom config.endpoint is unsupported,

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { copyFile, chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, chmod, mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,7 +11,7 @@ import type { RateLimitReadContext } from "../../src/types.js";
 const fixture = fileURLToPath(new URL("../fixtures/mock-sessionless-telemetry.mjs", import.meta.url));
 const dirs: string[] = [];
 afterEach(async () => { await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true }))); });
-async function setup(protocol: "claude" | "codex", env: Record<string, string> = {}) {
+async function setup(protocol: "claude" | "codex" | "antigravity", env: Record<string, string> = {}) {
   const cwd = await mkdtemp(join(tmpdir(), "agentex-rate-read-")); dirs.push(cwd);
   const log = join(cwd, "requests.jsonl");
   const ctx: RateLimitReadContext = { cwd, config: { command: fixture }, env: { MOCK_PROTOCOL: protocol, MOCK_LOG: log, ...env } };
@@ -116,7 +116,7 @@ describe("explicit sessionless account reads", () => {
     expect((await f.read({ signal: controller.signal })).status).toBe("unavailable");
     expect((await f.read({ config: { ...f.ctx.config, endpoint: { baseUrl: "http://127.0.0.1:1234", apiKey: "secret" } } })).status).toBe("unsupported");
     expect(await f.logs()).toEqual([]);
-    for (const type of ["cursor", "opencode", "antigravity", "pi", "process", "openclaw", "gemini", "copilot"]) expect(getProvider(type).readRateLimits).toBeUndefined();
+    for (const type of ["cursor", "opencode", "pi", "process", "openclaw", "gemini", "copilot"]) expect(getProvider(type).readRateLimits).toBeUndefined();
     expect(acpProvider.readRateLimits).toBeUndefined(); expect(httpAgentProvider.readRateLimits).toBeUndefined();
   });
   it.each(["claude", "codex"] as const)("%s reports non-service auth as unsupported", async (protocol) => {
@@ -156,5 +156,70 @@ describe("explicit sessionless account reads", () => {
     const f = await setup("claude");
     for (const timeoutMs of [0, -1, NaN, Infinity]) await expect(f.read({ timeoutMs })).rejects.toThrow("positive finite");
     expect(await f.logs()).toEqual([]);
+  });
+});
+
+
+describe("Antigravity account capacity", () => {
+  it("normalizes independent model pools and retains reset times without inferring enforcement", async () => {
+    const f = await setup("antigravity");
+    const result = await f.read({ config: { command: fixture, extraArgs: ["--continue"] } });
+    expect(result).toMatchObject({ support: "supported", status: "fresh", refreshSupported: true, value: { mode: "replace", snapshot: { provider: "antigravity" } } });
+    const { buckets, observedAt } = result.value!.snapshot;
+    expect(buckets).toMatchObject([
+      { id: "gemini-5h", usedPercent: 0, durationMs: 18_000_000, resetAt: "2030-01-01T00:00:00.000Z", observedAt },
+      { id: "gemini-weekly", usedPercent: 80, durationMs: 604_800_000, observedAt },
+      { id: "third-party-weekly", usedPercent: 100, durationMs: 604_800_000, label: "Claude and GPT models", observedAt },
+    ]);
+    expect(buckets[0]?.applicability).toEqual({ kind: "provider_pool", pool: "Gemini Models" });
+    expect(buckets[2]?.enforcement).toBeUndefined();
+    expect((await f.logs()).filter((x) => x.event === "request")).toEqual([{ event: "request", method: "usage", cwd: await realpath(f.cwd) }]);
+    await f.closed();
+  });
+
+  it.each(["1.1.10", "1.1.11-beta.1", "unknown"])("skips /usage on unverified version %s", async (version) => {
+    const f = await setup("antigravity", { MOCK_AGY_VERSION: version });
+    expect(await f.read()).toMatchObject({ status: "unsupported", value: null });
+    expect((await f.logs()).map((x) => x.mode)).toEqual(["version"]);
+    await f.closed();
+  });
+
+  it("returns safe diagnostics for signed-out and malformed reports", async () => {
+    const f = await setup("antigravity", { MOCK_AGY_SIGNED_OUT: "1" });
+    const signedOut = await f.read();
+    expect(signedOut).toMatchObject({ status: "unsupported", value: null });
+    expect(JSON.stringify(signedOut)).not.toContain("raw-secret-token");
+    const report = (num_turns: number, groups: unknown[]) => JSON.stringify({ status: "SUCCESS", num_turns, command: { name: "usage", data: { groups } } });
+    const read = (MOCK_RATES: string) => f.read({ env: { ...f.ctx.env, MOCK_AGY_SIGNED_OUT: "", MOCK_RATES } });
+    expect(await read("not JSON")).toMatchObject({ status: "unavailable", value: null });
+    expect(await read(report(1, []))).toMatchObject({ status: "unavailable", value: null });
+    expect(await read(report(0, []))).toMatchObject({ status: "fresh", value: { snapshot: { buckets: [] } } });
+    expect(await read(report(0, [{ name: "Gemini", buckets: [{ id: "weekly", remaining_fraction: 0.5, reset_time: "2000-01-01T00:00:00Z" }] }]))).toMatchObject({
+      status: "stale", value: { snapshot: { buckets: [{ usedPercent: 50, stale: true }] } },
+    });
+    await f.closed();
+  });
+
+  it("shares the version and usage reads, with independent caller cancellation", async () => {
+    const f = await setup("antigravity", { MOCK_DELAY: "250" });
+    const controller = new AbortController();
+    const cancelled = f.read({ signal: controller.signal });
+    const surviving = f.read();
+    await vi.waitFor(async () => expect((await f.logs()).some((x) => x.method === "usage")).toBe(true));
+    controller.abort();
+    expect(await cancelled).toMatchObject({ status: "unavailable", reason: expect.stringContaining("cancelled") });
+    expect((await surviving).status).toBe("fresh");
+    expect((await f.logs()).filter((x) => x.event === "start")).toHaveLength(2);
+    await f.closed();
+  });
+
+  it("closes a stalled usage process before the final caller returns", async () => {
+    const f = await setup("antigravity", { MOCK_DELAY: "5000" });
+    const controller = new AbortController();
+    const result = f.read({ signal: controller.signal });
+    await vi.waitFor(async () => expect((await f.logs()).some((x) => x.method === "usage")).toBe(true));
+    controller.abort();
+    expect(await result).toMatchObject({ status: "unavailable" });
+    await f.closed();
   });
 });

@@ -68,10 +68,10 @@ export async function probeAntigravityCapabilities(
         : {}),
     },
     capabilities: {
-      contextUsage: { supported: false, status: "degraded", reason: "Selected antigravity transport has no verified context or provider-capacity source" },
-      contextUsageRefresh: { supported: false, status: "degraded", reason: "Selected antigravity transport has no verified context or provider-capacity source" },
-      rateLimits: { supported: false, status: "degraded", reason: "Selected antigravity transport has no verified context or provider-capacity source" },
-      rateLimitsRefresh: { supported: false, status: "degraded", reason: "Selected antigravity transport has no verified context or provider-capacity source" },
+      contextUsage: { supported: false, status: "degraded", reason: "Antigravity stream-json does not expose session context or capacity telemetry" },
+      contextUsageRefresh: { supported: false, status: "degraded", reason: "Antigravity stream-json does not expose session context or capacity telemetry" },
+      rateLimits: { supported: false, status: "degraded", reason: "Use provider.readRateLimits() for Antigravity account quotas" },
+      rateLimitsRefresh: { supported: false, status: "degraded", reason: "Use provider.readRateLimits() for Antigravity account quotas" },
       sessions: supported(protocolSupported, "Antigravity stream-json input is unavailable"),
       resume: supported(protocolSupported, "Antigravity --conversation resume is unavailable"),
       modelDiscovery: modelDiscovery

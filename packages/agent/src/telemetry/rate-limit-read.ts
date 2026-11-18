@@ -1,17 +1,18 @@
 import { randomUUID } from "node:crypto";
 import type { RateLimitReadContext, RateLimitUpdate, TelemetryObservation } from "../types.js";
 import { record, textValue } from "../utils/jsonl-lines.js";
+import { readAntigravityQuota } from "../providers/antigravity/rate-limits.js";
 import { claudeUsageRateLimits } from "../providers/claude/parse.js";
 import { codexRateLimits } from "../providers/codex/transcript-normalize.js";
 import { NativeTelemetryError, NativeTelemetryRpc } from "./native-rpc.js";
-import { claudeTelemetryArgs, telemetryRuntime, type NativeTelemetryProvider, type TelemetryRuntime } from "./runtime.js";
+import { claudeTelemetryArgs, telemetryRuntime, type AccountRateLimitProvider, type NativeTelemetryProvider, type TelemetryRuntime } from "./runtime.js";
 import { rateLimitTimeout, TelemetryCancelled, TelemetryFlights } from "./single-flight.js";
 
 type Observation = TelemetryObservation<RateLimitUpdate>;
 const reads = new TelemetryFlights<Observation>();
 
 /** No completed-data cache. Every explicit read gets a fresh native observation. */
-export async function readNativeRateLimits(provider: NativeTelemetryProvider, ctx: RateLimitReadContext = {}): Promise<Observation> {
+export async function readNativeRateLimits(provider: AccountRateLimitProvider, ctx: RateLimitReadContext = {}): Promise<Observation> {
   const timeoutMs = rateLimitTimeout(ctx.timeoutMs);
   if (ctx.signal?.aborted) return unavailable("Rate-limit read cancelled");
   const started = Date.now();
@@ -26,10 +27,16 @@ export async function readNativeRateLimits(provider: NativeTelemetryProvider, ct
   }
 }
 
-async function readRuntimeRateLimits(runtime: TelemetryRuntime, signal: AbortSignal): Promise<Observation> {
+async function readRuntimeRateLimits(runtime: TelemetryRuntime<AccountRateLimitProvider>, signal: AbortSignal): Promise<Observation> {
   const binary = runtime.binary;
   if (!binary) return unavailable("Selected harness binary is unavailable");
   if (signal.aborted) return unavailable("Rate-limit read cancelled");
+  if (runtime.provider === "antigravity") {
+    const result = await readAntigravityQuota(binary, runtime.cwd, runtime.env, signal);
+    if (result === "upgrade_required") return unsupported("Antigravity CLI 1.1.11 or newer is required for account rate-limit reads");
+    if (result === "signed_out") return unsupported("Antigravity account rate limits require a Google sign-in");
+    return result ? observedRateLimits(result) : unavailable("Antigravity CLI returned no account rate-limit observation");
+  }
   let rpc: NativeTelemetryRpc | undefined;
   try {
     const args = runtime.provider === "claude" ? claudeTelemetryArgs : [...runtime.endpointArgs, "app-server"];
@@ -44,7 +51,7 @@ async function readRuntimeRateLimits(runtime: TelemetryRuntime, signal: AbortSig
 }
 
 /** Scope preparation has no native transport to close, but still consumes the caller's deadline. */
-function prepareRuntime(provider: NativeTelemetryProvider, ctx: RateLimitReadContext, timeoutMs: number): Promise<TelemetryRuntime> {
+function prepareRuntime(provider: AccountRateLimitProvider, ctx: RateLimitReadContext, timeoutMs: number): Promise<TelemetryRuntime<AccountRateLimitProvider>> {
   return new Promise((resolve, reject) => {
     const cleanup = () => { clearTimeout(timer); ctx.signal?.removeEventListener("abort", onAbort); };
     const onAbort = () => { cleanup(); reject(new TelemetryCancelled("aborted")); };
@@ -71,6 +78,10 @@ export async function readRateLimitsFromRpc(provider: NativeTelemetryProvider, r
     update = claudeUsageRateLimits(response, new Date().toISOString(), "replace");
   }
   if (!update) return unavailable("Runtime returned no account rate-limit observation", response.rate_limits_available === true ? "supported" : "unknown");
+  return observedRateLimits(update);
+}
+
+function observedRateLimits(update: RateLimitUpdate): Observation {
   update.snapshot.authContextId = randomUUID();
   for (const bucket of update.snapshot.buckets) bucket.stale = bucket.resetAt !== undefined && Date.parse(bucket.resetAt) <= Date.now();
   const stale = update.snapshot.buckets.some((bucket) => bucket.stale);

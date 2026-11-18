@@ -11,6 +11,10 @@ export async function fileIdentity(path: string): Promise<unknown[]> {
 }
 
 export async function nativeAuthFileIdentity(provider: string, cwd: string, env: Record<string, string | undefined>): Promise<unknown[][]> {
+  if (provider === "antigravity") {
+    const userHome = env[process.platform === "win32" ? "USERPROFILE" : "HOME"] || homedir();
+    return [await fileIdentity(resolve(cwd, userHome, ".gemini", "antigravity-cli", "settings.json"))];
+  }
   if (provider !== "codex" && provider !== "claude") return [];
   const userHome = env.HOME ?? env.USERPROFILE ?? homedir();
   const home = resolve(cwd, env[provider === "codex" ? "CODEX_HOME" : "CLAUDE_CONFIG_DIR"] ?? join(userHome, `.${provider}`));

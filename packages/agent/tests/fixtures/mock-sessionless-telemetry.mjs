@@ -7,6 +7,35 @@ const args = process.argv.slice(2);
 const mode = args.includes("--version") ? "version" : args.includes("generate-ts") ? "schema" : "control";
 const log = (value) => { if (process.env.MOCK_LOG) appendFileSync(process.env.MOCK_LOG, JSON.stringify(value) + "\n"); };
 log({ event: "start", mode, pid: process.pid, args });
+if (protocol === "antigravity") {
+  if (mode === "version") {
+    console.log(process.env.MOCK_AGY_VERSION ?? "1.1.11");
+    process.exit(0);
+  }
+  const expected = ["--settings", '{"disableSlashCommands":false}', "--print", "/usage", "--output-format", "json"];
+  if (JSON.stringify(args) !== JSON.stringify(expected)) process.exit(2);
+  if (process.env.MOCK_AGY_SIGNED_OUT) {
+    console.error("Authentication required: Bearer raw-secret-token");
+    process.exit(1);
+  }
+  log({ event: "request", method: "usage", cwd: process.cwd() });
+  await new Promise((resolve) => setTimeout(resolve, Number(process.env.MOCK_DELAY ?? 0)));
+  console.log(process.env.MOCK_RATES ?? JSON.stringify({
+    status: "SUCCESS", num_turns: 0, command: { name: "usage", data: { groups: [
+      { name: "Gemini Models", buckets: [
+        { id: "gemini-5h", window: "5h", remaining_fraction: 1, reset_time: "2030-01-01T00:00:00Z" },
+        { id: "gemini-weekly", window: "weekly", remaining_fraction: 0.2 },
+        { id: "disabled", disabled: true, remaining_fraction: 1 },
+        { id: "absolute", remaining_amount: 50 },
+        { id: "invalid", remaining_fraction: 2 },
+      ] },
+      { name: "Claude and GPT models", buckets: [
+        { id: "third-party-weekly", window: "weekly", remaining_fraction: 0 },
+      ] },
+    ] } },
+  }));
+  process.exit(0);
+}
 if (mode === "version") {
   console.log(protocol === "codex" ? "codex-cli 0.160.0" : "2.1.295 (Claude Code)"); process.exit(0);
 }
