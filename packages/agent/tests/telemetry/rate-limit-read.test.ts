@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { copyFile, chmod, mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { copyFile, chmod, mkdtemp, mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getProvider } from "../../src/registry.js";
 import { acpProvider } from "../../src/providers/acp/index.js";
@@ -161,42 +161,100 @@ describe("explicit sessionless account reads", () => {
 
 
 describe("Antigravity account capacity", () => {
+  type Bucket = Record<string, unknown>;
+  const report = (groups: { name: string; buckets: Bucket[] }[], options: { turns?: number; text?: string } = {}) => JSON.stringify({
+    status: "SUCCESS", num_turns: options.turns ?? 0, response: options.text ?? "", command: { name: "usage", data: { groups } },
+  });
+
   it("normalizes independent model pools and retains reset times without inferring enforcement", async () => {
     const f = await setup("antigravity");
     const result = await f.read({ config: { command: fixture, extraArgs: ["--continue"] } });
     expect(result).toMatchObject({ support: "supported", status: "fresh", refreshSupported: true, value: { mode: "replace", snapshot: { provider: "antigravity" } } });
     const { buckets, observedAt } = result.value!.snapshot;
     expect(buckets).toMatchObject([
-      { id: "gemini-5h", usedPercent: 0, durationMs: 18_000_000, resetAt: "2030-01-01T00:00:00.000Z", observedAt },
-      { id: "gemini-weekly", usedPercent: 80, durationMs: 604_800_000, observedAt },
-      { id: "third-party-weekly", usedPercent: 100, durationMs: 604_800_000, label: "Claude and GPT models", observedAt },
+      { id: "gemini-5h", label: "Gemini Models", usedPercent: 0, durationMs: 18_000_000, resetAt: "2030-01-01T00:00:00.000Z", observedAt },
+      { id: "gemini-weekly", label: "Gemini Models", usedPercent: 80, durationMs: 604_800_000, observedAt },
+      // The used-up pool's zero fraction is missing. Its text report says 0% remain.
+      { id: "3p-weekly", label: "Claude and GPT models", usedPercent: 100, durationMs: 604_800_000, resetAt: "2030-01-01T00:00:00.000Z", observedAt },
     ]);
+    expect(buckets).toHaveLength(3);
     expect(buckets[0]?.applicability).toEqual({ kind: "provider_pool", pool: "Gemini Models" });
     expect(buckets[2]?.enforcement).toBeUndefined();
-    expect((await f.logs()).filter((x) => x.event === "request")).toEqual([{ event: "request", method: "usage", cwd: await realpath(f.cwd) }]);
+    const logs = await f.logs();
+    expect(logs.some((x) => x.event === "unexpected")).toBe(false);
+    await f.closed();
+  });
+
+  it("runs agy in a private empty folder without auto-update, shared across caller folders", async () => {
+    const f = await setup("antigravity", { MOCK_DELAY: "150" });
+    const other = join(f.cwd, "other"); await mkdir(other);
+    const [a, b] = await Promise.all([f.read(), f.read({ cwd: other })]);
+    expect([a.status, b.status]).toEqual(["fresh", "fresh"]);
+    const logs = await f.logs();
+    const agy = logs.filter((x) => x.event === "agy");
+    expect(agy.map((x) => x.mode)).toEqual(["version", "control"]);
+    expect(agy.every((x) => x.autoUpdate === "true")).toBe(true);
+    const folder = agy[1]!.cwd as string;
+    expect(basename(folder)).toMatch(/^agentex-agy-quota-/);
+    expect(folder).not.toBe(await realpath(f.cwd)); expect(folder).not.toBe(await realpath(other));
+    await expect(stat(folder)).rejects.toThrow();
+    await f.closed();
+  });
+
+  it("takes a missing fraction from the text report and never guesses one", async () => {
+    const f = await setup("antigravity");
+    const read = async (MOCK_RATES: string) => f.read({ env: { ...f.ctx.env, MOCK_RATES } });
+    const buckets = async (MOCK_RATES: string) => (await read(MOCK_RATES)).value?.snapshot.buckets;
+    const weekly = { id: "weekly", name: "Weekly Limit Remaining", window: "weekly", reset_time: "2030-01-01T00:00:00Z" };
+
+    expect(await buckets(report([{ name: "Gemini", buckets: [{ ...weekly, remaining_fraction: 0 }] }]))).toMatchObject([{ usedPercent: 100 }]);
+    expect(await buckets(report([{ name: "Gemini", buckets: [{ ...weekly, remaining_fraction: 0.6752 }] }]))).toMatchObject([{ usedPercent: 32.48 }]);
+    expect(await buckets(report([{ name: "Gemini", buckets: [weekly] }], { text: "Gemini\tWeekly Limit Remaining\t37%\t2030-01-01T00:00:00Z\n" })))
+      .toMatchObject([{ usedPercent: 63 }]);
+
+    // No figure anywhere: the allowance stays with its reset, without a percentage.
+    for (const text of ["", "Gemini\tWeekly Limit Remaining\t0%\tx\nGemini\tWeekly Limit Remaining\t90%\tx\n", "Gemini\tWeekly Limit Remaining\tsoon\tx\n"]) {
+      const [kept] = (await buckets(report([{ name: "Gemini", buckets: [weekly] }], { text })))!;
+      expect(kept).toMatchObject({ id: "weekly", durationMs: 604_800_000, resetAt: "2030-01-01T00:00:00.000Z" });
+      expect(kept).not.toHaveProperty("usedPercent");
+    }
+    // Balances and window-less buckets without a fraction cannot become an allowance.
+    expect(await read(report([{ name: "Credits", buckets: [{ id: "credits", name: "Credits", remaining_amount: 50 }] }]))).toMatchObject({ status: "unavailable", value: null });
+    expect(await read(report([{ name: "Gemini", buckets: [{ id: "x", name: "Other" }, { ...weekly, remaining_fraction: 1.5 }] }]))).toMatchObject({ status: "unavailable", value: null });
     await f.closed();
   });
 
   it.each(["1.1.10", "1.1.11-beta.1", "unknown"])("skips /usage on unverified version %s", async (version) => {
     const f = await setup("antigravity", { MOCK_AGY_VERSION: version });
     expect(await f.read()).toMatchObject({ status: "unsupported", value: null });
-    expect((await f.logs()).map((x) => x.mode)).toEqual(["version"]);
+    expect((await f.logs()).filter((x) => x.event === "start").map((x) => x.mode)).toEqual(["version"]);
     await f.closed();
   });
 
-  it("returns safe diagnostics for signed-out and malformed reports", async () => {
+  it("returns safe diagnostics for signed-out, unreported and malformed reports", async () => {
     const f = await setup("antigravity", { MOCK_AGY_SIGNED_OUT: "1" });
     const signedOut = await f.read();
-    expect(signedOut).toMatchObject({ status: "unsupported", value: null });
+    expect(signedOut).toMatchObject({ status: "unsupported", value: null, reason: expect.stringContaining("sign-in") });
     expect(JSON.stringify(signedOut)).not.toContain("raw-secret-token");
-    const report = (num_turns: number, groups: unknown[]) => JSON.stringify({ status: "SUCCESS", num_turns, command: { name: "usage", data: { groups } } });
-    const read = (MOCK_RATES: string) => f.read({ env: { ...f.ctx.env, MOCK_AGY_SIGNED_OUT: "", MOCK_RATES } });
-    expect(await read("not JSON")).toMatchObject({ status: "unavailable", value: null });
-    expect(await read(report(1, []))).toMatchObject({ status: "unavailable", value: null });
-    expect(await read(report(0, []))).toMatchObject({ status: "fresh", value: { snapshot: { buckets: [] } } });
-    expect(await read(report(0, [{ name: "Gemini", buckets: [{ id: "weekly", remaining_fraction: 0.5, reset_time: "2000-01-01T00:00:00Z" }] }]))).toMatchObject({
+    const read = (env: Record<string, string>) => f.read({ env: { ...f.ctx.env, MOCK_AGY_SIGNED_OUT: "", ...env } });
+    // Exit 2: API-key sign-in has no account quota, or the CLI lacks a flag. Neither heals on retry.
+    expect(await read({ MOCK_AGY_EXIT: "2" })).toMatchObject({ status: "unsupported", refreshSupported: false, value: null });
+    expect(await read({ MOCK_AGY_EXIT: "1" })).toMatchObject({ status: "unavailable", value: null });
+    expect(await read({ MOCK_RATES: "not JSON" })).toMatchObject({ status: "unavailable", value: null });
+    expect(await read({ MOCK_RATES: report([], { turns: 1 }) })).toMatchObject({ status: "unavailable", value: null });
+    expect(await read({ MOCK_RATES: report([]) })).toMatchObject({ status: "fresh", value: { snapshot: { buckets: [] } } });
+    expect(await read({ MOCK_RATES: report([{ name: "Gemini", buckets: [{ id: "weekly", remaining_fraction: 0.5, reset_time: "2000-01-01T00:00:00Z" }] }]) })).toMatchObject({
       status: "stale", value: { snapshot: { buckets: [{ usedPercent: 50, stale: true }] } },
     });
+    await f.closed();
+  });
+
+  it.skipIf(process.platform === "win32")("ends processes agy leaves running, such as MCP servers", async () => {
+    const f = await setup("antigravity", { MOCK_AGY_CHILD: "1" });
+    expect((await f.read()).status).toBe("fresh");
+    const child = (await f.logs()).find((x) => x.event === "child");
+    expect(child?.pid).toEqual(expect.any(Number));
+    await vi.waitFor(() => expect(() => process.kill(child.pid, 0)).toThrow(), { timeout: 3_000 });
     await f.closed();
   });
 

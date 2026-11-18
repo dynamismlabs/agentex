@@ -1,6 +1,8 @@
 ## 0.0.52
 
 - Antigravity CLI 1.1.11 or later supports `getProvider("antigravity").readRateLimits()`. It reads the CLI’s structured quota report without a model turn and preserves each model pool’s allowance and reset time. See [sessionless capacity reads](docs/telemetry.md#read-account-capacity-without-a-session).
+- A used-up pool still reports 100% used. `agy` declares its remaining fraction `omitempty`, so a zero can be missing from JSON, and the reader takes the percentage from the report's text lines, and an allowance with no figure keeps its reset without a guessed percentage.
+- The read runs in a private empty folder with the CLI's auto-update off, ends the MCP servers `agy` leaves running, and reports exit code 2 (API-key sign-in or an older CLI) as unsupported rather than retryable.
 
 ## 0.0.51 — OpenCode effort is effort
 

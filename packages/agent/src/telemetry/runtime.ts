@@ -23,7 +23,9 @@ export async function telemetryRuntime<P extends AccountRateLimitProvider>(provi
     nativeAuthFileIdentity(provider, cwd, env),
     Promise.all(binary ? [binary.bin, ...binary.prefixArgs].map((path) => fileIdentity(resolve(path))) : []),
   ]);
-  const key = createHmac("sha256", keySalt).update(canonical({ provider, cwd, env, config, binary, authFiles, runtimeFiles })).digest("hex");
+  // Antigravity reads run in a private folder, so the caller's cwd doesn't change the result.
+  const scope = { provider, cwd: provider === "antigravity" ? null : cwd, env, config, binary, authFiles, runtimeFiles };
+  const key = createHmac("sha256", keySalt).update(canonical(scope)).digest("hex");
   return { provider, config, cwd, env, binary, endpointArgs: endpoint.args, key };
 }
 

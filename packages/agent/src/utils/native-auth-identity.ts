@@ -12,6 +12,8 @@ export async function fileIdentity(path: string): Promise<unknown[]> {
 
 export async function nativeAuthFileIdentity(provider: string, cwd: string, env: Record<string, string | undefined>): Promise<unknown[][]> {
   if (provider === "antigravity") {
+    // agy keeps its sign-in in the OS keychain, scoped by HOME, which the
+    // caller's environment already identifies. Its settings shape the CLI.
     const userHome = env[process.platform === "win32" ? "USERPROFILE" : "HOME"] || homedir();
     return [await fileIdentity(resolve(cwd, userHome, ".gemini", "antigravity-cli", "settings.json"))];
   }

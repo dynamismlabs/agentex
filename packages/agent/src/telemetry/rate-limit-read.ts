@@ -32,9 +32,10 @@ async function readRuntimeRateLimits(runtime: TelemetryRuntime<AccountRateLimitP
   if (!binary) return unavailable("Selected harness binary is unavailable");
   if (signal.aborted) return unavailable("Rate-limit read cancelled");
   if (runtime.provider === "antigravity") {
-    const result = await readAntigravityQuota(binary, runtime.cwd, runtime.env, signal);
+    const result = await readAntigravityQuota(binary, runtime.env, signal);
     if (result === "upgrade_required") return unsupported("Antigravity CLI 1.1.11 or newer is required for account rate-limit reads");
     if (result === "signed_out") return unsupported("Antigravity account rate limits require a Google sign-in");
+    if (result === "not_reported") return unsupported("Antigravity CLI reports no account rate limits for this sign-in or CLI version");
     return result ? observedRateLimits(result) : unavailable("Antigravity CLI returned no account rate-limit observation");
   }
   let rpc: NativeTelemetryRpc | undefined;

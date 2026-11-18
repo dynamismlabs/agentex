@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { appendFileSync, closeSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -8,29 +9,46 @@ const mode = args.includes("--version") ? "version" : args.includes("generate-ts
 const log = (value) => { if (process.env.MOCK_LOG) appendFileSync(process.env.MOCK_LOG, JSON.stringify(value) + "\n"); };
 log({ event: "start", mode, pid: process.pid, args });
 if (protocol === "antigravity") {
+  log({ event: "agy", mode, cwd: process.cwd(), autoUpdate: process.env.AGY_CLI_DISABLE_AUTO_UPDATE ?? null });
   if (mode === "version") {
     console.log(process.env.MOCK_AGY_VERSION ?? "1.1.11");
     process.exit(0);
   }
   const expected = ["--settings", '{"disableSlashCommands":false}', "--print", "/usage", "--output-format", "json"];
-  if (JSON.stringify(args) !== JSON.stringify(expected)) process.exit(2);
+  if (JSON.stringify(args) !== JSON.stringify(expected)) { log({ event: "unexpected", args }); process.exit(9); }
   if (process.env.MOCK_AGY_SIGNED_OUT) {
     console.error("Authentication required: Bearer raw-secret-token");
     process.exit(1);
   }
+  if (process.env.MOCK_AGY_EXIT) {
+    console.error("flag provided but not defined: -settings");
+    process.exit(Number(process.env.MOCK_AGY_EXIT));
+  }
+  if (process.env.MOCK_AGY_CHILD) {
+    // Like an MCP server agy starts and leaves running: same process group, no stdin.
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    child.unref();
+    log({ event: "child", pid: child.pid });
+  }
   log({ event: "request", method: "usage", cwd: process.cwd() });
   await new Promise((resolve) => setTimeout(resolve, Number(process.env.MOCK_DELAY ?? 0)));
+  // Shaped like agy 1.5.11 output. remaining_fraction is omitempty, so the
+  // used-up pool has none, and the text report still prints its percentage.
   console.log(process.env.MOCK_RATES ?? JSON.stringify({
-    status: "SUCCESS", num_turns: 0, command: { name: "usage", data: { groups: [
+    conversation_id: "", status: "SUCCESS", num_turns: 0,
+    response: "Gemini Models\tFive Hour Limit Remaining\t100%\t2030-01-01T00:00:00Z\n"
+      + "Gemini Models\tWeekly Limit Remaining\t20%\t2030-01-01T00:00:00Z\n"
+      + "Claude and GPT models\tWeekly Limit Remaining\t0%\t2030-01-01T00:00:00Z\n",
+    command: { name: "usage", data: { groups: [
       { name: "Gemini Models", buckets: [
-        { id: "gemini-5h", window: "5h", remaining_fraction: 1, reset_time: "2030-01-01T00:00:00Z" },
-        { id: "gemini-weekly", window: "weekly", remaining_fraction: 0.2 },
+        { id: "gemini-5h", name: "Five Hour Limit Remaining", window: "5h", remaining_fraction: 1, reset_time: "2030-01-01T00:00:00Z" },
+        { id: "gemini-weekly", name: "Weekly Limit Remaining", window: "weekly", remaining_fraction: 0.2 },
         { id: "disabled", disabled: true, remaining_fraction: 1 },
         { id: "absolute", remaining_amount: 50 },
         { id: "invalid", remaining_fraction: 2 },
       ] },
       { name: "Claude and GPT models", buckets: [
-        { id: "third-party-weekly", window: "weekly", remaining_fraction: 0 },
+        { id: "3p-weekly", name: "Weekly Limit Remaining", window: "weekly", reset_time: "2030-01-01T00:00:00Z" },
       ] },
     ] } },
   }));

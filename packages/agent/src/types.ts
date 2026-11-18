@@ -382,7 +382,8 @@ export interface ProviderModule {
    * A successful value is an authoritative replace update, independent of
    * probeCapabilities and existing session snapshot/refresh surfaces.
    * Honors cwd, env and config.command; custom config.endpoint is unsupported,
-   * and other config fields are ignored.
+   * and other config fields are ignored. Antigravity's account read runs in a
+   * private empty folder instead of cwd, since its quota is per account.
    */
   readRateLimits?(ctx?: RateLimitReadContext): Promise<TelemetryObservation<RateLimitUpdate>>;
   /** Optional management surface for harness-owned upstream providers. */
