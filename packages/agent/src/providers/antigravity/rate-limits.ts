@@ -32,15 +32,10 @@ export async function readAntigravityQuota(
   const cwd = await mkdtemp(join(tmpdir(), "agentex-agy-quota-"));
   // A passive read must not start agy's self-update (only the literal "true" disables it).
   const childEnv = { ...env, AGY_CLI_DISABLE_AUTO_UPDATE: "true" };
-  const run = async (runId: string, args: string[]) => {
-    let pid: number | undefined;
-    const result = await runChildProcess({
-      runId, command: binary.bin, args: [...binary.prefixArgs, ...args], cwd, env: childEnv, signal, graceSec: 1,
-      onStart: (started) => { pid = started; },
-    });
-    if (pid !== undefined) endLeftoverProcesses(pid);
-    return result;
-  };
+  const run = (runId: string, args: string[]) => runChildProcess({
+    runId, command: binary.bin, args: [...binary.prefixArgs, ...args], cwd, env: childEnv, signal, graceSec: 1,
+    onExit: endLeftoverProcesses,
+  });
   try {
     const version = await run("antigravity-quota-version", ["--version"]);
     if (version.exitCode !== 0) return null;
@@ -65,7 +60,8 @@ export async function readAntigravityQuota(
 /**
  * `agy` starts the user's MCP servers even for /usage and exits without
  * stopping them. They share its process group (the child runs as a group
- * leader), so end the group once it exits. Windows has no process groups.
+ * leader), so end the group on exit, before waiting for inherited pipes.
+ * Windows has no process groups.
  */
 function endLeftoverProcesses(groupId: number): void {
   if (process.platform === "win32") return;
@@ -110,7 +106,7 @@ function parseAntigravityQuota(output: string, observedAt: string): RateLimitUpd
       buckets.push({
         id, label: durationMs || !name ? pool : `${pool} ${name.replace(/\s+remaining$/i, "")}`,
         owner: { kind: "account" }, applicability: { kind: "provider_pool", pool },
-        ...(remaining !== undefined ? { usedPercent: Math.round((1 - remaining) * 10_000) / 100 } : {}),
+        ...(remaining !== undefined ? { usedPercent: 100 - remaining * 100 } : {}),
         observedAt, ...(durationMs !== undefined ? { durationMs } : {}), ...(resetAt ? { resetAt } : {}),
       });
     }

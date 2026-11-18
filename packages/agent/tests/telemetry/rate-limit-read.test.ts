@@ -208,7 +208,14 @@ describe("Antigravity account capacity", () => {
     const weekly = { id: "weekly", name: "Weekly Limit Remaining", window: "weekly", reset_time: "2030-01-01T00:00:00Z" };
 
     expect(await buckets(report([{ name: "Gemini", buckets: [{ ...weekly, remaining_fraction: 0 }] }]))).toMatchObject([{ usedPercent: 100 }]);
-    expect(await buckets(report([{ name: "Gemini", buckets: [{ ...weekly, remaining_fraction: 0.6752 }] }]))).toMatchObject([{ usedPercent: 32.48 }]);
+    const precise = await buckets(report([{ name: "Gemini", buckets: [
+      { ...weekly, id: "partial", remaining_fraction: 0.6752 },
+      { ...weekly, id: "above-zero", remaining_fraction: 0.99999 },
+      { ...weekly, id: "below-warning", remaining_fraction: 0.20004 },
+    ] }]));
+    expect(precise?.[0]?.usedPercent).toBeCloseTo(32.48);
+    expect(precise?.[1]?.usedPercent).toBeCloseTo(0.001, 6);
+    expect(precise?.[2]?.usedPercent).toBeCloseTo(79.996, 6);
     expect(await buckets(report([{ name: "Gemini", buckets: [weekly] }], { text: "Gemini\tWeekly Limit Remaining\t37%\t2030-01-01T00:00:00Z\n" })))
       .toMatchObject([{ usedPercent: 63 }]);
 
@@ -249,9 +256,9 @@ describe("Antigravity account capacity", () => {
     await f.closed();
   });
 
-  it.skipIf(process.platform === "win32")("ends processes agy leaves running, such as MCP servers", async () => {
-    const f = await setup("antigravity", { MOCK_AGY_CHILD: "1" });
-    expect((await f.read()).status).toBe("fresh");
+  it.skipIf(process.platform === "win32").each(["ignore", "stderr"])("ends an MCP process agy leaves running with %s stdio", async (stdio) => {
+    const f = await setup("antigravity", { MOCK_AGY_CHILD: stdio });
+    expect((await f.read({ timeoutMs: 2_000 })).status).toBe("fresh");
     const child = (await f.logs()).find((x) => x.event === "child");
     expect(child?.pid).toEqual(expect.any(Number));
     await vi.waitFor(() => expect(() => process.kill(child.pid, 0)).toThrow(), { timeout: 3_000 });

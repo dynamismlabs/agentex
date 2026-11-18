@@ -26,7 +26,8 @@ if (protocol === "antigravity") {
   }
   if (process.env.MOCK_AGY_CHILD) {
     // Like an MCP server agy starts and leaves running: same process group, no stdin.
-    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    const stderr = process.env.MOCK_AGY_CHILD === "stderr" ? 2 : "ignore";
+    const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 5000)"], { stdio: ["ignore", "ignore", stderr] });
     child.unref();
     log({ event: "child", pid: child.pid });
   }
