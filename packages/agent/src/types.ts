@@ -1694,6 +1694,17 @@ export class OpenCodeEffortWithoutModelError extends Error {
   }
 }
 
+/**
+ * OpenCode's ambient MCP configuration couldn't be read or changed while being
+ * isolated, so `strictMcpConfig` couldn't be proved. Nothing was started.
+ */
+export class OpenCodeMcpIsolationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "OpenCodeMcpIsolationError";
+  }
+}
+
 /** Invalid or unavailable explicit speed selection, detected before inference. */
 export class ServiceTierConfigurationError extends Error {
   constructor(readonly code: "unsupported_runtime" | "unsupported_model" | "conflicting_settings" | "unavailable" | "discovery_failed" | "invalid_tier", message: string) {

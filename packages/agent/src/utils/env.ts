@@ -20,11 +20,13 @@ const AUTH_ALLOW_LIST = [
   "CURSOR_API_KEY",
 ];
 
+// CONFIG_CONTENT covers OpenCode's inline config, which carries host MCP
+// servers' headers and environment (providers/opencode/mcp-config.ts).
 // HEADER covers custom-endpoint header carriers — `ANTHROPIC_CUSTOM_HEADERS` and
 // the generated `CODEX_CUSTOM_HEADER_*` vars — whose values can hold secret
 // header tokens (Authorization, X-API-Key). Over-redacting a non-secret header
 // in logs is the safe direction.
-const SENSITIVE_PATTERNS = /KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL|AUTH|HEADER/i;
+const SENSITIVE_PATTERNS = /KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL|AUTH|HEADER|CONFIG_CONTENT/i;
 
 const ESSENTIAL_PATHS_UNIX = ["/usr/local/bin", "/usr/bin", "/bin"];
 

@@ -23,6 +23,7 @@ import { acquireOpenCodeServer, type OpenCodeServerHandle } from "./server.js";
 import { OpenCodeHttpError, type OpenCodeClient } from "./client.js";
 import { createSessionRecord } from "../../sessions/record.js";
 import { opencodeSessionCodec } from "./codec.js";
+import { prepareOpenCodeMcp } from "./mcp-config.js";
 import { prepareOpenCodeSkillConfig } from "./skill-config.js";
 import { openCodeVariant, resolveOpenCodeV2Model } from "./effort.js";
 import { OpenCodeEffortWithoutModelError } from "../../types.js";
@@ -182,13 +183,19 @@ class OpenCodeSession implements AgentSession {
     const baseEnv = buildEnv(this.ctx.env);
     ensurePathInEnv(baseEnv);
     const skillConfig = await prepareOpenCodeSkillConfig(baseEnv, config.skillDirs);
-    const env = skillConfig.env;
     this._skillConfigCleanup = skillConfig.cleanup;
     const cwd = this.ctx.cwd ?? process.cwd();
     this.cwd = cwd;
 
     try {
-      this.server = await acquireOpenCodeServer(resolved.bin, resolved.prefixArgs, env, cwd);
+      const mcp = await prepareOpenCodeMcp({
+        config,
+        binary: resolved,
+        env: skillConfig.env,
+        cwd,
+        onNotice: (message) => { Promise.resolve(this.ctx.onOutput?.("stderr", message)).catch(() => {}); },
+      });
+      this.server = mcp.server ?? await acquireOpenCodeServer(resolved.bin, resolved.prefixArgs, mcp.env, cwd);
     } catch (error) {
       await this._skillConfigCleanup();
       this._skillConfigCleanup = null;

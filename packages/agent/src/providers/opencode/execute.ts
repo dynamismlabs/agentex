@@ -14,6 +14,7 @@ import {
   isOpenCodeUnknownSessionError,
   isOpenCodeAuthRequired,
 } from "./parse.js";
+import { prepareOpenCodeMcp } from "./mcp-config.js";
 import { prepareOpenCodeSkillConfig } from "./skill-config.js";
 import { isOpenCodeV2Binary } from "./v2.js";
 import { openCodeVariant, resolveOpenCodeV2Model } from "./effort.js";
@@ -104,9 +105,21 @@ async function executeOpenCodeProviderInner(ctx: ExecutionContext): Promise<Exec
   // 4. Inject skills through an isolated OpenCode config directory.
   ctx.onLifecycle?.({ phase: "preparing", step: "skills" });
   const skillConfig = await prepareOpenCodeSkillConfig(baseEnv, config.skillDirs);
-  const env = skillConfig.env;
 
   try {
+  // 4b. Host MCP servers ride OPENCODE_CONFIG_CONTENT (mcp-config.ts). `opencode
+  // run --standalone` starts its own server from the same env, so a server
+  // started only to isolate them is released here.
+  const mcp = await prepareOpenCodeMcp({
+    config,
+    binary: resolvedBinary,
+    env: skillConfig.env,
+    cwd,
+    onNotice: (message) => { Promise.resolve(ctx.onOutput?.("stderr", message)).catch(() => {}); },
+  });
+  mcp.server?.release();
+  const env = mcp.env;
+
   // 4. Determine session resume
   const sessionParams = ctx.sessionParams ?? null;
   const sessionId = (() => {

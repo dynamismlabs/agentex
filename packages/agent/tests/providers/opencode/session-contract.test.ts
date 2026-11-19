@@ -1,9 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { StreamEvent } from "../../../src/types.js";
 
-const mocks = vi.hoisted(() => ({ acquire: vi.fn() }));
+const mocks = vi.hoisted(() => ({ acquire: vi.fn(), isV2: vi.fn() }));
 vi.mock("../../../src/providers/opencode/server.js", () => ({
   acquireOpenCodeServer: mocks.acquire,
+}));
+vi.mock("../../../src/providers/opencode/v2.js", async (original) => ({
+  ...(await original<object>()),
+  isOpenCodeV2Binary: mocks.isV2,
 }));
 
 import { createOpenCodeSession } from "../../../src/providers/opencode/http-session.js";
@@ -45,6 +49,7 @@ function fixture(options: {
       calls.push({ kind: "json", path });
       if (path === "/permission") return permissionResolved ? [] : (options.permissions ?? []);
       if (path === "/question") return options.questions ?? [];
+      if (path === "/api/config") return [];
       throw new Error(`unexpected json ${path}`);
     },
     async ok(path: string, init?: RequestInit) {
@@ -67,7 +72,27 @@ function fixture(options: {
 }
 
 describe("OpenCode HTTP session contract", () => {
-  beforeEach(() => mocks.acquire.mockReset());
+  beforeEach(() => {
+    mocks.acquire.mockReset();
+    mocks.isV2.mockReset();
+  });
+
+  it("starts one server carrying the host's MCP servers, isolated", async () => {
+    mocks.isV2.mockResolvedValue(true);
+    const fake = fixture();
+    mocks.acquire.mockResolvedValue(fake.handle);
+    const session = await createOpenCodeSession({
+      config: { mcpServers: [{ name: "ri", type: "http", url: "http://127.0.0.1:1/mcp", headers: { Authorization: "Bearer t" } }] },
+    });
+    expect(mocks.acquire).toHaveBeenCalledTimes(1);
+    const env = mocks.acquire.mock.calls[0]![2] as Record<string, string>;
+    expect(JSON.parse(env["OPENCODE_CONFIG_CONTENT"]!)).toEqual({
+      mcp: { servers: { ri: { type: "remote", url: "http://127.0.0.1:1/mcp", headers: { Authorization: "Bearer t" } } } },
+    });
+    expect(fake.calls.some((call) => call.path === "/api/config")).toBe(true);
+    await session.close();
+    expect(fake.handle.release).toHaveBeenCalledTimes(1);
+  });
 
   it("sends model variant and agent and emits exactly one terminal result", async () => {
     const fake = fixture();

@@ -116,7 +116,9 @@ await (await session.send("Now list its entry points")).result; // same agy proc
 - **Usage.** agy reports cumulative usage per process. agentex reports each turn's share, keyed by the pinned model (or `"default"`). `cachedInputTokens` comes from `cache_read_tokens`.
 - **Not yet wired.** `config.mcpServers` (agy reads `~/.gemini/config/mcp_config.json` and `.agents/mcp_config.json` itself), and history import.
 
-OpenCode sessions use a password-authenticated loopback server, SSE events, permission and question reconciliation, durable service-backed history, saved-session discovery and import, runtime model and agent discovery, and upstream provider authentication. `config.mcpServers` remains unsupported for OpenCode because strict isolation from ambient OpenCode MCP configuration is not yet proven.
+OpenCode sessions use a password-authenticated loopback server, SSE events, permission and question reconciliation, durable service-backed history, saved-session discovery and import, runtime model and agent discovery, and upstream provider authentication.
+
+OpenCode 2 honors `config.mcpServers` and `strictMcpConfig` for sessions and `execute()`. The servers go in `OPENCODE_CONFIG_CONTENT`, the config document OpenCode loads last, so a host server replaces an ambient one of the same name and nothing is written to the user's or project's config. Isolation is the default once servers are supplied, as for Codex. OpenCode connects MCP servers when a session starts, not at boot, so agentex reads every config source's servers from the booted server (`GET /api/config`) and, when any are ambient, restarts it with each one disabled. They are never contacted and a local one's command never runs. If the sources can't be read, or a server appears between the two reads, the session or run fails with `OpenCodeMcpIsolationError` before anything starts. Set `strictMcpConfig: false` to keep the ambient servers. `probeCapabilities()` reports `mcp` and `strictMcpIsolation` per installed version. OpenCode 1 reads a different config shape, so it runs without the host servers and says so on stderr. Tools reach the model through OpenCode's own tool surface (OpenCode 2.3's code-mode `execute` tool), not as `mcp__<server>__<tool>` names.
 
 ### OpenCode and Cursor discovery
 
@@ -318,8 +320,8 @@ interface ProviderConfig {
   skipPermissions?: boolean;
   skillDirs?: string[];
   instructionsFile?: string;
-  mcpServers?: McpServerConfig[];   // Claude: stdio | http | sse; Codex 0.160+: stdio | streamable HTTP
-  strictMcpConfig?: boolean;        // ambient configured MCP isolation; Codex defaults true when servers are supplied
+  mcpServers?: McpServerConfig[];   // Claude: stdio | http | sse; Codex 0.160+: stdio | streamable HTTP; OpenCode 2: stdio | http | sse
+  strictMcpConfig?: boolean;        // ambient configured MCP isolation; Codex and OpenCode default true when servers are supplied
   allowedTools?: string[];          // claude: --allowed-tools (patterns verbatim; codex ignores)
   disallowedTools?: string[];       // claude: --disallowed-tools (deny wins; codex ignores)
   includePartialMessages?: boolean; // claude, antigravity: emit assistant_delta/thinking_delta typewriter events
@@ -336,7 +338,8 @@ interface ProviderConfig {
 
 Claude stages MCP configuration in a private file. Codex uses native config
 overrides with header and stdio-env values in child-only environment variables.
-Credentials in those fields never enter argv:
+OpenCode carries them in the child's `OPENCODE_CONFIG_CONTENT`, which
+`redactEnvForLogs` redacts. Credentials in those fields never enter argv:
 
 ```typescript
 config.mcpServers = [
