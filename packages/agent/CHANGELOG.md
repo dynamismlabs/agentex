@@ -1,3 +1,10 @@
+## 0.0.53 — OpenCode gets the host's MCP servers
+
+- **OpenCode 2 accepts `config.mcpServers`** for sessions and `execute()`. HTTP and SSE servers use OpenCode's remote transport with their headers. Stdio uses its local transport with its environment.
+- **Strict isolation defaults on when servers are supplied.** It requires OpenCode 2.3.0 or newer. A private server disables config-driven MCP loading and verifies that managed settings have left it disabled. Agentex registers the host definitions on that server through the runtime API. One-shot runs attach to the same server that agentex verified, and the host definitions stay in memory for the lease.
+- Set `strictMcpConfig: false` to retain ambient servers and add the host's through `OPENCODE_CONFIG_CONTENT`. `redactEnvForLogs` now redacts `*CONFIG_CONTENT*`. `probeCapabilities()` distinguishes host MCP support from strict isolation. OpenCode 1 continues with its native configuration and prints a notice when requested host tools are unavailable.
+- The real-binary test checks an ambient name collision, a forced config reload, and new and resumed one-shot runs against a local model fixture. The host server receives its authorization header and the model sees its instructions. The project server receives no requests and the global stdio command never runs. Enable the test with `AGENTEX_REAL_OPENCODE=1` and point `AGENTEX_OPENCODE_BIN` at OpenCode 2.3.0 or newer.
+
 ## 0.0.52
 
 - Antigravity CLI 1.1.11 or later supports `getProvider("antigravity").readRateLimits()`. It reads the CLI’s structured quota report without a model turn and preserves each model pool’s allowance and reset time. See [sessionless capacity reads](docs/telemetry.md#read-account-capacity-without-a-session).

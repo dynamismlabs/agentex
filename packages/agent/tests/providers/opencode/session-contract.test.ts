@@ -1,9 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { StreamEvent } from "../../../src/types.js";
 
-const mocks = vi.hoisted(() => ({ acquire: vi.fn() }));
+const mocks = vi.hoisted(() => ({ acquire: vi.fn(), isV2: vi.fn() }));
 vi.mock("../../../src/providers/opencode/server.js", () => ({
   acquireOpenCodeServer: mocks.acquire,
+}));
+vi.mock("../../../src/providers/opencode/v2.js", async (original) => ({
+  ...(await original<object>()),
+  isOpenCodeV2Binary: mocks.isV2,
 }));
 
 import { createOpenCodeSession } from "../../../src/providers/opencode/http-session.js";
@@ -26,8 +30,8 @@ function fixture(options: {
   const client = {
     async request(path: string, init?: RequestInit) {
       calls.push({ kind: "request", path, init });
-      if (path === "/session") return Response.json({ id: "ses_test" });
-      if (path === "/global/event") return openSse();
+      if (path === "/session" || path === "/api/session") return Response.json({ id: "ses_test" });
+      if (path === "/global/event" || path === "/api/event") return openSse();
       if (path.includes("/message")) {
         if (options.messageDelayMs) await new Promise((resolve) => setTimeout(resolve, options.messageDelayMs));
         if ((options.messageStatus ?? 200) !== 200) return new Response("sensitive upstream text", { status: options.messageStatus });
@@ -45,6 +49,9 @@ function fixture(options: {
       calls.push({ kind: "json", path });
       if (path === "/permission") return permissionResolved ? [] : (options.permissions ?? []);
       if (path === "/question") return options.questions ?? [];
+      if (path === "/api/config") return [{ type: "document", info: {
+        plugins: ["-opencode.config.mcp"], experimental: { location_idle_timeout: false },
+      } }];
       throw new Error(`unexpected json ${path}`);
     },
     async ok(path: string, init?: RequestInit) {
@@ -67,7 +74,33 @@ function fixture(options: {
 }
 
 describe("OpenCode HTTP session contract", () => {
-  beforeEach(() => mocks.acquire.mockReset());
+  beforeEach(() => {
+    mocks.acquire.mockReset();
+    mocks.isV2.mockReset();
+  });
+
+  it("starts one server carrying the host's MCP servers, isolated", async () => {
+    mocks.isV2.mockResolvedValue(true);
+    const fake = fixture();
+    mocks.acquire.mockResolvedValue({ ...fake.handle, apiVersion: 2, serverVersion: "2.3.0" });
+    const session = await createOpenCodeSession({
+      config: { mcpServers: [{ name: "ri", type: "http", url: "http://127.0.0.1:1/mcp", headers: { Authorization: "Bearer t" } }] },
+    });
+    expect(mocks.acquire).toHaveBeenCalledTimes(1);
+    const env = mocks.acquire.mock.calls[0]![2] as Record<string, string>;
+    expect(JSON.parse(env["OPENCODE_CONFIG_CONTENT"]!)).toEqual({
+      plugins: ["-opencode.config.mcp"],
+      experimental: { location_idle_timeout: false },
+    });
+    expect(fake.calls.some((call) => call.path === "/api/config")).toBe(true);
+    const attachment = fake.calls.find((call) => call.path === "/api/experimental/mcp/ri");
+    expect(attachment?.init?.method).toBe("PUT");
+    expect(JSON.parse(String(attachment?.init?.body))).toEqual({
+      config: { type: "remote", url: "http://127.0.0.1:1/mcp", headers: { Authorization: "Bearer t" } },
+    });
+    await session.close();
+    expect(fake.handle.release).toHaveBeenCalledTimes(1);
+  });
 
   it("sends model variant and agent and emits exactly one terminal result", async () => {
     const fake = fixture();

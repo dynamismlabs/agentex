@@ -13,7 +13,10 @@ export const opencodeProvider: ProviderModule = {
     rateLimits: false,
     contextUsageRefresh: false,
     rateLimitsRefresh: false,
-    mcp: false,
+    // OpenCode 2 only. probeCapabilities() reports mcp and strictMcpIsolation
+    // per installed version (mcp-config.ts).
+    mcp: true,
+    strictMcpIsolation: true,
     skills: true,
     instructions: true,
     workspace: true,

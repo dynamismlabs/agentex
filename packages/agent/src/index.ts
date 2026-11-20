@@ -142,7 +142,7 @@ export {
 } from "./utils/skill-commands.js";
 
 // Types
-export { OpenCodeEffortWithoutModelError, ServiceTierConfigurationError } from "./types.js";
+export { OpenCodeEffortWithoutModelError, OpenCodeMcpIsolationError, ServiceTierConfigurationError } from "./types.js";
 
 export type {
   ProviderModule,

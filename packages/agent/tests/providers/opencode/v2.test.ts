@@ -265,6 +265,8 @@ describe("OpenCode v2 server, probe, discovery & modes", () => {
               "/api/session/{sessionID}/form/{formID}/reply": { post: {} },
               "/api/model": { get: {} },
               "/api/credential/{credentialID}": { delete: {} },
+              "/api/config": { get: {} },
+              "/api/experimental/mcp/{server}": { put: {} },
             },
           }));
           return;
@@ -328,6 +330,8 @@ describe("OpenCode v2 server, probe, discovery & modes", () => {
     expect(report.capabilities.sessions?.supported).toBe(true);
     expect(report.capabilities.upstreamProviderDisconnect?.supported).toBe(true);
     expect(report.capabilities.savedHistory?.supported).toBe(true);
+    expect(report.capabilities.mcp?.supported).toBe(true);
+    expect(report.capabilities.strictMcpIsolation?.supported).toBe(true);
     expect(report.capabilities.planMode?.supported).toBe(true);
     expect(report.capabilities.modes?.supported).toBe(true);
     expect(report.capabilities.sessionEffortChange?.supported).toBe(report.capabilities.sessionVariantChange?.supported);

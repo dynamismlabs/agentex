@@ -752,13 +752,13 @@ export interface ProviderConfig {
   mcpServers?: McpServerConfig[];
   /**
    * Only use MCP servers from `mcpServers` (claude: `--strict-mcp-config`;
-   * Codex 0.160+: verified native config overrides),
+   * Codex 0.160+: verified native config overrides; OpenCode 2.3+: private runtime registration),
    * ignoring ambient configs (a stray `.mcp.json` in cwd, user-scope servers).
    * Hosts embedding sessions should set this so the session's MCP surface is
    * exactly what they attach. Works without `mcpServers` too — strict with no
    * config blocks all ambient MCP.
-   * Codex defaults to strict when `mcpServers` is supplied, including an empty
-   * array. Set false to retain ambient configured servers. Codex's separate
+   * Codex and OpenCode default to strict when `mcpServers` is supplied, including
+   * an empty array. Set false to retain ambient configured servers. Codex's separate
    * native ChatGPT apps integration is not controlled by this option.
    * MCP-configured Codex resumes use the supplied/restored cwd so discovery
    * and the resumed thread load the same project configuration.
@@ -1691,6 +1691,16 @@ export class OpenCodeEffortWithoutModelError extends Error {
   constructor() {
     super("OpenCode has no model to apply the effort or variant to. Set config.model, or choose a default model in OpenCode.");
     this.name = "OpenCodeEffortWithoutModelError";
+  }
+}
+
+/**
+ * The private OpenCode runtime could not satisfy the requested strict MCP setup.
+ */
+export class OpenCodeMcpIsolationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "OpenCodeMcpIsolationError";
   }
 }
 

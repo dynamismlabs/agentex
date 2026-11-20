@@ -116,7 +116,11 @@ await (await session.send("Now list its entry points")).result; // same agy proc
 - **Usage.** agy reports cumulative usage per process. agentex reports each turn's share, keyed by the pinned model (or `"default"`). `cachedInputTokens` comes from `cache_read_tokens`.
 - **Not yet wired.** `config.mcpServers` (agy reads `~/.gemini/config/mcp_config.json` and `.agents/mcp_config.json` itself), and history import.
 
-OpenCode sessions use a password-authenticated loopback server, SSE events, permission and question reconciliation, durable service-backed history, saved-session discovery and import, runtime model and agent discovery, and upstream provider authentication. `config.mcpServers` remains unsupported for OpenCode because strict isolation from ambient OpenCode MCP configuration is not yet proven.
+OpenCode sessions use a password-authenticated loopback server, SSE events, permission and question reconciliation, durable service-backed history, saved-session discovery and import, runtime model and agent discovery, and upstream provider authentication.
+
+OpenCode 2 accepts host `config.mcpServers` in sessions and `execute()`. Strict isolation is the default when servers are supplied and requires OpenCode 2.3.0 or newer. Agentex starts a private OpenCode server, disables its config-driven MCP loader, and verifies the setting against OpenCode's ordered config sources before registering the supplied servers through the runtime API. Managed settings that re-enable the loader fail startup with `OpenCodeMcpIsolationError`. The private server keeps its location alive and turns off filesystem watches for the lease. Both sessions and one-shot runs use that server, so an ordinary project config reload cannot introduce a new server or replace a supplied server. Host server definitions and credentials live in the runtime and disappear when the lease ends.
+
+Set `strictMcpConfig: false` to add host servers through `OPENCODE_CONFIG_CONTENT` and keep OpenCode's own servers. Strict one-shot runs select their worktree through `config.workspace` and their saved session through `sessionParams`. `probeCapabilities()` reports host MCP support and strict isolation separately. OpenCode 1 continues with its native configuration and reports the missing host tools on stderr. Tools reach the model through OpenCode's native tool surface, which includes the code-mode `execute` tool in OpenCode 2.3.
 
 ### OpenCode and Cursor discovery
 
@@ -318,8 +322,8 @@ interface ProviderConfig {
   skipPermissions?: boolean;
   skillDirs?: string[];
   instructionsFile?: string;
-  mcpServers?: McpServerConfig[];   // Claude: stdio | http | sse; Codex 0.160+: stdio | streamable HTTP
-  strictMcpConfig?: boolean;        // ambient configured MCP isolation; Codex defaults true when servers are supplied
+  mcpServers?: McpServerConfig[];   // Claude: stdio | http | sse; Codex 0.160+: stdio | streamable HTTP; OpenCode 2: stdio | http | sse
+  strictMcpConfig?: boolean;        // ambient configured MCP isolation; Codex and OpenCode default true when servers are supplied
   allowedTools?: string[];          // claude: --allowed-tools (patterns verbatim; codex ignores)
   disallowedTools?: string[];       // claude: --disallowed-tools (deny wins; codex ignores)
   includePartialMessages?: boolean; // claude, antigravity: emit assistant_delta/thinking_delta typewriter events
@@ -336,7 +340,8 @@ interface ProviderConfig {
 
 Claude stages MCP configuration in a private file. Codex uses native config
 overrides with header and stdio-env values in child-only environment variables.
-Credentials in those fields never enter argv:
+OpenCode carries them in the child's `OPENCODE_CONFIG_CONTENT`, which
+`redactEnvForLogs` redacts. Credentials in those fields never enter argv:
 
 ```typescript
 config.mcpServers = [
