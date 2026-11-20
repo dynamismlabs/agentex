@@ -266,6 +266,7 @@ describe("OpenCode v2 server, probe, discovery & modes", () => {
               "/api/model": { get: {} },
               "/api/credential/{credentialID}": { delete: {} },
               "/api/config": { get: {} },
+              "/api/experimental/mcp/{server}": { put: {} },
             },
           }));
           return;

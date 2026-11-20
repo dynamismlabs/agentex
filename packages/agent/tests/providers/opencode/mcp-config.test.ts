@@ -10,7 +10,6 @@ vi.mock("../../../src/providers/opencode/v2.js", async (original) => ({
 
 import { OpenCodeMcpIsolationError } from "../../../src/types.js";
 import {
-  openCodeConfigServerNames,
   openCodeMcpServerEntry,
   prepareOpenCodeMcp,
   withOpenCodeMcpConfig,
@@ -21,22 +20,20 @@ const HOST: McpServerConfig[] = [
   { name: "ri", type: "http", url: "http://127.0.0.1:4224/api/orchestrator/mcp", headers: { Authorization: "Bearer tok" } },
 ];
 
-/** A `GET /api/config` payload: one document per source, in load order. */
-function sources(...documents: Array<Record<string, unknown> | null>): unknown {
-  return documents.map((servers, index) => servers === null
-    ? { type: "directory", path: `/config/${index}` }
-    : { type: "document", path: index === documents.length - 1 ? null : `/config/${index}/opencode.json`, info: { mcp: { servers } } });
-}
+const KEEP_LOCATION = { location_idle_timeout: false };
+const INLINE = { type: "document", info: { plugins: ["-opencode.config.mcp"], experimental: KEEP_LOCATION } };
 
-function fakeServer(config: unknown | (() => unknown)) {
+function fakeServer(config: unknown, serverVersion = "2.3.0") {
   return {
+    apiVersion: 2,
+    serverVersion,
     client: {
       json: vi.fn(async (path: string) => {
         if (path !== "/api/config") throw new Error(`unexpected ${path}`);
-        const value = typeof config === "function" ? (config as () => unknown)() : config;
-        if (value instanceof Error) throw value;
-        return value;
+        if (config instanceof Error) throw config;
+        return config;
       }),
+      ok: vi.fn(async () => {}),
     },
     release: vi.fn(),
   };
@@ -66,32 +63,23 @@ describe("OpenCode MCP config", () => {
     expect(() => openCodeMcpServerEntry({ name: "f", type: "http", url: "not a url" })).toThrow(/valid/);
   });
 
-  it("merges into existing inline config and disables named servers", () => {
+  it("merges into existing inline config when isolation is off", () => {
     const env = withOpenCodeMcpConfig(
       { PATH: "/bin", OPENCODE_CONFIG_CONTENT: JSON.stringify({ model: "anthropic/claude", mcp: { servers: { mine: { type: "local", command: ["x"] } } } }) },
       HOST,
-      ["mine", "global"],
     );
     expect(env["PATH"]).toBe("/bin");
     expect(content(env)).toEqual({
       model: "anthropic/claude",
       mcp: {
         servers: {
-          mine: { type: "remote", url: "http://127.0.0.1:9/", disabled: true },
-          global: { type: "remote", url: "http://127.0.0.1:9/", disabled: true },
+          mine: { type: "local", command: ["x"] },
           ri: { type: "remote", url: "http://127.0.0.1:4224/api/orchestrator/mcp", headers: { Authorization: "Bearer tok" } },
         },
       },
     });
     expect(() => withOpenCodeMcpConfig({ OPENCODE_CONFIG_CONTENT: "[1]" }, HOST)).toThrow(/JSON object/);
     expect(() => withOpenCodeMcpConfig({ OPENCODE_CONFIG_CONTENT: "{" }, HOST)).toThrow(/valid JSON/);
-  });
-
-  it("reads server names from every config source", () => {
-    expect([...openCodeConfigServerNames(sources({ global: {} }, null, { project: {} }, { ri: {} }))].sort())
-      .toEqual(["global", "project", "ri"]);
-    expect([...openCodeConfigServerNames({ data: [{ info: { mcp: { legacy: {} } } }] })]).toEqual(["legacy"]);
-    expect([...openCodeConfigServerNames(null)]).toEqual([]);
   });
 
   it("leaves OpenCode alone without MCP options", async () => {
@@ -123,39 +111,37 @@ describe("OpenCode MCP config", () => {
     expect(mocks.acquire).not.toHaveBeenCalled();
   });
 
-  it("keeps the first server when nothing ambient is configured", async () => {
-    const server = fakeServer(sources(null, { ri: {} }));
+  it("disables the native config plugin and registers only host servers on the same server", async () => {
+    const server = fakeServer([
+      { type: "directory", path: "/config" },
+      { type: "document", path: "/repo/opencode.json", info: { plugins: ["*"] } },
+      INLINE,
+      { type: "document", path: "/system/opencode.json", info: {
+        mcp: { servers: { ri: { type: "remote", url: "http://ambient" }, other: { type: "local", command: ["ambient"] } } },
+      } },
+    ]);
     mocks.acquire.mockResolvedValue(server);
-    const prepared = await prepareOpenCodeMcp({ config: { mcpServers: HOST }, binary: BINARY, env: {}, cwd: "/repo" });
+    const env = { OPENCODE_CONFIG_CONTENT: JSON.stringify({ model: "my-model", plugins: ["-opencode.formatter"] }) };
+    const prepared = await prepareOpenCodeMcp({ config: { mcpServers: HOST }, binary: BINARY, env, cwd: "/repo" });
     expect(prepared.server).toBe(server);
     expect(server.release).not.toHaveBeenCalled();
     expect(mocks.acquire).toHaveBeenCalledTimes(1);
-    expect(mocks.acquire).toHaveBeenCalledWith(BINARY.bin, [], prepared.env, "/repo");
-    expect(Object.keys((content(prepared.env)["mcp"] as { servers: object }).servers)).toEqual(["ri"]);
-  });
-
-  it("restarts with every ambient server disabled", async () => {
-    const first = fakeServer(sources({ global: {} }, { project: {} }, { ri: {} }));
-    const second = fakeServer(sources({ global: {} }, { project: {} }, { ri: {}, global: {}, project: {} }));
-    mocks.acquire.mockResolvedValueOnce(first).mockResolvedValueOnce(second);
-    const prepared = await prepareOpenCodeMcp({ config: { mcpServers: HOST, strictMcpConfig: true }, binary: BINARY, env: {}, cwd: "/repo" });
-    expect(first.release).toHaveBeenCalledTimes(1);
-    expect(prepared.server).toBe(second);
-    expect(second.release).not.toHaveBeenCalled();
-    expect((content(prepared.env)["mcp"] as { servers: object }).servers).toEqual({
-      global: { type: "remote", url: "http://127.0.0.1:9/", disabled: true },
-      project: { type: "remote", url: "http://127.0.0.1:9/", disabled: true },
-      ri: { type: "remote", url: "http://127.0.0.1:4224/api/orchestrator/mcp", headers: { Authorization: "Bearer tok" } },
+    expect(mocks.acquire).toHaveBeenCalledWith(BINARY.bin, [], prepared.env, "/repo", expect.stringMatching(/^[a-f0-9]{64}$/));
+    expect(prepared.env["OPENCODE_FILEWATCHER_DISABLE"]).toBe("1");
+    expect(content(prepared.env)).toEqual({
+      model: "my-model", plugins: ["-opencode.formatter", "-opencode.config.mcp"], experimental: KEEP_LOCATION,
     });
-    expect(mocks.acquire.mock.calls[1]).toEqual([BINARY.bin, [], prepared.env, "/repo"]);
+    expect(server.client.ok).toHaveBeenCalledExactlyOnceWith("/api/experimental/mcp/ri", {
+      method: "PUT", body: JSON.stringify({ config: openCodeMcpServerEntry(HOST[0]!) }), signal: expect.any(AbortSignal),
+    });
   });
 
   it("isolates with no host servers when only strict is asked", async () => {
-    const first = fakeServer(sources({ global: {} }));
-    const second = fakeServer(sources({ global: {} }, { global: {} }));
-    mocks.acquire.mockResolvedValueOnce(first).mockResolvedValueOnce(second);
+    const server = fakeServer([INLINE]);
+    mocks.acquire.mockResolvedValue(server);
     const prepared = await prepareOpenCodeMcp({ config: { strictMcpConfig: true }, binary: BINARY, env: {}, cwd: "/repo" });
-    expect((content(prepared.env)["mcp"] as { servers: object }).servers).toEqual({ global: { type: "remote", url: "http://127.0.0.1:9/", disabled: true } });
+    expect(prepared.server).toBe(server);
+    expect(server.client.ok).not.toHaveBeenCalled();
   });
 
   it("fails closed when the config sources can't be read", async () => {
@@ -166,13 +152,36 @@ describe("OpenCode MCP config", () => {
     expect(server.release).toHaveBeenCalledTimes(1);
   });
 
-  it("fails closed when a server appears between the two reads", async () => {
-    const first = fakeServer(sources({ global: {} }, { ri: {} }));
-    const second = fakeServer(sources({ global: {}, late: {} }, { ri: {}, global: {} }));
-    mocks.acquire.mockResolvedValueOnce(first).mockResolvedValueOnce(second);
+  it.each(["opencode.config.mcp", "opencode.config.*", "*", { package: "opencode.config.mcp" }])(
+    "fails closed before registering anything when managed config re-enables the MCP plugin (%j)",
+    async (selector) => {
+      const server = fakeServer([INLINE, { type: "document", path: "/system/opencode.json", info: { plugins: [selector] } }]);
+      mocks.acquire.mockResolvedValue(server);
+      await expect(prepareOpenCodeMcp({ config: { mcpServers: HOST }, binary: BINARY, env: {}, cwd: "/repo" }))
+        .rejects.toThrow(/managed settings/);
+      expect(server.client.ok).not.toHaveBeenCalled();
+      expect(server.release).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each([null, [], [{ type: "document" }], [{ ...INLINE, path: "/repo/opencode.json" }]])(
+    "fails closed when the config response does not prove the inline directive (%j)",
+    async (payload) => {
+      const server = fakeServer(payload);
+      mocks.acquire.mockResolvedValue(server);
+      await expect(prepareOpenCodeMcp({ config: { mcpServers: HOST }, binary: BINARY, env: {}, cwd: "/repo" }))
+        .rejects.toBeInstanceOf(OpenCodeMcpIsolationError);
+      expect(server.client.ok).not.toHaveBeenCalled();
+      expect(server.release).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("rejects a v2 binary below the qualified strict isolation version", async () => {
+    const server = fakeServer([INLINE], "2.2.0");
+    mocks.acquire.mockResolvedValue(server);
     await expect(prepareOpenCodeMcp({ config: { mcpServers: HOST }, binary: BINARY, env: {}, cwd: "/repo" }))
-      .rejects.toThrow(/changed while it was being isolated/);
-    expect(first.release).toHaveBeenCalledTimes(1);
-    expect(second.release).toHaveBeenCalledTimes(1);
+      .rejects.toThrow(/2\.3\.0/);
+    expect(server.client.ok).not.toHaveBeenCalled();
+    expect(server.release).toHaveBeenCalledTimes(1);
   });
 });

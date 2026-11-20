@@ -7,6 +7,8 @@ import { OpenCodeClient } from "./client.js";
 
 export interface OpenCodeServerHandle {
   client: OpenCodeClient;
+  /** Pass in the CLI environment when attaching to this private server. */
+  password: string;
   apiVersion: 1 | 2;
   serverVersion: string | null;
   generation: number;
@@ -20,6 +22,7 @@ interface PooledServer {
   key: string;
   generation: number;
   client: OpenCodeClient;
+  password: string;
   apiVersion: 1 | 2;
   serverVersion: string | null;
   proc: ChildProcess;
@@ -132,13 +135,41 @@ async function startServer(
       detached: process.platform !== "win32",
     },
   );
+  return connectServer(key, generation, proc, password, /listening on (http:\/\/\S+)/i);
+}
 
+async function startIsolatedServer(
+  key: string,
+  generation: number,
+  binary: string,
+  prefixArgs: string[],
+  env: Record<string, string>,
+  cwd: string,
+): Promise<PooledServer> {
+  const password = randomBytes(32).toString("base64url");
+  // V2's stdio lease keeps the server password out of its tool environments.
+  const proc = spawn(binary, [...prefixArgs, "serve", "--stdio", "--port", "0", "--hostname", "127.0.0.1"], {
+    cwd,
+    env: { ...env, OPENCODE_PASSWORD: password },
+    stdio: ["pipe", "pipe", "pipe"],
+    detached: process.platform !== "win32",
+  });
+  return connectServer(key, generation, proc, password, /(?:^|\n)\{"url":"(http:\/\/127\.0\.0\.1:\d+)"\}\r?\n/);
+}
+
+async function connectServer(
+  key: string,
+  generation: number,
+  proc: ChildProcess,
+  password: string,
+  ready: RegExp,
+): Promise<PooledServer> {
   try {
     const url = await new Promise<string>((resolve, reject) => {
       let output = "";
       const onData = (chunk: string): void => {
         output += chunk;
-        const match = output.match(/listening on (http:\/\/\S+)/i);
+        const match = output.match(ready);
         if (match) {
           cleanup();
           resolve(match[1]!.trim());
@@ -173,7 +204,7 @@ async function startServer(
 
     const client = new OpenCodeClient(url, password);
     const { apiVersion, serverVersion } = await waitForHealth(client, 10_000);
-    return { key, generation, client, apiVersion, serverVersion, proc, refCount: 0, retired: false };
+    return { key, generation, client, password, apiVersion, serverVersion, proc, refCount: 0, retired: false };
   } catch (error) {
     try {
       proc.kill();
@@ -182,17 +213,6 @@ async function startServer(
     }
     throw error;
   }
-}
-
-export async function retireOpenCodeRuntime(
-  binary: string,
-  prefixArgs: string[],
-  env: Record<string, string>,
-  cwd: string,
-  options: { force?: boolean } = {},
-): Promise<number> {
-  const key = openCodeRuntimeKey(binary, cwd, prefixArgs, env);
-  return retireRuntimeKey(key, options);
 }
 
 async function retireRuntimeKey(
@@ -232,13 +252,16 @@ export async function acquireOpenCodeServer(
   prefixArgs: string[],
   env: Record<string, string>,
   cwd: string,
+  mcpIsolationKey?: string,
 ): Promise<OpenCodeServerHandle> {
-  const key = openCodeRuntimeKey(binary, cwd, prefixArgs, env);
+  const runtimeKey = openCodeRuntimeKey(binary, cwd, prefixArgs, env);
+  const key = mcpIsolationKey === undefined ? runtimeKey : `${runtimeKey}\0${mcpIsolationKey}`;
   const authStore = openCodeAuthStoreKey(env);
   const generation = generations.get(key) ?? 0;
   let pending = pool.get(key);
   if (!pending) {
-    pending = startServer(key, generation, binary, prefixArgs, env, cwd).catch((error) => {
+    const start = mcpIsolationKey === undefined ? startServer : startIsolatedServer;
+    pending = start(key, generation, binary, prefixArgs, env, cwd).catch((error) => {
       if (pool.get(key) === pending) {
         pool.delete(key);
         runtimeAuthStores.delete(key);
@@ -254,11 +277,12 @@ export async function acquireOpenCodeServer(
   let released = false;
   return {
     client: entry.client,
+    password: entry.password,
     apiVersion: entry.apiVersion,
     serverVersion: entry.serverVersion,
     generation: entry.generation,
     isCurrent: () => !entry.retired && (generations.get(key) ?? 0) === entry.generation,
-    retire: (options) => retireOpenCodeRuntime(binary, prefixArgs, env, cwd, options).then(() => undefined),
+    retire: (options) => retireRuntimeKey(key, options).then(() => undefined),
     retireAuthStore: (options) => retireOpenCodeAuthStore(env, options),
     release: () => {
       if (released) return;

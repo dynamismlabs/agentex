@@ -14,12 +14,12 @@ import {
   isOpenCodeUnknownSessionError,
   isOpenCodeAuthRequired,
 } from "./parse.js";
-import { prepareOpenCodeMcp } from "./mcp-config.js";
+import { assertOpenCodeMcpSessionFolder, prepareOpenCodeMcp } from "./mcp-config.js";
 import { prepareOpenCodeSkillConfig } from "./skill-config.js";
 import { isOpenCodeV2Binary } from "./v2.js";
 import { openCodeVariant, resolveOpenCodeV2Model } from "./effort.js";
-import { OpenCodeEffortWithoutModelError } from "../../types.js";
-import { acquireOpenCodeServer } from "./server.js";
+import { OpenCodeEffortWithoutModelError, OpenCodeMcpIsolationError } from "../../types.js";
+import { acquireOpenCodeServer, type OpenCodeServerHandle } from "./server.js";
 
 export function executeOpenCodeProvider(ctx: ExecutionContext): Promise<ExecutionResult> {
   return observeExecution(ctx, { context: false, rates: false }, executeOpenCodeProviderInner);
@@ -106,10 +106,8 @@ async function executeOpenCodeProviderInner(ctx: ExecutionContext): Promise<Exec
   ctx.onLifecycle?.({ phase: "preparing", step: "skills" });
   const skillConfig = await prepareOpenCodeSkillConfig(baseEnv, config.skillDirs);
 
+  let mcpServer: OpenCodeServerHandle | null = null;
   try {
-  // 4b. Host MCP servers ride OPENCODE_CONFIG_CONTENT (mcp-config.ts). `opencode
-  // run --standalone` starts its own server from the same env, so a server
-  // started only to isolate them is released here.
   const mcp = await prepareOpenCodeMcp({
     config,
     binary: resolvedBinary,
@@ -117,8 +115,15 @@ async function executeOpenCodeProviderInner(ctx: ExecutionContext): Promise<Exec
     cwd,
     onNotice: (message) => { Promise.resolve(ctx.onOutput?.("stderr", message)).catch(() => {}); },
   });
-  mcp.server?.release();
-  const env = mcp.env;
+  mcpServer = mcp.server;
+  if (mcpServer && config.extraArgs?.some((arg) => /^(?:--(?:server|standalone|worktree|session)(?:=|$)|-[ws])/.test(arg))) {
+    throw new OpenCodeMcpIsolationError("Strict MCP runs use the verified server and folder. Use config.workspace and sessionParams to select a worktree or session.");
+  }
+  // OpenCode's run client reads PWD before process.cwd(). Use the folder whose
+  // location on the verified server contains the host MCP registrations.
+  const env = mcpServer
+    ? { ...mcp.env, PWD: path.resolve(cwd), OPENCODE_PASSWORD: mcpServer.password }
+    : mcp.env;
 
   // 4. Determine session resume
   const sessionParams = ctx.sessionParams ?? null;
@@ -133,8 +138,9 @@ async function executeOpenCodeProviderInner(ctx: ExecutionContext): Promise<Exec
     if (sessionCwd && path.resolve(sessionCwd) !== path.resolve(cwd)) return null;
     return id;
   })();
+  if (mcpServer && sessionId) await assertOpenCodeMcpSessionFolder(mcpServer, sessionId, cwd);
 
-  const isV2 = await isOpenCodeV2Binary(resolvedBinary.bin, resolvedBinary.prefixArgs);
+  const isV2 = mcpServer !== null || await isOpenCodeV2Binary(resolvedBinary.bin, resolvedBinary.prefixArgs);
 
   // 5. Build args. Effort reaches OpenCode as the model's variant (effort.ts).
   // OpenCode 2 takes it only as `model#variant`, so without a model it goes on
@@ -142,18 +148,19 @@ async function executeOpenCodeProviderInner(ctx: ExecutionContext): Promise<Exec
   const variant = openCodeVariant(config);
   let runModel = model;
   if (isV2 && variant && !runModel) {
-    const server = await acquireOpenCodeServer(resolvedBinary.bin, resolvedBinary.prefixArgs, env, cwd);
+    const server = mcpServer ?? await acquireOpenCodeServer(resolvedBinary.bin, resolvedBinary.prefixArgs, env, cwd);
     try {
       const base = await resolveOpenCodeV2Model(server.client, sessionId);
       if (!base) throw new OpenCodeEffortWithoutModelError();
       runModel = `${base.providerID}/${base.id}`;
     } finally {
-      server.release();
+      if (server !== mcpServer) server.release();
     }
   }
   const buildArgs = (resumeSessionId: string | null): string[] => {
     const args = [...resolvedBinary.prefixArgs, "run", "--format", "json"];
-    if (isV2) args.push("--standalone");
+    if (mcpServer) args.push("--server", mcpServer.client.baseUrl);
+    else if (isV2) args.push("--standalone");
     if (resumeSessionId) args.push("--session", resumeSessionId);
     if (isV2) {
       if (runModel) {
@@ -349,6 +356,7 @@ async function executeOpenCodeProviderInner(ctx: ExecutionContext): Promise<Exec
     workspace,
   };
   } finally {
+    mcpServer?.release();
     await skillConfig.cleanup();
   }
 }

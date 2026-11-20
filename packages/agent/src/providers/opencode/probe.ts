@@ -3,6 +3,7 @@ import { findBinary } from "../../utils/binary.js";
 import { buildEnv, ensurePathInEnv } from "../../utils/env.js";
 import { runChildProcess } from "../../utils/process.js";
 import { acquireOpenCodeRuntime } from "./runtime.js";
+import { OPEN_CODE_MCP_ADD_ROUTE, supportsOpenCodeMcpIsolation } from "./mcp-config.js";
 import { fetchV2Agents, rec, serverApiVersion } from "./v2.js";
 
 function capability(
@@ -66,12 +67,8 @@ export async function probeOpenCodeCapabilities(
             .catch(() => []);
       const paths = rec(doc["paths"]);
       const has = (path: string, method: string) => Boolean(rec(paths[path])[method]);
-      const mcpSupported = isV2 && has("/api/config", "get");
-      const mcpReason = mcpSupported
-        ? undefined
-        : isV2
-          ? "This OpenCode server does not list its config sources, which host-supplied MCP isolation needs"
-          : "Host-supplied MCP servers need OpenCode 2.0 or newer";
+      const strictMcp = isV2 && supportsOpenCodeMcpIsolation(runtime.server.serverVersion)
+        && has("/api/config", "get") && has(OPEN_CODE_MCP_ADD_ROUTE, "put");
       const supportsDisconnect = isV2
         ? has("/api/credential/{credentialID}", "delete")
         : has("/auth/{providerID}", "delete");
@@ -116,10 +113,9 @@ export async function probeOpenCodeCapabilities(
         sessionModeChange: capability(
           isV2 ? agents.length > 0 && has("/api/session/{sessionID}/agent", "post") : agents.length > 0,
         ),
-        // Host servers and their isolation need OpenCode 2's config document and
-        // its config-sources endpoint (mcp-config.ts).
-        mcp: capability(mcpSupported, mcpReason),
-        strictMcpIsolation: capability(mcpSupported, mcpReason),
+        mcp: capability(isV2, isV2 ? undefined : "Host-supplied MCP servers need OpenCode 2.0 or newer"),
+        strictMcpIsolation: capability(strictMcp, strictMcp ? undefined
+          : "Strict MCP isolation requires OpenCode 2.3.0 or newer with runtime MCP registration"),
       };
       const required = ["sessions", "modelDiscovery", "permissionRequests", "questionRequests"] as const;
       const degraded = required.some((key) => !capabilities[key]?.supported);

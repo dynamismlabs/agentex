@@ -1,23 +1,22 @@
+import { createHash } from "node:crypto";
+import { realpath } from "node:fs/promises";
 import { OpenCodeMcpIsolationError, type McpServerConfig, type ProviderConfig } from "../../types.js";
 import type { ResolvedBinary } from "../../utils/binary.js";
+import { OpenCodeHttpError } from "./client.js";
 import { acquireOpenCodeServer, type OpenCodeServerHandle } from "./server.js";
-import { isOpenCodeV2Binary, rec, v2DataArray } from "./v2.js";
+import { isOpenCodeV2Binary, rec, v2DataRecord } from "./v2.js";
 
-/**
- * Host-supplied MCP servers reach OpenCode 2 through `OPENCODE_CONFIG_CONTENT`,
- * the config document it loads after the global, directory and project ones,
- * so a host server replaces an ambient one of the same name.
- *
- * OpenCode connects MCP servers when a session starts, not when `opencode
- * serve` boots, and `GET /api/config` lists every config source's servers. So
- * strict isolation reads the ambient names from a booted server and, when there
- * are any, restarts it with each one disabled in the same document. Nothing an
- * ambient entry names is contacted or run. Verified against OpenCode 2.3.0 with
- * a project and a global server: both report `disabled` and receive nothing.
- */
+const CONFIG_MCP_PLUGIN = "opencode.config.mcp";
+const DISABLE_CONFIG_MCP = `-${CONFIG_MCP_PLUGIN}`;
+const ADD_MCP_PATH = "/api/experimental/mcp";
 
-/** OpenCode validates each config document whole, so a disable needs a complete, inert server. */
-const DISABLED_SERVER = { type: "remote", url: "http://127.0.0.1:9/", disabled: true } as const;
+export const OPEN_CODE_MCP_ADD_ROUTE = `${ADD_MCP_PATH}/{server}`;
+
+/** First release qualified for the native config-plugin switch and runtime registration. */
+export function supportsOpenCodeMcpIsolation(version: string | null): boolean {
+  const parts = version?.match(/^(\d+)\.(\d+)\./);
+  return Boolean(parts && (Number(parts[1]) > 2 || (Number(parts[1]) === 2 && Number(parts[2]) >= 3)));
+}
 
 /** One host server in OpenCode 2's `mcp.servers` shape. */
 export function openCodeMcpServerEntry(server: McpServerConfig): Record<string, unknown> {
@@ -52,55 +51,99 @@ function assertServerNames(servers: McpServerConfig[]): void {
   }
 }
 
-/**
- * The env with `servers` (and `disabled` names as inert disabled entries)
- * merged into `OPENCODE_CONFIG_CONTENT`, keeping anything already there.
- */
-export function withOpenCodeMcpConfig(
-  env: Record<string, string>,
-  servers: McpServerConfig[],
-  disabled: string[] = [],
-): Record<string, string> {
-  let content: Record<string, unknown> = {};
+function inlineConfig(env: Record<string, string>): Record<string, unknown> {
   const existing = env["OPENCODE_CONFIG_CONTENT"];
-  if (existing !== undefined && existing.trim() !== "") {
-    let parsed: unknown;
-    try { parsed = JSON.parse(existing); }
-    catch { throw new Error("OPENCODE_CONFIG_CONTENT is not valid JSON, so MCP servers cannot be added to it"); }
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      throw new Error("OPENCODE_CONFIG_CONTENT is not a JSON object, so MCP servers cannot be added to it");
-    }
-    content = parsed as Record<string, unknown>;
+  if (existing === undefined || existing.trim() === "") return {};
+  let parsed: unknown;
+  try { parsed = JSON.parse(existing); }
+  catch { throw new Error("OPENCODE_CONFIG_CONTENT is not valid JSON, so MCP servers cannot be added to it"); }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("OPENCODE_CONFIG_CONTENT is not a JSON object, so MCP servers cannot be added to it");
   }
+  return parsed as Record<string, unknown>;
+}
+
+/** Non-strict mode adds the supplied definitions to the caller's inline config. */
+export function withOpenCodeMcpConfig(env: Record<string, string>, servers: McpServerConfig[]): Record<string, string> {
+  const content = inlineConfig(env);
   const mcp = rec(content["mcp"]);
-  const entries: Record<string, unknown> = { ...rec(mcp["servers"]) };
-  for (const name of disabled) entries[name] = { ...DISABLED_SERVER };
-  for (const server of servers) entries[server.name] = openCodeMcpServerEntry(server);
+  const entries = { ...rec(mcp["servers"]), ...Object.fromEntries(servers.map((s) => [s.name, openCodeMcpServerEntry(s)])) };
   return {
     ...env,
     OPENCODE_CONFIG_CONTENT: JSON.stringify({ ...content, mcp: { ...mcp, servers: entries } }),
   };
 }
 
-/** Every MCP server name across the config sources `GET /api/config` reports. */
-export function openCodeConfigServerNames(payload: unknown): Set<string> {
-  const names = new Set<string>();
-  for (const source of v2DataArray(payload)) {
-    const mcp = rec(rec(rec(source)["info"])["mcp"]);
-    // OpenCode reports every source in the `servers` shape, migrating older documents.
-    const servers = "servers" in mcp ? rec(mcp["servers"]) : mcp;
-    for (const name of Object.keys(servers)) names.add(name);
-  }
-  return names;
+function withConfigMcpDisabled(env: Record<string, string>): Record<string, string> {
+  const content = inlineConfig(env);
+  const plugins = content["plugins"] ?? [];
+  if (!Array.isArray(plugins)) throw new OpenCodeMcpIsolationError("OpenCode's inline plugins must be an array.");
+  return {
+    ...env,
+    // Managed settings outrank the inline directive. Freeze file-driven changes
+    // during the lease so a managed file cannot re-enable the config plugin.
+    OPENCODE_FILEWATCHER_DISABLE: "1",
+    OPENCODE_CONFIG_CONTENT: JSON.stringify({
+      ...content,
+      plugins: [...plugins, DISABLE_CONFIG_MCP],
+      // Registrations live in the location's runtime. Keep even an idle chat's
+      // location alive until the host releases the server lease.
+      experimental: { ...rec(content["experimental"]), location_idle_timeout: false },
+    }),
+  };
 }
 
-async function configServerNames(server: OpenCodeServerHandle): Promise<Set<string>> {
-  try {
-    return openCodeConfigServerNames(await server.client.json<unknown>("/api/config"));
-  } catch {
+/** OpenCode processes plugin selectors in document and array order, including wildcards. */
+function assertConfigMcpDisabled(payload: unknown): void {
+  const entries = Array.isArray(payload) ? payload : rec(payload)["data"];
+  if (!Array.isArray(entries)) throw new OpenCodeMcpIsolationError("OpenCode returned an invalid config source list.");
+  let inlineDisables = false;
+  let enabled = true;
+  let idleTimeout: unknown;
+  for (const entry of entries) {
+    const source = rec(entry);
+    if (source["type"] === "directory") continue;
+    if (source["type"] !== "document" || !source["info"] || typeof source["info"] !== "object") {
+      throw new OpenCodeMcpIsolationError("OpenCode returned an invalid config source.");
+    }
+    const info = rec(source["info"]);
+    const configuredIdle = rec(info["experimental"])["location_idle_timeout"];
+    if (configuredIdle !== undefined) idleTimeout = configuredIdle;
+    const plugins = info["plugins"] ?? [];
+    if (!Array.isArray(plugins)) throw new OpenCodeMcpIsolationError("OpenCode returned invalid plugin selectors.");
+    if (source["path"] == null && source["integrationID"] == null && plugins.at(-1) === DISABLE_CONFIG_MCP) {
+      inlineDisables = true;
+    }
+    for (const plugin of plugins) {
+      const remove = typeof plugin === "string" && plugin.startsWith("-");
+      const selector = typeof plugin === "string" ? (remove ? plugin.slice(1) : plugin) : rec(plugin)["package"];
+      if (typeof selector !== "string") throw new OpenCodeMcpIsolationError("OpenCode returned an invalid plugin selector.");
+      if (selector === CONFIG_MCP_PLUGIN || selector === "*" ||
+          (selector.endsWith(".*") && CONFIG_MCP_PLUGIN.startsWith(selector.slice(0, -1)))) {
+        enabled = !remove;
+      }
+    }
+  }
+  if (!inlineDisables || enabled) {
     throw new OpenCodeMcpIsolationError(
-      "Could not read OpenCode's MCP configuration to isolate it. OpenCode 2.3.0 or newer is required; no session was started.",
+      "OpenCode's config-driven MCP plugin could not be disabled. Check for managed settings that enable it.",
     );
+  }
+  if (idleTimeout !== false) {
+    throw new OpenCodeMcpIsolationError("OpenCode could not retain the location for the lifetime of its MCP registrations.");
+  }
+}
+
+/** A native resume can select a different location, whose MCP registry is separate. */
+export async function assertOpenCodeMcpSessionFolder(server: OpenCodeServerHandle, id: string, cwd: string): Promise<void> {
+  const record = await server.client.json<unknown>(`/api/session/${encodeURIComponent(id)}`).catch((error) => {
+    if (error instanceof OpenCodeHttpError && error.status === 404) return null;
+    throw error;
+  });
+  if (record === null) return;
+  const folder = rec(v2DataRecord(record)["location"])["directory"];
+  if (folder !== await realpath(cwd)) {
+    throw new OpenCodeMcpIsolationError("The saved OpenCode session uses a different folder from the verified MCP runtime.");
   }
 }
 
@@ -140,36 +183,30 @@ export async function prepareOpenCodeMcp(args: {
     return { env, server: null };
   }
 
-  const hostEnv = withOpenCodeMcpConfig(env, servers);
-  if (!(config.strictMcpConfig ?? true)) return { env: hostEnv, server: null };
-
-  const host = new Set(servers.map((server) => server.name));
-  const first = await acquireOpenCodeServer(binary.bin, binary.prefixArgs, hostEnv, cwd);
-  let ambient: string[];
-  try {
-    ambient = [...await configServerNames(first)].filter((name) => !host.has(name));
-  } catch (error) {
-    first.release();
-    throw error;
+  if (config.strictMcpConfig === false) {
+    return { env: withOpenCodeMcpConfig(env, servers), server: null };
   }
-  if (ambient.length === 0) return { env: hostEnv, server: first };
 
-  // Releasing the last reference stops this server before any session connected its MCP.
-  first.release();
-  const isolatedEnv = withOpenCodeMcpConfig(env, servers, ambient);
-  const isolated = await acquireOpenCodeServer(binary.bin, binary.prefixArgs, isolatedEnv, cwd);
+  // Remove the source of ambient registrations, even if a config reload adds new names.
+  // The experimental API's overrides supply the only server definitions for this lease.
+  const isolatedEnv = withConfigMcpDisabled(env);
+  const entries = servers.map((server) => [server.name, openCodeMcpServerEntry(server)] as const);
+  const key = createHash("sha256").update(JSON.stringify(entries)).digest("hex");
+  const isolated = await acquireOpenCodeServer(binary.bin, binary.prefixArgs, isolatedEnv, cwd, key);
   try {
-    const disabled = new Set(ambient);
-    const unexpected = [...await configServerNames(isolated)].filter((name) => !host.has(name) && !disabled.has(name));
-    // A config file that gained a server between the two reads: refuse rather than run with it.
-    if (unexpected.length > 0) {
-      throw new OpenCodeMcpIsolationError(
-        "OpenCode's MCP configuration changed while it was being isolated; no session was started.",
-      );
+    if (isolated.apiVersion !== 2 || !supportsOpenCodeMcpIsolation(isolated.serverVersion)) {
+      throw new OpenCodeMcpIsolationError("Strict MCP isolation requires OpenCode 2.3.0 or newer.");
+    }
+    assertConfigMcpDisabled(await isolated.client.json<unknown>("/api/config", { signal: AbortSignal.timeout(10_000) }));
+    for (const [name, config] of entries) {
+      await isolated.client.ok(`${ADD_MCP_PATH}/${encodeURIComponent(name)}`, {
+        method: "PUT", body: JSON.stringify({ config }), signal: AbortSignal.timeout(10_000),
+      });
     }
     return { env: isolatedEnv, server: isolated };
   } catch (error) {
     isolated.release();
-    throw error;
+    if (error instanceof OpenCodeMcpIsolationError) throw error;
+    throw new OpenCodeMcpIsolationError("Could not verify or register MCP servers on the private OpenCode server.");
   }
 }
