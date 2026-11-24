@@ -307,13 +307,36 @@ export interface PartialStreamContext {
 }
 
 /**
+ * Whether this line's thinking blocks are progress updates.
+ *
+ * Claude Code asks the API for `thinking.display: "updates"` by default
+ * (2.1.3xx on Opus 5.5 and other models that support it). In that mode the
+ * reasoning itself always comes back empty, and the notes the model writes
+ * between tool calls (what it found, what it will do next) come back as
+ * `thinking` blocks with text. Those notes are written for the user, not
+ * private reasoning, so they surface as `assistant` text with
+ * `phase: "commentary"`, the same shape as Codex's progress messages.
+ *
+ * Claude Code names the mode on the line itself: `thinking_display` on the
+ * live stream (stream-json stdout, `stream_event` wrappers included) and
+ * `thinkingDisplay` in the transcript it writes to disk. Any other mode
+ * (`"summarized"` mixes reasoning summaries in, older versions returned the
+ * full reasoning) or no mode at all keeps the block as `thinking`.
+ */
+function isProgressUpdateLine(event: Record<string, unknown>): boolean {
+  return (event["thinking_display"] ?? event["thinkingDisplay"]) === "updates";
+}
+
+/**
  * Map a `stream_event` wrapper line into delta events.
  *
  * Emitted (when carrying text):
  * - `content_block_delta` + `text_delta`     → `assistant_delta`
- * - `content_block_delta` + `thinking_delta` → `thinking_delta` (best-effort —
- *   on recent Claude versions these deltas are the only place thinking prose
- *   appears, since the consolidated thinking block is withheld)
+ * - `content_block_delta` + `thinking_delta` on a progress-update line (see
+ *   `isProgressUpdateLine`) → `assistant_delta` with `phase: "commentary"`,
+ *   matching the consolidated `assistant` event it becomes
+ * - `content_block_delta` + `thinking_delta` otherwise → `thinking_delta`
+ *   (best-effort, where a model or mode still streams reasoning text)
  *
  * Known scaffolding (`message_start`/`message_stop` — which also maintain the
  * cross-line message id — `content_block_start`/`stop`, `message_delta`,
@@ -363,6 +386,9 @@ function parsePartialStreamEvent(
       typeof delta["thinking"] === "string" &&
       delta["thinking"]
     ) {
+      if (isProgressUpdateLine(wrapper)) {
+        return [{ type: "assistant_delta", text: delta["thinking"], phase: "commentary", blockIndex, ...base }];
+      }
       return [{ type: "thinking_delta", text: delta["thinking"], blockIndex, ...base }];
     }
     // signature_delta, empty deltas, input_json_delta, … — scaffolding.
@@ -515,7 +541,12 @@ function parseStreamLineContent(event: Record<string, unknown>, partial?: Partia
       if (blockType === "text") {
         out.push({ type: "assistant", text: asString(block["text"], ""), ...base });
       } else if (blockType === "thinking") {
-        out.push({ type: "thinking", text: asString(block["thinking"], ""), ...base });
+        const text = asString(block["thinking"], "");
+        if (text.trim() && isProgressUpdateLine(event)) {
+          out.push({ type: "assistant", text, phase: "commentary", ...base });
+        } else {
+          out.push({ type: "thinking", text, ...base });
+        }
       } else if (blockType === "tool_use") {
         out.push({
           type: "tool_call",

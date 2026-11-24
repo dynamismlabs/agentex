@@ -1,3 +1,10 @@
+## 0.0.54 — Claude's progress updates are messages, not thinking
+
+- **Claude progress updates arrive as `assistant` text with `phase: "commentary"`.** Claude Code requests `thinking.display: "updates"` by default on models that support it (Opus 5.5 among them). In that mode the model's reasoning comes back empty, and the notes it writes between tool calls (what it found, what it will do next) come back as `thinking` blocks with text. They were reported as `thinking`, so hosts showed what the model wrote for the user as private reasoning, or hid it. Now a thinking block with text on a line Claude Code marks `"updates"` (`thinking_display` on the live stream, `thinkingDisplay` in the transcript on disk) is an `assistant` event with `phase: "commentary"`, the same shape as Codex's progress messages. Saved transcripts read through local history get the same events. Empty reasoning blocks stay `thinking`, and so does a thinking block in any other display mode or with none (older transcripts with full reasoning, `"summarized"`).
+- **With `includePartialMessages`, a progress update streams as `assistant_delta` with `phase: "commentary"`** and the `messageId` of the consolidated event, not as `thinking_delta`. `assistant_delta` gains the optional `phase` field.
+- One-shot summaries are unchanged: they come from the result text, which never included these notes.
+- Verified against claude 2.1.331 on claude-opus-5-5: a live stream-json run with partial messages and the transcript the same run wrote are the new test fixtures. Every thinking block with text becomes commentary right before the tool call it introduces, its deltas add up to it, and no thinking event with text is left.
+
 ## 0.0.53 — OpenCode gets the host's MCP servers
 
 - **OpenCode 2 accepts `config.mcpServers`** for sessions and `execute()`. HTTP and SSE servers use OpenCode's remote transport with their headers. Stdio uses its local transport with its environment.
