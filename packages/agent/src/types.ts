@@ -1286,7 +1286,14 @@ export type StreamEvent =
   | ({
       type: "assistant";
       text: string;
-      /** Codex message role within a turn. Omitted by other providers and older wire formats. */
+      /**
+       * The message's role within a turn. `commentary` is a progress update
+       * written for the user mid-turn (what the agent found, what it will do
+       * next), not the turn's answer: Codex's commentary messages, and
+       * Claude's progress-update blocks (`thinking.display: "updates"`).
+       * `final_answer` is Codex's terminal answer. Omitted by other providers,
+       * older wire formats, and ordinary Claude text.
+       */
       phase?: "commentary" | "final_answer";
     } & BaseStreamEventFields)
   | ({
@@ -1302,14 +1309,16 @@ export type StreamEvent =
       text: string;
       /** Content block index within the message, for multi-block replies. */
       blockIndex: number;
+      /** Set when the consolidated `assistant` event will carry the same `phase` (Claude progress updates). */
+      phase?: "commentary";
     } & BaseStreamEventFields)
   | ({
       /**
        * Incremental thinking text (best-effort, same `includePartialMessages`
-       * flag). NOTE: on recent Claude versions the consolidated `thinking`
-       * block is withheld (signature-only), so these deltas can be the ONLY
-       * place thinking prose appears. Don't depend on them being present or
-       * complete — treat as advisory UI sugar.
+       * flag). Current Claude models stream no reasoning text: the reasoning
+       * block comes back empty, and the progress updates Claude Code requests
+       * stream as `assistant_delta` with `phase: "commentary"` instead. Don't
+       * depend on these being present or complete — treat as advisory UI sugar.
        */
       type: "thinking_delta";
       text: string;
