@@ -149,8 +149,13 @@ export interface WatchSubscription {
 export type Disposer = () => void;
 
 export interface GitCapability {
-  /** Current branch on this worktree. */
-  readonly branch: string;
+  /**
+   * Branch checked out when the handle was opened, or `null` when HEAD was
+   * detached (a commit, tag or remote branch checked out directly, often to
+   * review it). A detached workspace still has status, diff, checkpoints and
+   * archive. Only `push` needs a branch.
+   */
+  readonly branch: string | null;
   /** Base branch the worktree was created from. */
   readonly base: string;
   /**
@@ -195,7 +200,8 @@ export interface GitCapability {
 
   /**
    * Push the current branch to `origin`. If the branch has no upstream, sets
-   * `origin/<branch>` as the upstream on first push.
+   * `origin/<branch>` as the upstream on first push. Throws when HEAD is
+   * detached, since there is no branch to push.
    */
   push(): Promise<void>;
 

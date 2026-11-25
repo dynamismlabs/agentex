@@ -4,7 +4,7 @@ import {
   listCheckpoints,
   restoreCheckpoint,
 } from "../git/checkpoints.js";
-import { checkout, rawGit } from "../git/commands.js";
+import { checkout, getCurrentBranch, rawGit } from "../git/commands.js";
 import { commitChanges, pushCurrentBranch } from "../git/commit-push.js";
 import { readStructuredDiff } from "../git/diff.js";
 import { mergeFromInto, pullLatestBaseInto } from "../git/pull.js";
@@ -23,7 +23,7 @@ function resolveDiffRef(spec: DiffSpec, baseSha: string): string {
 export function makeGitHandle(opts: {
   path: string;
   source: string;
-  branch: string;
+  branch: string | null;
   base: string;
   baseSha: string;
   baseShaIsFreshlyDerived?: boolean;
@@ -49,7 +49,12 @@ export function makeGitHandle(opts: {
       await commitChanges(opts.path, message);
     },
     async push() {
-      await pushCurrentBranch(opts.path, opts.branch);
+      // Read the branch now, not at open: `checkout` may have moved HEAD since.
+      const branch = await getCurrentBranch(opts.path);
+      if (branch === null) {
+        throw new Error("ws.git.push: HEAD is detached, so there is no branch to push. Check out a branch first.");
+      }
+      await pushCurrentBranch(opts.path, branch);
     },
     async pullLatestBase(pullOpts) {
       await pullLatestBaseInto({
