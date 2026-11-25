@@ -240,7 +240,10 @@ export function createGateway(opts: CreateGatewayOptions = {}): Gateway {
         provider,
         onStreamEvent: (event: StreamEvent) => {
           events.emit("agent.event", event as unknown as Record<string, unknown>, sessionKey);
-          if (streamer && event.type === "assistant") {
+          // A progress update (Codex commentary, a Claude progress note) is
+          // what the agent is doing, not the reply. Subscribers still get it
+          // above, but it stays out of the reply the channel shows.
+          if (streamer && event.type === "assistant" && event.phase !== "commentary") {
             streamer.appendText(event.text);
           }
         },

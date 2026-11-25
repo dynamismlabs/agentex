@@ -405,6 +405,53 @@ describe("Message flow — end to end", () => {
     expect(lastEdit!.text).toBe("Streaming response");
   });
 
+  it("keeps progress updates out of the streamed reply and still publishes them", async () => {
+    const note = "b.txt shows the refund came first, so that's the first inconsistency. Checking c.txt next.\n\n";
+    registerProvider(
+      createMockProvider("mock-stream-commentary", async (ctx) => {
+        if (ctx.onEvent) {
+          await ctx.onEvent({ type: "assistant", text: "Reading the files. ", timestamp: new Date().toISOString() });
+          await ctx.onEvent({ type: "assistant", text: note, phase: "commentary", timestamp: new Date().toISOString() });
+          // Long enough for the throttled streamer to edit the reply in between.
+          await new Promise((r) => setTimeout(r, 600));
+        }
+        return { summary: "Order 1001 has three inconsistencies." };
+      }),
+    );
+
+    stateDir = await mkdtemp(resolve(tmpdir(), "gw-strm-note-"));
+    const mockChannel = createMockChannel("test", { streaming: true });
+
+    gateway = createGateway({
+      config: {
+        gateway: { bind: "loopback", port: nextPort(), auth: { mode: "none" } },
+        agent: { provider: "mock-stream-commentary", cwd: "/tmp" },
+        sessions: { dmScope: "per-peer" },
+        queue: { mode: "queue", maxQueueDepth: 10 },
+        channels: { test: { dm: { policy: "open" } } },
+      },
+      channels: [mockChannel],
+      stateDir,
+    });
+
+    const published: Record<string, unknown>[] = [];
+    gateway.events.on("*", (payload) => published.push(payload as Record<string, unknown>));
+
+    await gateway.start();
+    mockChannel.onMessage!(directMessage({ text: "Check order 1001" }));
+
+    await waitFor(() => mockChannel.editCalls.some((call) => call.text === "Order 1001 has three inconsistencies."), 5000);
+
+    // The reply grew from ordinary text only, and the note never reached the channel.
+    expect(mockChannel.editCalls.some((call) => call.text.includes("Reading the files."))).toBe(true);
+    const shown = [...mockChannel.sendCalls, ...mockChannel.editCalls].map((call) => call.text);
+    expect(shown.some((text) => text.includes("Checking c.txt next"))).toBe(false);
+
+    // Event subscribers still see it, marked as commentary.
+    expect(JSON.stringify(published)).toContain("Checking c.txt next");
+    expect(JSON.stringify(published)).toContain('"phase":"commentary"');
+  });
+
   it("pairing flow: unapproved sender triggers pairing event", async () => {
     registerProvider(createMockProvider("mock-pair"));
 
