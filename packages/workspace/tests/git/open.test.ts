@@ -2,8 +2,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { workspace } from "../../src/index.js";
-import { makeTmpDir, removeTmpDir } from "../helpers.js";
-import { headSha, setupSimpleRepo } from "../git-helpers.js";
+import { makeTmpDir, pathExists, removeTmpDir, writeUtf8 } from "../helpers.js";
+import { commitFile, git, headSha, setupSimpleRepo } from "../git-helpers.js";
 
 const tmpDirs: string[] = [];
 
@@ -192,5 +192,61 @@ describe("workspace.open (git)", () => {
     const expectedReal = await fs.realpath(sourcePath);
     const actualReal = await fs.realpath(reopened.source);
     expect(actualReal).toBe(expectedReal);
+  });
+
+  // An agent reviewing a pull request checks out the remote branch or a
+  // commit directly. The worktree must still open, so its files, status and
+  // diff stay readable and it can be archived.
+  it("opens a worktree on a detached HEAD: branch is null, status and diff still work", async () => {
+    const root = await tmp("git-open-detached");
+    const sourcePath = path.join(root, "source");
+    const wsPath = path.join(root, "ws");
+    await setupSimpleRepo(sourcePath);
+
+    const created = await workspace.create({
+      kind: "git",
+      source: sourcePath,
+      baseBranch: "main",
+      path: wsPath,
+      branch: "feature/review",
+    });
+    if (created.kind !== "git") throw new Error("kind narrow failed");
+    const reviewed = await commitFile(wsPath, "reviewed.ts", "export const x = 1;\n", "the change under review");
+    await git(wsPath, "checkout", "--detach", reviewed);
+    await writeUtf8(path.join(wsPath, "notes.md"), "review notes\n");
+
+    const reopened = await workspace.open(wsPath);
+    if (reopened.kind !== "git") throw new Error("kind narrow failed");
+
+    expect(reopened.git.branch).toBeNull();
+    expect(reopened.git.base).toBe("main");
+    expect(reopened.git.baseSha).toBe(created.git.baseSha);
+    const status = await reopened.git.status();
+    expect(status.dirty).toBe(true);
+    expect(status.untracked).toEqual(["notes.md"]);
+    const diff = await reopened.git.diff("base");
+    expect(diff.files.map((f) => f.path).sort()).toEqual(["notes.md", "reviewed.ts"]);
+
+    await workspace.archive(wsPath, { force: true });
+    expect(await pathExists(wsPath)).toBe(false);
+  });
+
+  it("still throws when the path is not a working git checkout", async () => {
+    const root = await tmp("git-open-broken-link");
+    const sourcePath = path.join(root, "source");
+    const wsPath = path.join(root, "ws");
+    await setupSimpleRepo(sourcePath);
+
+    await workspace.create({
+      kind: "git",
+      source: sourcePath,
+      baseBranch: "main",
+      path: wsPath,
+      branch: "feature/broken",
+    });
+    // The worktree's `.git` file now points at a gitdir that doesn't exist.
+    await fs.writeFile(path.join(wsPath, ".git"), `gitdir: ${path.join(root, "gone")}\n`);
+
+    await expect(workspace.open(wsPath, { source: sourcePath })).rejects.toThrow();
   });
 });

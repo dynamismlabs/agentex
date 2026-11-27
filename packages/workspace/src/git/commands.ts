@@ -74,9 +74,21 @@ export async function mergeBase(cwd: string, refA: string, refB: string): Promis
   return stdout.trim();
 }
 
-export async function getCurrentBranch(cwd: string): Promise<string> {
-  const { stdout } = await execFileSafe("git", ["symbolic-ref", "--short", "HEAD"], { cwd });
-  return stdout.trim();
+/**
+ * The branch checked out in `cwd`, or `null` when HEAD is detached (a commit,
+ * tag or remote branch checked out directly, or a rebase in progress). Any
+ * other failure, such as `cwd` not being a git checkout, throws.
+ */
+export async function getCurrentBranch(cwd: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileSafe("git", ["symbolic-ref", "--quiet", "--short", "HEAD"], { cwd });
+    return stdout.trim();
+  } catch (err) {
+    // With `--quiet` a detached HEAD exits 1 and prints nothing. Every other
+    // failure exits 128.
+    if ((err as { code?: unknown }).code === 1) return null;
+    throw err;
+  }
 }
 
 export async function branchExists(cwd: string, branch: string): Promise<boolean> {

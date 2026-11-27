@@ -353,8 +353,8 @@ async function archiveGit(wsPath: string, opts: ArchiveOptions): Promise<void> {
   }
 
   // Capture the branch name BEFORE worktreeRemove — once the worktree dir is
-  // gone, `getCurrentBranch(wsPath)` can't read HEAD. Best-effort: detached
-  // HEAD or any other read failure just skips the branch cleanup below.
+  // gone, `getCurrentBranch(wsPath)` can't read HEAD. Best-effort: a detached
+  // HEAD (null) or any other read failure just skips the branch cleanup below.
   let branchToDelete: string | null = null;
   if (opts.deleteBranch === true) {
     try {

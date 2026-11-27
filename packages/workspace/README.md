@@ -106,7 +106,7 @@ ws.watch(handler, opts?)                // → WatchSubscription { ready: Promis
 ### Git capability (`ws.git`, present only when `ws.kind === "git"`)
 
 ```ts
-ws.git.branch                           // string — current branch
+ws.git.branch                           // string | null — branch at open, null on a detached HEAD
 ws.git.base                             // string — base branch the workspace was created from
 ws.git.baseSha                          // string — captured atomically at create time
 ws.git.baseShaIsFreshlyDerived?         // true if baseSha was derived at open time (not the original)
@@ -116,7 +116,7 @@ await ws.git.shortstat(vs)              // → { files, additions, deletions } (
 await ws.git.diff(vs)                   // → StructuredDiff { files: [{ path, status, oldPath?, hunks }] }
 
 await ws.git.commit(message)            // git add -A + commit -m (snapshots EVERYTHING)
-await ws.git.push()                     // auto-set-upstream on first push
+await ws.git.push()                     // auto-set-upstream on first push; throws on a detached HEAD
 await ws.git.pullLatestBase({ strategy?: "merge" | "rebase" })
                                         // fetch base from origin → integrate; throws MergeConflictError on conflict
 

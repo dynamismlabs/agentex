@@ -114,4 +114,27 @@ describe("ws.git.push", () => {
     const status = await ws.git.status();
     expect(status.ahead).toBe(0);
   });
+
+  it("refuses with a clear error when HEAD is detached", async () => {
+    const { wsPath, ws } = await makeGitWorkspace("push-detached", true);
+
+    await git(wsPath, "checkout", "--detach");
+
+    await expect(ws.git.push()).rejects.toThrow(/HEAD is detached/);
+  });
+
+  it("pushes the branch checked out now, not the one the handle opened on", async () => {
+    const { remotePath, wsPath, ws } = await makeGitWorkspace("push-after-checkout", true);
+    if (!remotePath) throw new Error("expected remote");
+
+    await git(wsPath, "checkout", "-b", "feature/moved");
+    await writeUtf8(path.join(wsPath, "moved.ts"), "1\n");
+    await ws.git.commit("on the moved branch");
+    await ws.git.push();
+
+    const { stdout } = await git(remotePath, "branch", "--list", "feature/moved");
+    expect(stdout.trim()).toContain("feature/moved");
+    const status = await ws.git.status();
+    expect(status.ahead).toBe(0);
+  });
 });
